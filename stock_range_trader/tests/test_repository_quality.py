@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parents[1]
+GIT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_gitignore_excludes_required_python_and_report_artifacts() -> None:
-    patterns = set(
-        (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-    )
+    patterns = set((GIT_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
 
     assert {
         ".venv/",
@@ -27,7 +25,7 @@ def test_gitignore_excludes_required_python_and_report_artifacts() -> None:
 
 
 def test_github_actions_covers_supported_pythons_and_quality_gates() -> None:
-    workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+    workflow = (GIT_ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
 
@@ -40,3 +38,5 @@ def test_github_actions_covers_supported_pythons_and_quality_gates() -> None:
         "ruff format --check .",
     ):
         assert command in workflow
+
+    assert "working-directory: stock_range_trader" in workflow
