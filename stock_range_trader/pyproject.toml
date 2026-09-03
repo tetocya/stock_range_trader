@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-range-trader"
+version = "0.1.0"
+description = "A range-market detector and mean-reversion backtester for Japanese equities"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "backtest*",
+    "config*",
+    "data*",
+    "indicators*",
+    "metrics*",
+    "reports*",
+    "risk*",
+    "screening*",
+    "strategy*",
+]

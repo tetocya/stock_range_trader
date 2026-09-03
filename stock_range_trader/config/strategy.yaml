@@ -1,0 +1,48 @@
+# Indicator settings
+sma_period: 20
+atr_period: 20
+atr_method: wilder
+adx_period: 14
+
+# Entry and exit thresholds
+buy_atr_multiplier: 1.5
+sell_atr_multiplier: 1.5
+range_score_threshold: 70.0
+range_exit_threshold: 50.0
+adx_entry_max: 25.0
+adx_exit_min: 30.0
+range_breakdown_days: 3
+stop_loss_pct: 0.05
+max_holding_days: 40
+
+# Range detection and scoring
+range_window: 60
+slope_lookback: 20
+normalized_slope_limit: 0.001
+adx_score_limit: 50.0
+trend_slope_weight: 0.50
+trend_adx_weight: 0.50
+crossing_target: 6
+stability_window: 20
+stability_cv_limit: 0.50
+liquidity_window: 60
+average_volume_target: 100000
+
+range_score_weights:
+  trend: 0.30
+  mean_reversion: 0.30
+  stability: 0.20
+  liquidity: 0.20
+
+# Portfolio and risk
+initial_capital: 1000000
+max_position_pct: 0.10
+max_positions: 1
+lot_size: 100
+max_drawdown_stop: 0.20
+
+# Execution and metrics
+slippage_pct: 0.001
+commission_rate: 0.0
+annual_trading_days: 252
+risk_free_rate: 0.0
