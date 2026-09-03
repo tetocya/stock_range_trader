@@ -1,9 +1,0 @@
-backtest
-config
-data
-indicators
-metrics
-reports
-risk
-screening
-strategy
