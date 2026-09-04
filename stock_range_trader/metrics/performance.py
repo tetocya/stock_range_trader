@@ -11,8 +11,6 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
-from data.price_policy import has_dual_price_lanes, validate_backtest_price_contract
-
 if TYPE_CHECKING:
     from backtest.engine import BacktestResult
 
@@ -153,13 +151,9 @@ def calculate_performance_metrics(
     average_holding = float(holding_days.mean()) if number_of_trades else np.nan
     profit_factor = _profit_factor(winning, losing)
 
-    _, benchmark_close, _, split_ratios = _benchmark_price_inputs(market_data)
-    split_multiplier = split_ratios.copy()
-    split_multiplier.iloc[0] = 1.0
-    cumulative_split = split_multiplier.cumprod()
+    benchmark_close = market_data["close"].astype(float)
     theoretical_buy_and_hold_return = float(
-        benchmark_close.iloc[-1] * cumulative_split.iloc[-1] / benchmark_close.iloc[0]
-        - 1.0
+        benchmark_close.iloc[-1] / benchmark_close.iloc[0] - 1.0
     )
     executable_equity = executable_buy_and_hold_equity(
         market_data=market_data,
@@ -220,11 +214,8 @@ def executable_buy_and_hold_equity(
     )
     _validate_benchmark_market_data(market_data)
 
-    benchmark_open, benchmark_close, benchmark_volume, split_ratios = (
-        _benchmark_price_inputs(market_data)
-    )
-    first_open = float(benchmark_open.iloc[0])
-    first_volume = float(benchmark_volume.iloc[0])
+    first_open = float(market_data["open"].iloc[0])
+    first_volume = float(market_data["volume"].iloc[0])
     execution_price = first_open * (1.0 + slippage_pct)
     cash_per_share = execution_price * (1.0 + commission_rate)
     shares = 0
@@ -232,16 +223,7 @@ def executable_buy_and_hold_equity(
         shares = math.floor(initial_capital / cash_per_share / lot_size) * lot_size
     commission = execution_price * shares * commission_rate
     residual_cash = initial_capital - execution_price * shares - commission
-    split_multiplier = split_ratios.copy()
-    split_multiplier.iloc[0] = 1.0
-    held_shares = shares * split_multiplier.cumprod()
-    if not np.allclose(held_shares, np.round(held_shares), rtol=0.0, atol=1e-9):
-        from data import UnsupportedCorporateActionError
-
-        raise UnsupportedCorporateActionError(
-            "benchmark split creates fractional shares; cash-in-lieu is not modeled"
-        )
-    equity = residual_cash + held_shares * benchmark_close
+    equity = residual_cash + shares * market_data["close"].astype(float)
     return pd.Series(
         equity.to_numpy(), index=market_data.index, name="executable_buy_and_hold"
     )
@@ -350,28 +332,6 @@ def _validate_benchmark_market_data(frame: pd.DataFrame) -> None:
     _validate_finite_numeric(frame["open"], "open", positive=True)
     _validate_finite_numeric(frame["close"], "close", positive=True)
     _validate_finite_numeric(frame["volume"], "volume", non_negative=True)
-    validate_backtest_price_contract(frame)
-
-
-def _benchmark_price_inputs(
-    frame: pd.DataFrame,
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """Select raw execution prices and explicit splits when available."""
-
-    if has_dual_price_lanes(frame):
-        return (
-            frame["execution_open"].astype(float),
-            frame["execution_close"].astype(float),
-            frame["execution_volume"].astype(float),
-            frame["split_ratio"].astype(float),
-        )
-    ones = pd.Series(1.0, index=frame.index, dtype=float)
-    return (
-        frame["open"].astype(float),
-        frame["close"].astype(float),
-        frame["volume"].astype(float),
-        ones,
-    )
 
 
 def _validate_trade_log(frame: pd.DataFrame) -> None:

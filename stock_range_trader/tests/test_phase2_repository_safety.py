@@ -6,8 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pandas as pd
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GIT_ROOT = PROJECT_ROOT.parent
 
@@ -49,7 +47,6 @@ def test_phase2_clis_expose_help_without_api_key_or_network(monkeypatch) -> None
         "run_screening.py",
         "run_batch_backtest.py",
         "compare_providers.py",
-        "evaluate_range_score.py",
     )
     for script in scripts:
         completed = subprocess.run(
@@ -61,52 +58,6 @@ def test_phase2_clis_expose_help_without_api_key_or_network(monkeypatch) -> None
         )
         assert completed.returncode == 0, completed.stderr
         assert "--api-key" not in completed.stdout
-
-
-def test_unfiltered_jquants_download_is_guarded_before_authentication(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.delenv("JQUANTS_API_KEY", raising=False)
-    universe_path = tmp_path / "universe.csv"
-    pd.DataFrame(
-        {
-            "as_of_date": ["2026-08-31"],
-            "jquants_code": ["72030"],
-            "yfinance_ticker": ["7203.T"],
-            "market_segment_code": ["0111"],
-            "sector17_code": ["6"],
-            "sector33_code": ["3700"],
-            "product_category": ["011"],
-            "universe_included": [True],
-        }
-    ).to_csv(universe_path, index=False)
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(PROJECT_ROOT / "examples" / "download_prices.py"),
-            "--provider",
-            "jquants",
-            "--universe",
-            str(universe_path),
-            "--config",
-            str(PROJECT_ROOT / "config" / "data_sources.yaml"),
-            "--output-dir",
-            str(tmp_path / "output"),
-            "--refresh",
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode != 0
-    assert "J-Quants target symbols: 1" in completed.stdout
-    assert "Estimated API requests (minimum): 1" in completed.stdout
-    assert "0h 0m 13s (13s)" in completed.stdout
-    assert "requires --allow-long-run" in completed.stderr
-    assert "JQUANTS_API_KEY is required" not in completed.stderr
 
 
 def test_no_generated_market_data_or_environment_file_is_tracked() -> None:

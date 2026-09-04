@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
-import jquantsapi
 import pandas as pd
 import pytest
 from phase2_helpers import jquants_bar_record, master_frame
@@ -30,55 +29,6 @@ def test_api_key_is_required_when_no_transport_is_injected(monkeypatch) -> None:
 
     with pytest.raises(ProviderAuthenticationError, match="JQUANTS_API_KEY"):
         JQuantsV2Provider()
-
-
-def test_actual_clientv2_session_disables_internal_retry_and_applies_timeout(
-    monkeypatch,
-) -> None:
-    """Inspect the real official Session/Adapter, not an injected transport."""
-
-    client = jquantsapi.ClientV2(api_key="offline-test-key")
-    provider = JQuantsV2Provider(
-        client=client,
-        timeout_seconds=17.5,
-        min_request_interval_seconds=12,
-    )
-    session = client._session  # noqa: SLF001
-    adapter = session.get_adapter("https://")
-    retry = adapter.max_retries
-
-    assert adapter._pool_connections == 1  # noqa: SLF001
-    assert adapter._pool_maxsize == 1  # noqa: SLF001
-    assert retry.total == 0
-    assert retry.connect == 0
-    assert retry.read == 0
-    assert retry.redirect == 0
-    assert retry.status == 0
-    assert retry.other == 0
-
-    captured: dict[str, object] = {}
-
-    class Response:
-        ok = True
-        status_code = 200
-        url = "https://api.jquants.com/v2/equities/master"
-
-        @staticmethod
-        def json():
-            return {"data": master_frame().to_dict("records")}
-
-    def get(url, *, params, headers, timeout):
-        captured.update(
-            {"url": url, "params": params, "headers": headers, "timeout": timeout}
-        )
-        return Response()
-
-    monkeypatch.setattr(session, "get", get)
-    result = provider.get_universe(date(2026, 8, 31))
-
-    assert len(result) == 2
-    assert captured["timeout"] == 17.5
-    assert captured["headers"] == client._base_headers()  # noqa: SLF001
 
 
 def test_v2_daily_response_maps_to_canonical_fields() -> None:

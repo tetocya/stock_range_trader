@@ -208,24 +208,3 @@ def test_batch_records_all_ranked_symbols_when_price_data_is_empty() -> None:
     assert result.provider == "yfinance"
     assert result.summary.loc[0, "status"] == "failed"
     assert "no canonical bars selected" in result.summary.loc[0, "error"]
-
-
-def test_batch_marks_unreproducible_jquants_corporate_action_unsupported() -> None:
-    config = load_strategy_config("config/strategy.yaml")
-    bars = canonical_bars("72030", provider="jquants", periods=180)
-    bars.loc[90, "adjustment_factor"] = 0.5
-    ranking = pd.DataFrame(
-        [
-            {
-                "symbol": "72030",
-                "company_name": "Toyota",
-                "provider": "jquants",
-                "range_score": 80.0,
-            }
-        ]
-    )
-
-    result = BatchBacktestRunner(config).run(ranking, bars)
-
-    assert result.summary.loc[0, "status"] == "unsupported"
-    assert "split share ratio" in result.summary.loc[0, "error"]

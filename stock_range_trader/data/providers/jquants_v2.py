@@ -11,8 +11,6 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 import pandas as pd
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from data.canonical import (
     CANONICAL_COLUMNS,
@@ -112,19 +110,16 @@ class JQuantsV2Provider(PriceDataProvider, UniverseProvider):
         else:
             library_version = "injected"
         if request_func is None:
-            session = _configure_official_client_transport(client)
+            if client is None or not callable(getattr(client, "_get", None)):
+                raise TypeError("client must provide the ClientV2 _get transport")
 
             def official_request(
                 path: str, params: Mapping[str, Any], timeout: float
             ) -> Any:
-                response = session.get(
-                    f"{client.JQUANTS_API_BASE}{path}",
-                    params=dict(params),
-                    headers=client._base_headers(),  # noqa: SLF001
-                    timeout=timeout,
+                del timeout  # ClientV2 currently applies its own transport timeout.
+                return client._get(  # noqa: SLF001
+                    f"{client.JQUANTS_API_BASE}{path}", params=dict(params)
                 )
-                client._raise_for_status(response)  # noqa: SLF001
-                return response
 
             request_func = official_request
         self._request = request_func
@@ -291,9 +286,7 @@ class JQuantsV2Provider(PriceDataProvider, UniverseProvider):
 
     def _request_page(self, path: str, params: Mapping[str, Any]) -> Any:
         last_error: Exception | None = None
-        attempts = 0
         for attempt in range(self.max_retries):
-            attempts = attempt + 1
             self._limiter.wait()
             try:
                 return self._request(path, params, self.timeout_seconds)
@@ -311,7 +304,7 @@ class JQuantsV2Provider(PriceDataProvider, UniverseProvider):
                 )
                 self._sleep(max(0.0, delay))
         raise ProviderDownloadError(
-            f"J-Quants request failed after {attempts} attempts: {last_error}"
+            f"J-Quants request failed after {self.max_retries} attempts: {last_error}"
         ) from last_error
 
 
@@ -385,44 +378,6 @@ def _normalize_symbols(symbols: Sequence[str]) -> list[str]:
     if not result:
         raise ValueError("at least one symbol is required")
     return result
-
-
-def _configure_official_client_transport(client: Any) -> Any:
-    """Reuse ClientV2's Session while disabling its hidden urllib3 retries.
-
-    This deliberately depends on three private ClientV2 helpers. Keeping the
-    official Session preserves its request behavior, while a zero-retry
-    adapter makes the provider's rate-limited outer loop the only retry owner.
-    """
-
-    required = (
-        "JQUANTS_API_BASE",
-        "_request_session",
-        "_base_headers",
-        "_raise_for_status",
-    )
-    missing = [name for name in required if not hasattr(client, name)]
-    if missing:
-        raise TypeError(
-            "client is incompatible with the required ClientV2 transport: "
-            + ", ".join(missing)
-        )
-    session = client._request_session()  # noqa: SLF001
-    no_retries = Retry(
-        total=0,
-        connect=0,
-        read=0,
-        redirect=0,
-        status=0,
-        other=0,
-        allowed_methods=frozenset(),
-        raise_on_status=False,
-    )
-    session.mount(
-        "https://",
-        HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=no_retries),
-    )
-    return session
 
 
 def _status_code(error: Exception) -> int | None:

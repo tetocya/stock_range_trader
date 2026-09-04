@@ -8,11 +8,7 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from data import (
-    UnsupportedCorporateActionError,
-    canonical_to_phase1,
-    require_single_provider,
-)
+from data import canonical_to_phase1, require_single_provider
 from metrics import calculate_backtest_metrics
 from universe import jquants_to_yfinance
 
@@ -118,16 +114,6 @@ class BatchBacktestRunner:
                     annual_trading_days=self.strategy_config.annual_trading_days,
                     risk_free_rate=self.strategy_config.risk_free_rate,
                 )
-            except UnsupportedCorporateActionError as error:
-                summary_records.append(
-                    _failed_summary(
-                        candidate,
-                        provider,
-                        str(error),
-                        status="unsupported",
-                    )
-                )
-                continue
             except Exception as error:
                 summary_records.append(_failed_summary(candidate, provider, str(error)))
                 continue
@@ -180,11 +166,7 @@ class BatchBacktestRunner:
 
 
 def _failed_summary(
-    candidate: pd.Series,
-    provider: str,
-    message: str,
-    *,
-    status: str = "failed",
+    candidate: pd.Series, provider: str, message: str
 ) -> dict[str, object]:
     record: dict[str, object] = {
         column: float("nan") for column in BATCH_SUMMARY_COLUMNS
@@ -194,7 +176,7 @@ def _failed_summary(
             "symbol": str(candidate["symbol"]),
             "company_name": str(candidate["company_name"]),
             "provider": provider,
-            "status": status,
+            "status": "failed",
             "error": message,
             "range_score_as_of": candidate["range_score"],
             "number_of_trades": 0,
