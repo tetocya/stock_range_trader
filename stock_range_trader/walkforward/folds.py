@@ -305,6 +305,12 @@ class PurgePolicy:
     ) -> tuple[ForwardObservation, ...]:
         if not isinstance(fold, WalkForwardFold):
             raise TypeError("fold must be WalkForwardFold")
+        if fold.embargo_sessions < self.forward_sessions:
+            raise FoldValidationError(
+                f"{fold.fold_id} embargo_sessions ({fold.embargo_sessions}) must "
+                "be greater than or equal to PurgePolicy.forward_sessions "
+                f"({self.forward_sessions})"
+            )
         _require_symbol(symbol)
         sessions = _normalize_unique_dates(
             "observed_session_dates", observed_session_dates

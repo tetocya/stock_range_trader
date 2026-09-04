@@ -285,8 +285,69 @@ def test_validation_label_cannot_enter_test_interval() -> None:
     assert not any(observation.retained for observation in observations)
 
 
-def test_test_observation_without_full_horizon_is_right_censored() -> None:
+def test_validation_rejects_embargo_shorter_than_forward_horizon() -> None:
+    with pytest.raises(FoldValidationError, match="embargo_sessions.*must"):
+        PurgePolicy(forward_sessions=3).assess_validation(
+            _fold(),
+            "7203.T",
+            [date(2024, 3, 27)],
+            [],
+        )
+
+
+def test_test_rejects_embargo_shorter_than_forward_horizon() -> None:
+    with pytest.raises(FoldValidationError, match="embargo_sessions.*must"):
+        PurgePolicy(forward_sessions=3).assess_test(
+            _fold(),
+            "7203.T",
+            [date(2024, 6, 27)],
+            [],
+        )
+
+
+def test_embargo_equal_to_forward_horizon_is_allowed() -> None:
     fold = _fold()
+    policy = PurgePolicy(forward_sessions=fold.embargo_sessions)
+
+    validation = policy.assess_validation(
+        fold,
+        "7203.T",
+        [date(2024, 3, 25)],
+        [date(2024, 3, 25), date(2024, 3, 26), date(2024, 3, 27)],
+    )[0]
+    test = policy.assess_test(
+        fold,
+        "7203.T",
+        [date(2024, 4, 1)],
+        [date(2024, 4, 1), date(2024, 4, 2), date(2024, 4, 3)],
+    )[0]
+
+    assert validation.retained
+    assert test.retained
+
+
+def test_policy_from_config_accepts_fold_generated_from_same_config() -> None:
+    config = _config(forward_sessions=2, embargo_sessions=2)
+    schedule = generate_fold_schedule(
+        config,
+        configured_start=date(2023, 1, 1),
+        configured_end=date(2023, 5, 1),
+    )
+    policy = PurgePolicy.from_schedule_config(config)
+
+    observation = policy.assess_validation(
+        schedule.folds[0],
+        "7203.T",
+        [date(2023, 3, 1)],
+        [date(2023, 3, 1), date(2023, 3, 2), date(2023, 3, 3)],
+    )[0]
+
+    assert observation.retained
+    assert observation.label_end_date == date(2023, 3, 3)
+
+
+def test_test_observation_without_full_horizon_is_right_censored() -> None:
+    fold = replace(_fold(), embargo_sessions=3)
     policy = PurgePolicy(forward_sessions=3)
     observation = policy.assess_test(
         fold,
@@ -341,7 +402,7 @@ def test_future_data_only_appends_folds_and_cannot_change_past_labels() -> None:
 
     assert short.folds == long.folds[: len(short.folds)]
 
-    fold = _fold()
+    fold = replace(_fold(), embargo_sessions=3)
     policy = PurgePolicy(forward_sessions=3)
     base_sessions = [date(2024, 6, 27), date(2024, 6, 28)]
     base = policy.assess_test(fold, "A", [date(2024, 6, 27)], base_sessions)
