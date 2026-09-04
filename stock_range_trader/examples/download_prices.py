@@ -32,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_DATA_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--symbols",
+        help="comma-separated provider symbols to download (for example 72030,99840)",
+    )
+    parser.add_argument("--limit", type=int, help="download only the first N symbols")
+    parser.add_argument(
+        "--allow-long-run",
+        action="store_true",
+        help="explicitly allow an unfiltered J-Quants universe download",
+    )
     return parser
 
 
@@ -47,6 +57,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     symbols = sorted(set(included[column].dropna().astype(str)))
     if not symbols:
         raise ValueError("universe contains no included symbols for this provider")
+    if args.symbols:
+        requested_symbols = {
+            value.strip().upper() for value in args.symbols.split(",") if value.strip()
+        }
+        unknown = sorted(requested_symbols - set(symbols))
+        if unknown:
+            raise ValueError(
+                "symbols are not in the supplied universe: " + ", ".join(unknown)
+            )
+        symbols = [symbol for symbol in symbols if symbol in requested_symbols]
+    if args.limit is not None:
+        if args.limit <= 0:
+            raise ValueError("limit must be positive")
+        symbols = symbols[: args.limit]
+    if not symbols:
+        raise ValueError("symbol selection is empty")
     config = load_phase2_config(args.config)
     adjustment_mode = (
         "adj_close_ratio_for_ohlc_raw_volume"
@@ -70,6 +96,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     issues: list[dict[str, str]] = []
     if hit is None:
+        if args.provider == "jquants":
+            request_count, minimum_seconds = estimate_jquants_run(
+                len(symbols), config.jquants.min_request_interval_seconds
+            )
+            print(f"J-Quants target symbols: {len(symbols)}")
+            print(f"Estimated API requests (minimum): {request_count}")
+            print(
+                "Minimum rate-limit time at "
+                f"{config.jquants.min_request_interval_seconds:g}s/request: "
+                f"{format_duration(minimum_seconds)}"
+            )
+            print("Pagination and retry attempts can increase this estimate.")
+            if not (args.symbols or args.limit is not None or args.allow_long_run):
+                raise RuntimeError(
+                    "unfiltered J-Quants download requires --allow-long-run, "
+                    "--symbols, or --limit"
+                )
         provider = create_price_provider(args.provider, config)
         bars = provider.get_daily_bars(symbols, start, exclusive_end)
         issues = [
@@ -130,6 +173,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_run_manifest(metadata, output_dir / f"{args.provider}_prices_manifest.json")
     print(price_path)
     return 0
+
+
+def estimate_jquants_run(
+    symbol_count: int, interval_seconds: float = 13.0
+) -> tuple[int, float]:
+    """Return the minimum symbol-page request count and conservative duration."""
+
+    if symbol_count <= 0 or interval_seconds <= 0.0:
+        raise ValueError("symbol_count and interval_seconds must be positive")
+    minimum_requests = symbol_count
+    return minimum_requests, minimum_requests * float(interval_seconds)
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration without hiding the exact number of seconds."""
+
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    return f"{hours}h {minutes}m {remaining_seconds}s ({seconds:g}s)"
 
 
 if __name__ == "__main__":

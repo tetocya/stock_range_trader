@@ -11,6 +11,8 @@ import pandas as pd
 
 from data.validation import DataValidationError, validate_ohlcv
 
+from .price_policy import EXECUTION_COLUMNS, POLICY_COLUMNS, SIGNAL_COLUMNS
+
 CANONICAL_SCHEMA_VERSION = "2.0"
 MAX_ADJUSTED_CLOSE_UNIT_RATIO = 50.0
 CANONICAL_COLUMNS: tuple[str, ...] = (
@@ -235,7 +237,7 @@ def canonical_to_phase1(
     symbol: str | None = None,
     as_of_date: date | None = None,
 ) -> pd.DataFrame:
-    """Adapt one provider/symbol to the unchanged Phase 1.1 engine contract."""
+    """Adapt one provider/symbol to the compatible dual-price engine contract."""
 
     selected = frame.copy()
     if symbol is not None:
@@ -250,15 +252,43 @@ def canonical_to_phase1(
         raise CanonicalDataError("provider mixing is not allowed")
     if selected["symbol"].nunique() != 1:
         raise CanonicalDataError("Phase 1 adapter accepts exactly one symbol")
-    result = selected.rename(
-        columns={
-            "adjusted_open": "open",
-            "adjusted_high": "high",
-            "adjusted_low": "low",
-            "adjusted_close": "close",
-            "adjusted_volume": "volume",
+    result = pd.DataFrame(
+        {
+            "date": selected["date"],
+            "open": selected["adjusted_open"],
+            "high": selected["adjusted_high"],
+            "low": selected["adjusted_low"],
+            "close": selected["adjusted_close"],
+            "volume": selected["adjusted_volume"],
+            "turnover_value": selected["turnover_value"],
+            "signal_open": selected["adjusted_open"],
+            "signal_high": selected["adjusted_high"],
+            "signal_low": selected["adjusted_low"],
+            "signal_close": selected["adjusted_close"],
+            "signal_volume": selected["adjusted_volume"],
+            "execution_open": selected["raw_open"],
+            "execution_high": selected["raw_high"],
+            "execution_low": selected["raw_low"],
+            "execution_close": selected["raw_close"],
+            "execution_volume": selected["raw_volume"],
+            "dividend": selected["dividend"],
         }
-    )[
+    )
+    provider = str(selected["provider"].iloc[0])
+    if provider == "yfinance":
+        split = pd.to_numeric(selected["stock_split"], errors="coerce")
+        result["split_ratio"] = split.where(split > 0.0, 1.0)
+        result["corporate_action_supported"] = True
+    elif provider == "jquants":
+        result["split_ratio"] = 1.0
+        result["corporate_action_supported"] = bool(
+            selected["adjustment_factor"].astype(float).eq(1.0).all()
+        )
+    else:
+        result["split_ratio"] = 1.0
+        result["corporate_action_supported"] = False
+    result = result.reset_index(drop=True)
+    result = result[
         [
             "date",
             "open",
@@ -267,8 +297,11 @@ def canonical_to_phase1(
             "close",
             "volume",
             "turnover_value",
+            *SIGNAL_COLUMNS,
+            *EXECUTION_COLUMNS,
+            *POLICY_COLUMNS,
         ]
-    ].reset_index(drop=True)
+    ]
     validate_ohlcv(result)
     return result
 

@@ -230,6 +230,9 @@ class Trade:
     entry_date: pd.Timestamp
     entry_price: float
     shares: int
+    split_adjustment_ratio: float
+    split_adjusted_entry_price: float
+    exit_shares: int
     exit_signal_date: pd.Timestamp
     exit_date: pd.Timestamp
     exit_price: float
@@ -242,15 +245,29 @@ class Trade:
     holding_days: int
 
     @classmethod
-    def from_fills(cls, entry: Fill, exit: Fill, holding_days: int) -> Trade:
+    def from_fills(
+        cls,
+        entry: Fill,
+        exit: Fill,
+        holding_days: int,
+        *,
+        split_adjustment_ratio: float = 1.0,
+    ) -> Trade:
         """Create and validate a completed trade from matching fills."""
 
         if entry.side is not OrderSide.BUY or exit.side is not OrderSide.SELL:
             raise ValueError("a trade requires a BUY fill followed by a SELL fill")
-        if entry.symbol != exit.symbol or entry.shares != exit.shares:
-            raise ValueError(
-                "entry and exit fills must have matching symbol and shares"
-            )
+        if entry.symbol != exit.symbol:
+            raise ValueError("entry and exit fills must have matching symbols")
+        if (
+            isinstance(split_adjustment_ratio, bool)
+            or not np.isfinite(split_adjustment_ratio)
+            or split_adjustment_ratio <= 0.0
+        ):
+            raise ValueError("split_adjustment_ratio must be finite and positive")
+        expected_exit_shares = entry.shares * float(split_adjustment_ratio)
+        if not np.isclose(expected_exit_shares, exit.shares, rtol=0.0, atol=1e-9):
+            raise ValueError("exit shares must match split-adjusted entry shares")
         if exit.exit_reason is None:
             raise ValueError("the exit fill must include an exit reason")
         if exit.execution_date <= entry.execution_date:
@@ -260,7 +277,7 @@ class Trade:
         if holding_days <= 0:
             raise ValueError("holding_days must be greater than zero")
 
-        gross_profit = (exit.execution_price - entry.execution_price) * entry.shares
+        gross_profit = exit.notional - entry.notional
         commission = entry.commission + exit.commission
         slippage_cost = entry.slippage_cost + exit.slippage_cost
         net_profit = gross_profit - commission
@@ -272,6 +289,11 @@ class Trade:
             entry_date=entry.execution_date,
             entry_price=entry.execution_price,
             shares=entry.shares,
+            split_adjustment_ratio=float(split_adjustment_ratio),
+            split_adjusted_entry_price=(
+                entry.execution_price / float(split_adjustment_ratio)
+            ),
+            exit_shares=exit.shares,
             exit_signal_date=exit.signal_date,
             exit_date=exit.execution_date,
             exit_price=exit.execution_price,
