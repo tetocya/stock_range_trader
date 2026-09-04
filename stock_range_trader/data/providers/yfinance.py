@@ -27,11 +27,11 @@ YFINANCE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "Volume",
 )
 YFINANCE_ACTION_COLUMNS: tuple[str, ...] = ("Dividends", "Stock Splits")
-YFINANCE_ADJUSTMENT_MODE = "adj_close_ratio_for_ohlc_raw_volume"
+YFINANCE_ADJUSTMENT_MODE = "adj_close_ratio_for_ohlc_provider_reported_volume"
 
 
 class YFinanceProvider(PriceDataProvider):
-    """Download explicit, non-auto-adjusted Yahoo Finance daily batches."""
+    """Download Yahoo Finance daily batches with ``auto_adjust=False``."""
 
     name = "yfinance"
     adjustment_mode = YFINANCE_ADJUSTMENT_MODE
@@ -219,12 +219,12 @@ def yfinance_to_canonical(
     ticker: str,
     fetched_at: datetime,
 ) -> pd.DataFrame:
-    """Preserve raw/actions and separately derive adjusted OHLC.
+    """Preserve provider-reported fields/actions and derive adjusted OHLC.
 
-    ``Adj Close / Close`` is applied only to OHLC. Volume remains raw because
-    Yahoo does not expose a standalone dividend-free split factor in this
-    response; applying the total-return factor to volume would mix dividends
-    with split adjustment. Liquidity always uses Raw Close × Raw Volume.
+    ``Adj Close / Close`` is applied only to OHLC. Volume remains as reported
+    because Yahoo does not expose a standalone dividend-free split factor in
+    this response; applying the total-return factor to volume would mix
+    dividends with split adjustment. Liquidity uses reported Close × Volume.
     """
 
     required = set(YFINANCE_REQUIRED_COLUMNS + YFINANCE_ACTION_COLUMNS)

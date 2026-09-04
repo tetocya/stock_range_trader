@@ -158,10 +158,6 @@ class BacktestEngine:
             market_bar = MarketBar.from_series(row)
             current_date = market_bar.date
 
-            # Provider split events are effective before this session opens.
-            # Dividends are deliberately excluded from cash and both benchmarks.
-            portfolio.apply_split(market_bar.split_ratio)
-
             # This block runs before any current-day close-based decision.
             if pending_signal is not None:
                 fill, order_result = self._execute_pending_signal(

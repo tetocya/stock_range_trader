@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pandas as pd
@@ -117,6 +118,10 @@ def test_mock_pipeline_download_cache_screen_backtest_and_report(tmp_path) -> No
     assert summary_path.is_file()
     assert manifest_path.is_file()
     assert set(pd.read_csv(summary_path)["provider"]) == {"yfinance"}
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["provider_price_basis"] == (
+        "yahoo_reported_ohlcv_auto_adjust_false;historical_split_basis_unverified"
+    )
 
     conflicting = screened.ranking.copy()
     conflicting.loc[:, "provider"] = "jquants"

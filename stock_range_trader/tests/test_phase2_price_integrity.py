@@ -5,9 +5,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from phase2_helpers import canonical_bars
 
 from backtest import BacktestEngine, MarketOnNextOpen
-from data import UnsupportedCorporateActionError
+from data import (
+    UnsupportedCorporateActionError,
+    canonical_to_phase1,
+    validate_backtest_price_contract,
+)
 from metrics import calculate_backtest_metrics, executable_buy_and_hold_equity
 from risk import RiskManager
 from strategy import MeanReversionStrategy
@@ -64,7 +69,7 @@ def _engine() -> BacktestEngine:
     )
 
 
-def test_position_size_and_costs_use_historical_unadjusted_open() -> None:
+def test_position_size_and_costs_use_provider_reported_open() -> None:
     frame = _dual_price_market(
         [42.0, 50.0],
         raw_opens=[168.0, 200.0],
@@ -81,7 +86,7 @@ def test_position_size_and_costs_use_historical_unadjusted_open() -> None:
     assert result.portfolio.position.signal_entry_price == 50.0
 
 
-def test_split_adjusts_shares_and_cost_basis_without_equity_jump() -> None:
+def test_non_unit_split_ratio_is_rejected_before_share_adjustment() -> None:
     frame = _dual_price_market(
         [84.0, 100.0, 100.0, 100.0],
         raw_opens=[168.0, 200.0, 100.0, 100.0],
@@ -89,35 +94,23 @@ def test_split_adjusts_shares_and_cost_basis_without_equity_jump() -> None:
         split_ratios=[1.0, 1.0, 2.0, 1.0],
     )
 
-    result = _engine().run("7203", frame)
-
-    assert result.portfolio.position is not None
-    assert result.portfolio.position.shares == 1_000
-    assert result.portfolio.position.split_adjusted_entry_price == 100.0
-    assert result.equity_curve.loc[1, "position_value"] == pytest.approx(100_000.0)
-    assert result.equity_curve.loc[2, "position_value"] == pytest.approx(100_000.0)
-    assert result.equity_curve.loc[2, "total_equity"] == pytest.approx(
-        result.equity_curve.loc[1, "total_equity"]
-    )
+    with pytest.raises(UnsupportedCorporateActionError, match="adjustment is disabled"):
+        _engine().run("7203", frame)
 
 
-def test_trade_across_split_uses_adjusted_exit_shares_and_total_cost_basis() -> None:
-    frame = _dual_price_market(
-        [84.0, 100.0, 116.0, 110.0],
-        raw_opens=[168.0, 200.0, 116.0, 110.0],
-        raw_closes=[168.0, 200.0, 116.0, 110.0],
-        split_ratios=[1.0, 1.0, 2.0, 1.0],
-    )
+def test_yfinance_split_event_marks_entire_interval_unsupported() -> None:
+    bars = canonical_bars(periods=4)
+    bars.loc[2, "stock_split"] = 2.0
 
-    result = _engine().run("7203", frame)
-    trade = result.trade_log.iloc[0]
+    adapted = canonical_to_phase1(bars, symbol="7203.T")
 
-    assert trade["shares"] == 500
-    assert trade["exit_shares"] == 1_000
-    assert trade["split_adjustment_ratio"] == 2.0
-    assert trade["split_adjusted_entry_price"] == 100.0
-    assert trade["gross_profit"] == pytest.approx(10_000.0)
-    assert result.portfolio.cash == pytest.approx(1_009_790.0)
+    assert adapted["split_ratio"].eq(1.0).all()
+    assert not adapted["corporate_action_supported"].any()
+    with pytest.raises(
+        UnsupportedCorporateActionError,
+        match="provider price basis is not verified",
+    ):
+        validate_backtest_price_contract(adapted)
 
 
 def test_dividends_are_excluded_from_strategy_and_both_benchmarks() -> None:
@@ -148,12 +141,11 @@ def test_dividends_are_excluded_from_strategy_and_both_benchmarks() -> None:
     )
 
 
-def test_theoretical_and_executable_benchmarks_use_raw_prices_and_splits() -> None:
+def test_benchmarks_use_provider_reported_prices_only_for_split_free_interval() -> None:
     frame = _dual_price_market(
         [100.0, 100.0],
         raw_opens=[200.0, 100.0],
         raw_closes=[200.0, 100.0],
-        split_ratios=[1.0, 2.0],
     )
     benchmark = executable_buy_and_hold_equity(
         frame,
@@ -162,42 +154,33 @@ def test_theoretical_and_executable_benchmarks_use_raw_prices_and_splits() -> No
     )
     metrics = calculate_backtest_metrics(_engine().run("7203", frame))
 
-    assert list(benchmark) == [1_000_000.0, 1_000_000.0]
-    assert metrics.theoretical_buy_and_hold_return == 0.0
-    assert metrics.executable_buy_and_hold_return == pytest.approx(-0.00098)
+    assert list(benchmark) == [1_000_000.0, 500_000.0]
+    assert metrics.theoretical_buy_and_hold_return == -0.5
+    assert metrics.executable_buy_and_hold_return == pytest.approx(-0.49098)
+
+    frame.loc[1, "split_ratio"] = 2.0
+    with pytest.raises(UnsupportedCorporateActionError, match="adjustment is disabled"):
+        executable_buy_and_hold_equity(frame, initial_capital=1_000_000.0)
 
 
-def test_future_split_does_not_rewrite_an_earlier_fill_price_or_size() -> None:
+def test_future_split_is_unsupported_without_rewriting_prior_prefix_fill() -> None:
     original = _dual_price_market(
         [84.0, 100.0, 100.0, 100.0],
         raw_opens=[168.0, 200.0, 200.0, 200.0],
         raw_closes=[168.0, 200.0, 200.0, 200.0],
     )
     with_future_split = original.copy()
-    signal_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "signal_open",
-        "signal_high",
-        "signal_low",
-        "signal_close",
-    ]
-    with_future_split.loc[:2, signal_columns] *= 0.5
     with_future_split.loc[3, "split_ratio"] = 2.0
-    with_future_split.loc[3, "execution_open"] = 100.0
-    with_future_split.loc[3, "execution_high"] = 102.0
-    with_future_split.loc[3, "execution_low"] = 98.0
-    with_future_split.loc[3, "execution_close"] = 100.0
 
-    first = _engine().run("7203", original).fills[0]
-    second = _engine().run("7203", with_future_split).fills[0]
+    first = _engine().run("7203", original.iloc[:3].copy()).fills[0]
+    second = _engine().run("7203", with_future_split.iloc[:3].copy()).fills[0]
 
     assert second.execution_date == first.execution_date
     assert second.raw_open_price == first.raw_open_price
     assert second.execution_price == first.execution_price
     assert second.shares == first.shares
+    with pytest.raises(UnsupportedCorporateActionError, match="adjustment is disabled"):
+        _engine().run("7203", with_future_split)
 
 
 def test_unsupported_corporate_action_refuses_executable_result() -> None:
@@ -208,5 +191,5 @@ def test_unsupported_corporate_action_refuses_executable_result() -> None:
     )
     frame.loc[1, "corporate_action_supported"] = False
 
-    with pytest.raises(UnsupportedCorporateActionError, match="split share ratio"):
+    with pytest.raises(UnsupportedCorporateActionError, match="price basis"):
         _engine().run("7203", frame)

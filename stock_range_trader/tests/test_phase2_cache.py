@@ -20,7 +20,7 @@ def _request() -> CacheRequest:
         symbols=("7203.T",),
         requested_start=date(2026, 1, 1),
         requested_end=date(2026, 9, 1),
-        adjustment_mode="adj_close_ratio_for_ohlc_raw_volume",
+        adjustment_mode="adj_close_ratio_for_ohlc_provider_reported_volume",
         universe_as_of_date=date(2026, 8, 31),
     )
 
@@ -53,6 +53,9 @@ def test_cache_round_trip_and_manifest_audit_fields(tmp_path) -> None:
     assert stored.manifest.actual_end == "2026-08-31"
     assert stored.manifest.row_count == 3
     assert stored.manifest.content_hash
+    assert stored.manifest.provider_price_basis == (
+        "yahoo_reported_ohlcv_auto_adjust_false;historical_split_basis_unverified"
+    )
     assert stored.manifest.status_counts == {"ok": 1}
     assert stored.manifest.issues == [
         {

@@ -22,6 +22,7 @@ from .price_policy import (
     THEORETICAL_BENCHMARK_MODE,
     UnsupportedCorporateActionError,
     price_policy_manifest_fields,
+    provider_price_basis,
     validate_backtest_price_contract,
 )
 from .reconciliation import ProviderComparisonResult, compare_providers
@@ -49,6 +50,7 @@ __all__ = [
     "load_ohlcv_csv",
     "normalize_canonical_frame",
     "price_policy_manifest_fields",
+    "provider_price_basis",
     "require_single_provider",
     "validate_canonical_bars",
     "validate_backtest_price_contract",

@@ -160,4 +160,9 @@ def test_range_score_evaluation_cli_writes_complete_metrics_and_manifest(
     assert manifest["forward_sessions"] == 20
     assert "overlapping" in manifest["overlap_warning"]
     assert manifest["profit_factor_policy"] == "not_applicable_no_trading_rule"
-    assert manifest["execution_price_mode"] == "historical_unadjusted_ohlcv"
+    assert manifest["execution_price_mode"] == (
+        "provider_reported_ohlcv_basis_not_assumed_unadjusted"
+    )
+    assert manifest["provider_price_basis"] == (
+        "yahoo_reported_ohlcv_auto_adjust_false;historical_split_basis_unverified"
+    )

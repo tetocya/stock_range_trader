@@ -14,6 +14,7 @@ from phase2_common import (
 
 from config import load_strategy_config
 from data import require_single_provider
+from data.providers import JQUANTS_ADJUSTMENT_MODE, YFINANCE_ADJUSTMENT_MODE
 from reports import Phase2RunMetadata, write_phase2_csv, write_run_manifest
 from screening import SCORE_LABELS, evaluate_range_score_history
 
@@ -54,9 +55,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         actual_start=actual_start,
         actual_end=actual_end,
         adjustment_mode=(
-            "adj_close_ratio_for_ohlc_raw_volume"
+            YFINANCE_ADJUSTMENT_MODE
             if args.provider == "yfinance"
-            else "jquants_official_adjusted_ohlcv"
+            else JQUANTS_ADJUSTMENT_MODE
         ),
         universe_as_of_date=None,
         analysis_design="causal_month_end_fixed_bins_exploratory",
@@ -80,7 +81,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "survivorship bias may remain"
             ),
             "score_information_set": "evaluation date and earlier rows only",
-            "forward_return_mode": "raw close with explicit split-share adjustment",
+            "forward_return_mode": (
+                "provider-reported execution close; split intervals unsupported"
+            ),
             "profit_factor_policy": "not_applicable_no_trading_rule",
             "confidence_interval": "normal 95% interval for mean forward return",
             "overlap_warning": (

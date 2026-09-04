@@ -228,4 +228,25 @@ def test_batch_marks_unreproducible_jquants_corporate_action_unsupported() -> No
     result = BatchBacktestRunner(config).run(ranking, bars)
 
     assert result.summary.loc[0, "status"] == "unsupported"
-    assert "split share ratio" in result.summary.loc[0, "error"]
+    assert "provider price basis" in result.summary.loc[0, "error"]
+
+
+def test_batch_marks_yfinance_split_interval_unsupported() -> None:
+    config = load_strategy_config("config/strategy.yaml")
+    bars = canonical_bars("7203.T", provider="yfinance", periods=180)
+    bars.loc[90, "stock_split"] = 2.0
+    ranking = pd.DataFrame(
+        [
+            {
+                "symbol": "72030",
+                "company_name": "Toyota",
+                "provider": "yfinance",
+                "range_score": 80.0,
+            }
+        ]
+    )
+
+    result = BatchBacktestRunner(config).run(ranking, bars)
+
+    assert result.summary.loc[0, "status"] == "unsupported"
+    assert "provider price basis" in result.summary.loc[0, "error"]

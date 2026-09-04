@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,7 @@ from data import (
     EXECUTION_PRICE_MODE,
     SIGNAL_PRICE_MODE,
     THEORETICAL_BENCHMARK_MODE,
+    provider_price_basis,
 )
 
 
@@ -33,6 +34,7 @@ class Phase2RunMetadata:
     actual_end: date | None
     adjustment_mode: str
     universe_as_of_date: date | None
+    provider_price_basis: str = field(init=False)
     analysis_design: str = "exploratory_in_sample"
     signal_price_mode: str = SIGNAL_PRICE_MODE
     execution_price_mode: str = EXECUTION_PRICE_MODE
@@ -56,6 +58,11 @@ class Phase2RunMetadata:
             and self.actual_start > self.actual_end
         ):
             raise ValueError("actual_start must not be after actual_end")
+        object.__setattr__(
+            self,
+            "provider_price_basis",
+            provider_price_basis(self.provider),
+        )
 
     def to_dict(self) -> dict[str, str | None]:
         return {

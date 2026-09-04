@@ -71,9 +71,10 @@ def evaluate_range_score_history(
 ) -> ScoreEvaluationResult:
     """Evaluate fixed bins without exposing any future row to score generation.
 
-    Forward returns and excursions use raw closes with explicit split-share
-    adjustment and exclude cash dividends. The fixed SMA visible on the
-    evaluation date is the mean-reversion target.
+    Forward returns and excursions use provider-reported execution closes and
+    exclude cash dividends. Intervals containing a split are rejected before
+    evaluation. The fixed SMA visible on the evaluation date is the
+    mean-reversion target.
     """
 
     if isinstance(forward_sessions, bool) or not isinstance(forward_sessions, int):
@@ -103,7 +104,7 @@ def evaluate_range_score_history(
             if pd.isna(row["range_score"]) or pd.isna(row["sma"]):
                 continue
             future = phase1.iloc[int(position) + 1 : forward_position + 1]
-            path_returns = _split_adjusted_path_returns(
+            path_returns = _provider_reported_path_returns(
                 current_close=float(phase1.iloc[int(position)]["execution_close"]),
                 future=future,
             )
@@ -155,12 +156,10 @@ def evaluate_range_score_history(
     return ScoreEvaluationResult(observations, _summarize(observations))
 
 
-def _split_adjusted_path_returns(
+def _provider_reported_path_returns(
     *, current_close: float, future: pd.DataFrame
 ) -> pd.Series:
-    split_multiplier = future["split_ratio"].astype(float).cumprod()
-    future_value = future["execution_close"].astype(float) * split_multiplier
-    return future_value / current_close - 1.0
+    return future["execution_close"].astype(float) / current_close - 1.0
 
 
 def _target_was_hit(

@@ -277,8 +277,11 @@ def canonical_to_phase1(
     provider = str(selected["provider"].iloc[0])
     if provider == "yfinance":
         split = pd.to_numeric(selected["stock_split"], errors="coerce")
-        result["split_ratio"] = split.where(split > 0.0, 1.0)
-        result["corporate_action_supported"] = True
+        split_detected = bool(split.fillna(0.0).ne(0.0).any())
+        # Yahoo's action event is retained in the canonical frame, but its
+        # OHLCV adjustment basis is not assumed. Do not mutate held shares.
+        result["split_ratio"] = 1.0
+        result["corporate_action_supported"] = not split_detected
     elif provider == "jquants":
         result["split_ratio"] = 1.0
         result["corporate_action_supported"] = bool(

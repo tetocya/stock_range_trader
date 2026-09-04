@@ -18,6 +18,7 @@ from phase2_common import (
 
 from data import CANONICAL_COLUMNS
 from data.cache import CacheManager, CacheRequest
+from data.providers import JQUANTS_ADJUSTMENT_MODE, YFINANCE_ADJUSTMENT_MODE
 from reports import Phase2RunMetadata, write_phase2_csv, write_run_manifest
 
 
@@ -75,9 +76,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("symbol selection is empty")
     config = load_phase2_config(args.config)
     adjustment_mode = (
-        "adj_close_ratio_for_ohlc_raw_volume"
+        YFINANCE_ADJUSTMENT_MODE
         if args.provider == "yfinance"
-        else "jquants_official_adjusted_ohlcv"
+        else JQUANTS_ADJUSTMENT_MODE
     )
     request = CacheRequest(
         provider=args.provider,
