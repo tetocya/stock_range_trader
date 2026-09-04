@@ -1,5 +1,11 @@
 """Phase 3 walk-forward validation contracts."""
 
+from .candidates import (
+    ExecutableCandidateCatalog,
+    ExecutableCandidateDefinition,
+    SignalCandidateCatalog,
+    SignalCandidateDefinition,
+)
 from .capabilities import (
     AnalysisMode,
     ProviderCapability,
@@ -17,9 +23,25 @@ from .folds import (
     generate_fold_schedule,
     resolve_fold_observation_bounds,
 )
+from .selection import (
+    CandidateAssessment,
+    CandidateSelection,
+    ExecutableCandidateSelector,
+    ExecutableValidationScore,
+    SelectionInputError,
+    SelectionStatus,
+    SignalCandidateSelector,
+    SignalValidationScore,
+)
 
 __all__ = [
     "AnalysisMode",
+    "CandidateAssessment",
+    "CandidateSelection",
+    "ExecutableCandidateCatalog",
+    "ExecutableCandidateDefinition",
+    "ExecutableCandidateSelector",
+    "ExecutableValidationScore",
     "FoldObservationBounds",
     "FoldSchedule",
     "FoldValidationError",
@@ -29,6 +51,12 @@ __all__ = [
     "ProviderCapabilityError",
     "ProviderCapabilityRegistry",
     "PurgePolicy",
+    "SelectionInputError",
+    "SelectionStatus",
+    "SignalCandidateCatalog",
+    "SignalCandidateDefinition",
+    "SignalCandidateSelector",
+    "SignalValidationScore",
     "WalkForwardFold",
     "generate_fold_schedule",
     "resolve_fold_observation_bounds",
