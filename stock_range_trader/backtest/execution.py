@@ -13,7 +13,7 @@ from .trade import Fill, Order, OrderSide, validate_price
 
 @dataclass(frozen=True, slots=True)
 class MarketBar:
-    """Market data visible to the execution model at one daily open."""
+    """Raw execution bar plus the separately scaled signal open."""
 
     date: pd.Timestamp
     open: float
@@ -21,6 +21,10 @@ class MarketBar:
     low: float
     close: float
     volume: float
+    signal_open: float | None = None
+    split_ratio: float = 1.0
+    dividend: float = 0.0
+    corporate_action_supported: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.date, pd.Timestamp) or pd.isna(self.date):
@@ -37,6 +41,19 @@ class MarketBar:
             or self.volume < 0.0
         ):
             raise ValueError("volume must be finite and non-negative")
+        if self.signal_open is None:
+            object.__setattr__(self, "signal_open", self.open)
+        validate_price(self.signal_open, "signal_open")
+        if (
+            isinstance(self.split_ratio, bool)
+            or not np.isfinite(self.split_ratio)
+            or self.split_ratio <= 0.0
+        ):
+            raise ValueError("split_ratio must be finite and greater than zero")
+        if isinstance(self.dividend, bool) or not np.isfinite(self.dividend):
+            raise ValueError("dividend must be finite")
+        if not isinstance(self.corporate_action_supported, bool):
+            raise TypeError("corporate_action_supported must be bool")
 
     @classmethod
     def from_series(cls, row: pd.Series) -> MarketBar:
@@ -46,13 +63,21 @@ class MarketBar:
         missing = sorted(required.difference(row.index))
         if missing:
             raise ValueError("Missing MarketBar fields: " + ", ".join(missing))
+        explicit_execution = "execution_open" in row.index
+        prefix = "execution_" if explicit_execution else ""
         return cls(
             date=pd.Timestamp(row["date"]),
-            open=float(row["open"]),
-            high=float(row["high"]),
-            low=float(row["low"]),
-            close=float(row["close"]),
-            volume=float(row["volume"]),
+            open=float(row[f"{prefix}open"]),
+            high=float(row[f"{prefix}high"]),
+            low=float(row[f"{prefix}low"]),
+            close=float(row[f"{prefix}close"]),
+            volume=float(row[f"{prefix}volume"]),
+            signal_open=float(row.get("signal_open", row["open"])),
+            split_ratio=float(row.get("split_ratio", 1.0)),
+            dividend=float(row.get("dividend", 0.0)),
+            corporate_action_supported=bool(
+                row.get("corporate_action_supported", True)
+            ),
         )
 
 

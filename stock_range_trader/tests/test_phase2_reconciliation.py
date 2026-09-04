@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pandas as pd
 from phase2_helpers import canonical_bars
 
@@ -96,3 +101,63 @@ def test_future_price_change_does_not_change_earlier_range_score() -> None:
         original.loc[:cutoff, "range_score"],
         rescored.loc[:cutoff, "range_score"],
     )
+
+
+def test_range_score_evaluation_cli_writes_complete_metrics_and_manifest(
+    tmp_path: Path,
+) -> None:
+    project_root = Path(__file__).parents[1]
+    input_path = tmp_path / "prices.parquet"
+    output_dir = tmp_path / "evaluation"
+    canonical_bars(periods=260).to_parquet(input_path, index=False)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "examples" / "evaluate_range_score.py"),
+            "--input",
+            str(input_path),
+            "--provider",
+            "yfinance",
+            "--forward-sessions",
+            "20",
+            "--output-dir",
+            str(output_dir),
+        ],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    observations = pd.read_csv(output_dir / "range_score_observations.csv")
+    summary = pd.read_csv(output_dir / "range_score_bin_summary.csv")
+    manifest = json.loads(
+        (output_dir / "range_score_evaluation_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert not observations.empty
+    assert {
+        "mean_reversion_target_hit",
+        "maximum_adverse_excursion",
+        "maximum_favorable_excursion",
+        "maximum_drawdown",
+    }.issubset(observations.columns)
+    assert {
+        "symbol_count",
+        "observation_count",
+        "mean_forward_return",
+        "median_forward_return",
+        "mean_reversion_target_hit_rate",
+        "win_rate",
+        "profit_factor",
+        "forward_return_standard_error",
+        "forward_return_ci95_lower",
+        "forward_return_ci95_upper",
+    }.issubset(summary.columns)
+    assert manifest["forward_sessions"] == 20
+    assert "overlapping" in manifest["overlap_warning"]
+    assert manifest["profit_factor_policy"] == "not_applicable_no_trading_rule"
+    assert manifest["execution_price_mode"] == "historical_unadjusted_ohlcv"

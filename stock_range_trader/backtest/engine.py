@@ -8,6 +8,7 @@ from typing import TypeAlias
 
 import pandas as pd
 
+from data import validate_backtest_price_contract
 from data.validation import validate_ohlcv
 from risk import RiskManager
 from strategy import PositionContext, Signal, SignalAction, Strategy
@@ -31,6 +32,9 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "entry_date",
     "entry_price",
     "shares",
+    "split_adjustment_ratio",
+    "split_adjusted_entry_price",
+    "exit_shares",
     "exit_signal_date",
     "exit_date",
     "exit_price",
@@ -139,6 +143,7 @@ class BacktestEngine:
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError("symbol must not be empty")
         validate_ohlcv(frame)
+        validate_backtest_price_contract(frame)
         prepared = self.strategy.prepare(frame)
         portfolio = Portfolio(self.initial_capital)
         self.risk_manager.reset()
@@ -153,6 +158,10 @@ class BacktestEngine:
             market_bar = MarketBar.from_series(row)
             current_date = market_bar.date
 
+            # Provider split events are effective before this session opens.
+            # Dividends are deliberately excluded from cash and both benchmarks.
+            portfolio.apply_split(market_bar.split_ratio)
+
             # This block runs before any current-day close-based decision.
             if pending_signal is not None:
                 fill, order_result = self._execute_pending_signal(
@@ -164,13 +173,21 @@ class BacktestEngine:
                 pending_signal = None
                 order_results.append(order_result)
                 if fill is not None:
-                    portfolio.apply_fill(fill)
+                    signal_entry_price = None
+                    if fill.side is OrderSide.BUY:
+                        signal_entry_price = self.execution_model.execution_price(
+                            OrderSide.BUY, float(market_bar.signal_open)
+                        )
+                    portfolio.apply_fill(
+                        fill,
+                        signal_entry_price=signal_entry_price,
+                    )
                     fills.append(fill)
 
             # A position bought at this morning's open has one completed
             # holding session when this close becomes observable.
             portfolio.increment_holding_days()
-            close_price = float(row["close"])
+            close_price = market_bar.close
             position_value = portfolio.position_value(close_price)
             total_equity = portfolio.cash + position_value
             drawdown = self.risk_manager.update_equity(total_equity)
@@ -350,7 +367,7 @@ class BacktestEngine:
             return PositionContext()
         return PositionContext(
             has_position=True,
-            entry_price=portfolio.position.entry_price,
+            entry_price=portfolio.position.signal_entry_price,
             holding_days=portfolio.position.holding_days,
         )
 

@@ -1,6 +1,6 @@
 # stock_range_trader
 
-日本株の日足データを対象に、レンジ相場の検出とLong Onlyの平均回帰戦略を検証するバックテストプロジェクトです。Phase 2ではJ-Quants API V2 Freeとyfinance、国内普通株Universe、同一基準日のRange Scoreランキング、銘柄別バックテスト集計を実装しています。Pythonプロジェクト本体は [`stock_range_trader/`](stock_range_trader/) にあります。設計、調整規約、データ制約の詳細は[プロジェクトREADME](stock_range_trader/README.md)を参照してください。
+日本株の日足データを対象に、レンジ相場の検出とLong Onlyの平均回帰戦略を検証するバックテストプロジェクトです。Phase 2.1では調整済みSignal Priceと非調整Execution Priceの分離、株式分割会計、J-Quants実HTTP Rate Limit、Range Score時系列評価を実装しています。Pythonプロジェクト本体は [`stock_range_trader/`](stock_range_trader/) にあります。設計、調整規約、データ制約の詳細は[プロジェクトREADME](stock_range_trader/README.md)を参照してください。
 
 > 本システムは調査・バックテスト専用です。実注文機能や投資助言機能はありません。
 
@@ -55,6 +55,10 @@ python examples/run_screening.py --provider yfinance --as-of YYYY-MM-DD --top 30
 python examples/run_batch_backtest.py \
   --provider yfinance \
   --ranking outputs/range_ranking_YYYY-MM-DD.csv
+python examples/evaluate_range_score.py \
+  --input outputs/yfinance_prices.parquet \
+  --provider yfinance \
+  --output-dir outputs/range_score_evaluation
 ```
 
-J-Quantsとyfinanceの価格は連結しません。キャッシュとRaw DataはGit管理対象外です。結果にはSurvivorship bias、Provider間差、現在Universeを使う探索的・in-sample設計の制限があり、利益を保証しません。
+J-Quantsとyfinanceの価格は連結しません。J-Quants全Universe価格取得は推定request数と最低時間を事前表示し、`--allow-long-run`の明示的な指定がなければ開始しません。キャッシュとRaw DataはGit管理対象外です。結果にはSurvivorship bias、Provider間差、現在Universeを使う探索的・in-sample設計の制限があり、利益を保証しません。
