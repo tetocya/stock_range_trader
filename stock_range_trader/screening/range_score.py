@@ -131,7 +131,14 @@ class RangeScorer:
 
         # Median traded value is comparable across price levels and resists a
         # one-day volume spike better than average share volume.
-        result["trading_value"] = result["close"] * result["volume"]
+        calculated_trading_value = result["close"] * result["volume"]
+        if "turnover_value" in result.columns:
+            supplied_turnover = pd.to_numeric(result["turnover_value"], errors="coerce")
+            result["trading_value"] = supplied_turnover.where(
+                supplied_turnover.notna(), calculated_trading_value
+            )
+        else:
+            result["trading_value"] = calculated_trading_value
         result["median_trading_value"] = (
             result["trading_value"]
             .rolling(window=self.liquidity_window, min_periods=self.liquidity_window)

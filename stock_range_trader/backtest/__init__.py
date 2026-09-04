@@ -1,11 +1,14 @@
 """Event-driven backtesting components."""
 
+from .batch_runner import BatchBacktestResult, BatchBacktestRunner
 from .engine import BacktestEngine, BacktestResult
 from .execution import ExecutionModel, MarketBar, MarketOnNextOpen
 from .portfolio import Portfolio, Position
 from .trade import Fill, Order, OrderReason, OrderResult, OrderSide, OrderStatus, Trade
 
 __all__ = [
+    "BatchBacktestResult",
+    "BatchBacktestRunner",
     "BacktestEngine",
     "BacktestResult",
     "ExecutionModel",

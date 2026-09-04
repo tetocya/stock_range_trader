@@ -1,8 +1,8 @@
-# 日本株レンジ・平均回帰型バックテスト（Phase 1.1）
+# 日本株レンジ・平均回帰型バックテスト（Phase 2）
 
 ## プロジェクトの目的
 
-日本株の日足CSVから一定価格帯を往復する銘柄・期間を検出し、レンジ下側で買って上側で売るLong Onlyの平均回帰戦略を検証するPhase 1システムです。収益率の最大化やパラメータ最適化よりも、将来データを使用せず、現実的な約定順序を再現できるバックテストの正しさ・再現性・テスト可能性を優先します。
+日本株の中から一定価格帯を往復する銘柄を検出し、レンジ下側で買って上側で売るLong Onlyの平均回帰戦略を検証します。Phase 2ではPhase 1.1の単一銘柄エンジンを維持したまま、J-Quants API V2とyfinanceのProvider、国内普通株Universe、同一基準日スクリーニング、銘柄横断の独立バックテスト、Provider間比較を追加します。
 
 > **重要:** 本システムは調査・バックテスト専用です。証券会社API、実注文、ペーパートレード、投資助言機能はありません。出力は将来の運用成績を保証しません。
 
@@ -30,7 +30,7 @@ python -m pip install -e ".[dev]"
 
 `requirements.txt`を使用する場合は、`python -m pip install -r requirements.txt`でも依存ライブラリを導入できます。ただし、`examples/run_single_stock.py`を直接実行する場合はeditable installも行ってください。
 
-主な実行時依存はpandas、NumPy、PyYAML、matplotlib、開発用依存はpytestとRuffです。TA-Lib、SciPy、外部Broker SDKには依存しません。
+主な実行時依存はpandas、NumPy、PyYAML、matplotlib、pyarrow、`jquants-api-client`、yfinance、開発用依存はpytestとRuffです。TA-Lib、SciPy、外部Broker SDKには依存しません。
 
 ## 入力データ形式
 
@@ -195,6 +195,101 @@ Trade Logには`symbol`、`entry_signal_date`、`entry_date`、`entry_price`、`
 
 Order Logには`symbol`、`signal_date`、`scheduled_execution_date`、`side`、`requested_shares`、`filled_shares`、`status`、`reason`、`raw_open_price`、`execution_price`、`commission`、`slippage_cost`を保存します。値が確定しない非約定項目は空欄です。
 
+## Phase 2のデータ取得設計
+
+Phase 2は「1回の実行につき1つのPrice Provider」を不変条件とします。Providerを連結しません。つまり、古い期間のyfinanceと新しい期間のJ-Quantsを連結したOHLCVは作りません。調整規約、取得可能期間、欠損、価格単位の違いを1本の時系列の中に隠さないためです。Strategy、RangeScorer、BacktestEngineは外部APIを直接呼び出さず、Providerが次のCanonical Schemaへ変換したデータだけを受け取ります。
+
+```text
+date, symbol, provider,
+raw_open, raw_high, raw_low, raw_close, raw_volume, turnover_value,
+adjusted_open, adjusted_high, adjusted_low, adjusted_close, adjusted_volume,
+adjustment_factor, dividend, stock_split, fetched_at
+```
+
+Phase 1.1 Adapterは調整済みOHLCVを指標計算へ渡し、Liquidity ScoreにはProvider側の実売買代金を優先します。すべてのPhase 2派生出力に`provider`、`requested_start`、`requested_end`、`actual_start`、`actual_end`、`adjustment_mode`、`universe_as_of_date`を付けます。日付区間は開始日を含み、`end`を含まない半開区間です。特にyfinanceの`end`は排他的であることをテストで固定しています。
+
+### J-Quants API V2 Free
+
+[公式Pythonクライアント](https://github.com/J-Quants/jquants-api-client-python)の`ClientV2`トランスポートを使い、上場銘柄マスタ、日足、取引カレンダーのV2 endpointを扱います。Freeは5年分の価格取得に使わず、12週間遅延した利用可能期間でUniverse、公式価格との重複期間比較、J-Quants単独の短期実行に使います。取得可能日を固定日付で仮定せず、実際の最古日・最新日をmanifestに保存します。
+
+`config/data_sources.yaml`は`plan: free`、`rate_limit_per_minute: 5`、`min_request_interval_seconds: 13`を固定します。ページネーションも含めて全リクエストを直列実行し、公式クライアントの並列`*_range`に依存しません。HTTP 429は`Retry-After`を優先し、ない場合とserver/network失敗は指数バックオフ＋jitterで設定回数までretryします。Free契約でカレンダーendpointを使えない場合、平日を代用することはせず、upstreamのエラーを明示します。
+
+APIキーは環境変数`JQUANTS_API_KEY`以外から読み込みません。CLI引数、YAML、ログへ渡す設計はありません。
+
+```bash
+export JQUANTS_API_KEY="<your-api-key>"
+```
+
+リポジトリ直下の`.env.example`は空の変数名だけを示し、`.env`はGit対象外です。
+
+J-Quantsは`AdjO / AdjH / AdjL / AdjC / AdjVo`を調整済みOHLCV、`Va`を売買代金としてそのまま保持します。`AdjFactor`は調整係数として保持しますが、Yahooの分割イベント比率と同じとは見なしません。日足レスポンスにない配当金や分割イベントを推測して補いません。
+
+### yfinanceの5年価格
+
+yfinanceは個人の研究・バックテスト用に限定し、直近5年の日足取得に使います。[公式`download`リファレンス](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)に従い、取得引数は`interval="1d"`、`auto_adjust=False`、`actions=True`、`keepna=True`、`progress=False`、`threads=False`を明示します。50銘柄ずつのbatchに分割し、空応答、不明ticker、部分失敗は銘柄別のstatusと理由に記録します。
+
+Raw Open/High/Low/Close/VolumeとDividends/Stock Splitsを保持し、`Adj Close / Close`比をOHLCにだけ適用します。この比率には配当の影響が含まれ得るため、Volumeに逆数を掛けて分割調整量と見なすことはしません。`adjusted_volume`はRaw Volume、`turnover_value`はRaw Close × Raw Volumeです。J-Quantsとの調整規約差は自動補正せずProvider比較に残します。
+
+## 国内普通株Universe
+
+J-Quants上場銘柄マスタの公式コードだけで判定します。商品区分`011`で、市場区分`0111`（Prime）、`0112`（Standard）、`0113`（Growth）の銘柄を含めます。ETF、ETN、REIT、インフラファンド、優先株、出資証券、外国株・外国ETF、PRO Marketなどは商品・市場コードが対象外のため除外されます。名称の部分一致は使いません。
+
+Universe Snapshotは除外銘柄も含め、基準日、J-Quantsコード、会社名、市場、業種、商品区分、Yahoo ticker、判定、除外理由を保存します。J-Quantsの5桁コードは常に文字列で保持し、`72030`→`7203.T`、`130A0`→`130A.T`の末尾規則を正規表現で検証します。推測で変換できない銘柄は`unresolved_symbols.csv`へ出力します。
+
+Snapshotのマスタ日と`as_of_date`の一致を検証し、現在Universeを過去Universeとしてラベル付けしません。一方、Freeとyfinanceだけで5年前の完全なpoint-in-time Universeは再現できない可能性があります。現在Universeを使った5年分の結果は「探索的・in-sample記述」であり、Survivorship bias除去済み、または予測性能の検証とは表現しません。
+
+## キャッシュとmanifest
+
+Provider別の本体を`.data_cache/<provider>/<dataset>/`のParquet、要求別manifestを`.data_cache/manifests/`のJSONで保存します。要求内容のSHA-256 keyが一致する場合はAPIを呼ばず再利用し、`--refresh`の場合だけ再取得します。Parquetを先、それを指すmanifestを後に原子的に公開するため、途中失敗時も完了済みキャッシュは維持されます。
+
+manifestにはProvider、endpoint/method、symbols、要求期間、実際の取得期間、UTC取得時刻、Schema version、調整モード、library version、行数、列、content hash、Universe基準日、status集計、注記を保存します。読込時にhash、Schema、行数、列、要求メタデータを再検証します。`.data_cache/`、`*.parquet`、`data/raw/`はGit対象外であり、J-QuantsやYahooのRaw DataをGitHubへ掲載してはいけません。
+
+## Phase 2 CLI
+
+コマンドはPythonプロジェク直下で実行します。先に基準日Universeを作成し、同じSnapshotで価格、スクリーニング、独立バックテストを実行します。
+
+```bash
+python examples/download_universe.py \
+  --provider jquants \
+  --as-of YYYY-MM-DD
+
+python examples/download_prices.py \
+  --provider yfinance \
+  --years 5
+
+python examples/run_screening.py \
+  --provider yfinance \
+  --as-of YYYY-MM-DD \
+  --top 30
+
+python examples/run_batch_backtest.py \
+  --provider yfinance \
+  --ranking outputs/range_ranking_YYYY-MM-DD.csv
+
+python examples/compare_providers.py \
+  --symbols 1301,7203,8306,9984
+```
+
+`download_prices.py --end`も排他的です。例えば2026-09-01まで指定した場合、対象は2026-08-31までです。`--refresh`を付けない同一要求はキャッシュを再利用します。APIキーをCLI引数で渡すオプションはありません。
+
+Screeningは同一`as_of_date`の観測を持つ銘柄だけをRange Score降順、同点はJ-Quantsコード昇順で決定論的に並べます。取得失敗、空応答、履歴・Warm-up不足、基準日の欠測、不正OHLCVは`screening_exclusions_<date>.csv`に理由を残します。上位初期値は30銘柄で、利益率はランキングに使いません。
+
+Batch Backtestは各銘柄でPhase 1.1 Engineを新規生成し、各々の初期資金で独立実行します。共通資金のPortfolioではありません。`batch_backtest_summary.csv`、`batch_trade_log.csv`、`batch_order_log.csv`を出力し、1銘柄の失敗で全体を停止させません。
+
+Provider比較は重複日のRaw OHLC、Volume、Adjusted Close、Turnoverの相対差を計算し、Provider間差異が許容幅を超える列をWarningにします。J-Quantsを公式基準としますが、どちらのデータも書き換えず、5年yfinance時系列の一部をJ-Quantsで置換しません。
+
+Range Scoreの時系列評価は各月末時点までの情報だけで0–40、40–60、60–80、80–100の固定Binへ分け、後続20営業日の結果を記録します。この段階で閾値最適化は行いません。
+
+## Phase 2のデータ品質と制限
+
+- J-Quants Freeの遅延と期間制限により、希望する5年価格はyfinanceに依存します。取得可能期間はAPI応答とmanifestで確認が必要です。
+- Yahooの非公式性、tickerの対応関係、配当・分割・銘柄コード変更、通貨・価格単位、売買停止、上場廃止は別途確認が必要です。欠損価格を自動補間しません。
+- J-QuantsとYahooは調整規約や日付、出来高、売買代金が完全一致するとは限りません。比較Warningは品質調査の入口であり、正しい値の自動決定ではありません。
+- 価格がある日だけでカレンダーを完全再現することはできません。Freeで公式カレンダーを取得できない実行では、長期欠損率の判定に利用できません。
+- 5年前の上場廃止銘柄を含む完全なpoint-in-time UniverseがなければSurvivorship biasが残ります。現在のRange Scoreで銘柄を選び過去5年を表示しても予測性能の検証にはなりません。
+- Phase 2はパラメータ最適化、Walk-forward、Out-of-sample、機械学習、分足・Tick、共通資金Portfolio、Paper Trading、Broker API、実注文を実装しません。
+- Phase 2結果はデータと仮定に基づく探索的バックテストであり、利益や将来の成績を保証しません。
+
 ## テスト
 
 ```bash
@@ -203,7 +298,7 @@ ruff check .
 ruff format --check .
 ```
 
-Unit Testに加え、実サンプルを用いたAPI・CLIのend-to-end test、禁止されたネットワーク／注文送信コードの構造検査、Look-ahead bias専用テストを含みます。
+Unit Testに加え、Phase 1.1の実サンプルCLI、Phase 2の固定fixtureとmockによるdownload→cache→screening→batch backtest→reportのend-to-end test、禁止されたネットワーク／注文送信コードの構造検査、Look-ahead bias専用テストを含みます。通常のpytestは外部APIを呼びません。Live Testは`RUN_LIVE_JQUANTS_TESTS=1`または`RUN_LIVE_YFINANCE_TESTS=1`を明示した場合だけ最小範囲で実行され、J-Quantsはさらに`JQUANTS_API_KEY`がなければskipされます。
 
 Look-ahead専用テストは、未来データ改変に対する過去結果の不変性、シグナル日と約定日の厳格な前後関係、中央ローリング・未来方向shift・backfillの不使用を検証します。
 
@@ -223,8 +318,8 @@ Look-ahead専用テストは、未来データ改変に対する過去結果の�
 
 ## Roadmap
 
-1. **Phase 1.1（現在）**：Phase 1にOrder Log、出来高ゼロ失効、実行可能ベンチマーク、売買代金流動性、ADX互換性、CIを追加
-2. **Phase 2**：J-Quants API、東証銘柄一括取得、Range Scoreランキング、複数銘柄Backtest
+1. **Phase 1.1（完了）**：Phase 1にOrder Log、出来高ゼロ失効、実行可能ベンチマーク、売買代金流動性、ADX互換性、CIを追加
+2. **Phase 2（現在）**：J-Quants API V2 Free、yfinance、国内普通株Universe、Provider別cache、Range Scoreランキング、銘柄別Backtest集計、Provider間比較
 3. **Phase 3**：Parameter Search、Walk-forward validation、Out-of-sample test
 4. **Phase 4**：Paper Trading
 5. **Phase 5**：証券会社API連携
