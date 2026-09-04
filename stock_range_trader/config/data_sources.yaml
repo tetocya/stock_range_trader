@@ -1,0 +1,24 @@
+cache_root: .data_cache
+schema_version: "2.0"
+
+jquants:
+  plan: free
+  rate_limit_per_minute: 5
+  min_request_interval_seconds: 13
+  timeout_seconds: 30
+  max_retries: 3
+
+yfinance:
+  batch_size: 50
+  threads: false
+  timeout_seconds: 20
+  max_retries: 3
+
+screening:
+  top_n: 30
+  minimum_observations: 120
+  maximum_missing_session_ratio: 0.10
+
+comparison:
+  price_relative_tolerance: 0.01
+  volume_relative_tolerance: 0.10
