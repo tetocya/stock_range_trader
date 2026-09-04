@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 
 from data import (
-    DIVIDEND_POLICY,
+    UnsupportedCorporateActionError,
     canonical_to_phase1,
     require_single_provider,
-    validate_backtest_price_contract,
+    validate_signal_price_contract,
 )
 
 from .range_detector import RangeDetector
@@ -19,6 +19,13 @@ from .range_score import RangeScorer
 
 SCORE_BINS: tuple[float, ...] = (0.0, 40.0, 60.0, 80.0, 100.0000001)
 SCORE_LABELS: tuple[str, ...] = ("0-40", "40-60", "60-80", "80-100")
+RANGE_SCORE_FORWARD_RETURN_MODE = (
+    "provider_adjusted_signal_close;cash_dividends_not_added;"
+    "provider_adjustment_may_include_distributions"
+)
+RANGE_SCORE_DIVIDEND_POLICY = (
+    "cash_dividends_not_added;provider_adjusted_signal_price_may_embed_distributions"
+)
 OBSERVATION_COLUMNS: tuple[str, ...] = (
     "provider",
     "symbol",
@@ -52,6 +59,12 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
     "forward_return_ci95_lower",
     "forward_return_ci95_upper",
 )
+EVALUATION_EXCLUSION_COLUMNS: tuple[str, ...] = (
+    "provider",
+    "symbol",
+    "status",
+    "reason",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +73,7 @@ class ScoreEvaluationResult:
 
     observations: pd.DataFrame
     summary: pd.DataFrame
+    exclusions: pd.DataFrame
 
 
 def evaluate_range_score_history(
@@ -71,9 +85,10 @@ def evaluate_range_score_history(
 ) -> ScoreEvaluationResult:
     """Evaluate fixed bins without exposing any future row to score generation.
 
-    Forward returns and excursions use provider-reported execution closes and
-    exclude cash dividends. Intervals containing a split are rejected before
-    evaluation. The fixed SMA visible on the evaluation date is the
+    Forward returns and excursions use the provider-adjusted signal close;
+    cash dividends are not added separately. Symbols with an in-range split
+    or unverified provider adjustment are excluded without stopping other
+    symbols. The fixed SMA visible on the evaluation date is the
     mean-reversion target.
     """
 
@@ -83,10 +98,23 @@ def evaluate_range_score_history(
         raise ValueError("forward_sessions must be positive")
     provider = require_single_provider(bars)
     records: list[dict[str, object]] = []
+    exclusion_records: list[dict[str, object]] = []
     for symbol in sorted(set(bars["symbol"].astype(str))):
         symbol_bars = bars.loc[bars["symbol"].astype(str) == symbol].copy()
-        phase1 = canonical_to_phase1(symbol_bars, symbol=symbol)
-        validate_backtest_price_contract(phase1)
+        try:
+            _reject_unverified_corporate_action(symbol_bars, provider)
+            phase1 = canonical_to_phase1(symbol_bars, symbol=symbol)
+            validate_signal_price_contract(phase1)
+        except UnsupportedCorporateActionError as error:
+            exclusion_records.append(
+                {
+                    "provider": provider,
+                    "symbol": symbol,
+                    "status": "unsupported",
+                    "reason": str(error),
+                }
+            )
+            continue
         month_end_positions = (
             phase1.reset_index(drop=True)
             .groupby(phase1["date"].dt.to_period("M").to_numpy(), sort=True)
@@ -104,8 +132,8 @@ def evaluate_range_score_history(
             if pd.isna(row["range_score"]) or pd.isna(row["sma"]):
                 continue
             future = phase1.iloc[int(position) + 1 : forward_position + 1]
-            path_returns = _provider_reported_path_returns(
-                current_close=float(phase1.iloc[int(position)]["execution_close"]),
+            path_returns = _adjusted_signal_path_returns(
+                current_close=float(phase1.iloc[int(position)]["signal_close"]),
                 future=future,
             )
             forward_return = float(path_returns.iloc[-1])
@@ -138,28 +166,54 @@ def evaluate_range_score_history(
                     "maximum_adverse_excursion": min(0.0, float(path_returns.min())),
                     "maximum_favorable_excursion": max(0.0, float(path_returns.max())),
                     "maximum_drawdown": _maximum_drawdown(path_returns),
-                    "dividend_policy": DIVIDEND_POLICY,
+                    "dividend_policy": RANGE_SCORE_DIVIDEND_POLICY,
                     "universe_bias": (
                         "current/supplied universe; survivorship bias possible"
                     ),
                 }
             )
     observations = pd.DataFrame.from_records(records, columns=OBSERVATION_COLUMNS)
+    exclusions = pd.DataFrame.from_records(
+        exclusion_records, columns=EVALUATION_EXCLUSION_COLUMNS
+    ).sort_values("symbol", kind="stable", ignore_index=True)
     if observations.empty:
         return ScoreEvaluationResult(
             observations,
             pd.DataFrame(columns=SUMMARY_COLUMNS),
+            exclusions,
         )
     observations["score_bin"] = pd.Categorical(
         observations["score_bin"], categories=SCORE_LABELS, ordered=True
     )
-    return ScoreEvaluationResult(observations, _summarize(observations))
+    return ScoreEvaluationResult(observations, _summarize(observations), exclusions)
 
 
-def _provider_reported_path_returns(
+def _adjusted_signal_path_returns(
     *, current_close: float, future: pd.DataFrame
 ) -> pd.Series:
-    return future["execution_close"].astype(float) / current_close - 1.0
+    return future["signal_close"].astype(float) / current_close - 1.0
+
+
+def _reject_unverified_corporate_action(
+    symbol_bars: pd.DataFrame, provider: str
+) -> None:
+    if provider == "yfinance":
+        split = pd.to_numeric(symbol_bars["stock_split"], errors="coerce")
+        if split.fillna(0.0).ne(0.0).any():
+            raise UnsupportedCorporateActionError(
+                "yfinance Stock Splits != 0 in the evaluation interval"
+            )
+        return
+    if provider == "jquants":
+        adjustment = pd.to_numeric(symbol_bars["adjustment_factor"], errors="coerce")
+        if not adjustment.eq(1.0).all():
+            raise UnsupportedCorporateActionError(
+                "J-Quants adjustment_factor != 1 in the evaluation interval"
+            )
+        return
+    raise UnsupportedCorporateActionError(
+        f"unsupported provider for Range Score evaluation: {provider}"
+    )
 
 
 def _target_was_hit(

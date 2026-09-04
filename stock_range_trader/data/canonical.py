@@ -276,12 +276,11 @@ def canonical_to_phase1(
     )
     provider = str(selected["provider"].iloc[0])
     if provider == "yfinance":
-        split = pd.to_numeric(selected["stock_split"], errors="coerce")
-        split_detected = bool(split.fillna(0.0).ne(0.0).any())
-        # Yahoo's action event is retained in the canonical frame, but its
-        # OHLCV adjustment basis is not assumed. Do not mutate held shares.
+        # Even a split after the exclusive requested end can retrospectively
+        # alter Yahoo's historical basis. Signal analysis remains available,
+        # but this adapter never authorizes yfinance executable results.
         result["split_ratio"] = 1.0
-        result["corporate_action_supported"] = not split_detected
+        result["corporate_action_supported"] = False
     elif provider == "jquants":
         result["split_ratio"] = 1.0
         result["corporate_action_supported"] = bool(

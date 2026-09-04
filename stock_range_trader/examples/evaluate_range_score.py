@@ -16,7 +16,12 @@ from config import load_strategy_config
 from data import require_single_provider
 from data.providers import JQUANTS_ADJUSTMENT_MODE, YFINANCE_ADJUSTMENT_MODE
 from reports import Phase2RunMetadata, write_phase2_csv, write_run_manifest
-from screening import SCORE_LABELS, evaluate_range_score_history
+from screening import (
+    RANGE_SCORE_DIVIDEND_POLICY,
+    RANGE_SCORE_FORWARD_RETURN_MODE,
+    SCORE_LABELS,
+    evaluate_range_score_history,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,13 +66,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         universe_as_of_date=None,
         analysis_design="causal_month_end_fixed_bins_exploratory",
+        dividend_policy=RANGE_SCORE_DIVIDEND_POLICY,
     )
     output_dir: Path = args.output_dir
     observation_path = output_dir / "range_score_observations.csv"
     summary_path = output_dir / "range_score_bin_summary.csv"
+    exclusion_path = output_dir / "range_score_exclusions.csv"
     manifest_path = output_dir / "range_score_evaluation_manifest.json"
     write_phase2_csv(result.observations, observation_path, metadata)
     write_phase2_csv(result.summary, summary_path, metadata)
+    write_phase2_csv(result.exclusions, exclusion_path, metadata)
+    exclusion_records = result.exclusions.loc[
+        :, ["symbol", "status", "reason"]
+    ].to_dict(orient="records")
     write_run_manifest(
         metadata,
         manifest_path,
@@ -81,9 +92,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "survivorship bias may remain"
             ),
             "score_information_set": "evaluation date and earlier rows only",
-            "forward_return_mode": (
-                "provider-reported execution close; split intervals unsupported"
-            ),
+            "forward_return_mode": RANGE_SCORE_FORWARD_RETURN_MODE,
+            "exclusions_file": exclusion_path.name,
+            "excluded_symbol_count": int(result.exclusions["symbol"].nunique()),
+            "exclusion_count": len(result.exclusions),
+            "exclusions": exclusion_records,
             "profit_factor_policy": "not_applicable_no_trading_rule",
             "confidence_interval": "normal 95% interval for mean forward return",
             "overlap_warning": (
@@ -95,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(observation_path)
     print(summary_path)
+    print(exclusion_path)
     print(manifest_path)
     return 0
 

@@ -60,3 +60,23 @@ def test_live_yfinance_mhi_2024_split_is_golden_unsupported() -> None:
     assert not adapted["corporate_action_supported"].any()
     with pytest.raises(UnsupportedCorporateActionError, match="price basis"):
         validate_backtest_price_contract(adapted)
+
+
+@pytest.mark.live_yfinance
+@pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_YFINANCE_TESTS") != "1",
+    reason="requires RUN_LIVE_YFINANCE_TESTS=1",
+)
+def test_live_yfinance_mhi_pre_split_exclusive_end_is_still_unsupported() -> None:
+    """A window ending before Yahoo's split row must not authorize execution."""
+
+    bars = YFinanceProvider(batch_size=1).get_daily_bars(
+        ["7011.T"], date(2024, 3, 20), date(2024, 3, 28)
+    )
+
+    assert not bars.empty
+    assert bars["stock_split"].eq(0.0).all()
+    assert bars["date"].dt.date.max() < date(2024, 3, 28)
+    adapted = canonical_to_phase1(bars, symbol="7011.T")
+    with pytest.raises(UnsupportedCorporateActionError, match="always unsupported"):
+        validate_backtest_price_contract(adapted)

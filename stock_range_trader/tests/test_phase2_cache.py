@@ -132,6 +132,24 @@ def test_cache_detects_schema_and_manifest_corruption(tmp_path) -> None:
         manager.load(request)
 
 
+def test_cache_detects_provider_price_basis_manifest_tampering(tmp_path) -> None:
+    manager = CacheManager(tmp_path)
+    request = _request()
+    manager.store(
+        request,
+        canonical_bars(periods=3),
+        endpoint="yfinance.download",
+        library_version="test",
+    )
+    manifest_path = tmp_path / "manifests" / f"{request.key}.json"
+    values = json.loads(manifest_path.read_text(encoding="utf-8"))
+    values["provider_price_basis"] = "tampered"
+    manifest_path.write_text(json.dumps(values), encoding="utf-8")
+
+    with pytest.raises(CacheCorruptionError, match="provider_price_basis mismatch"):
+        manager.load(request)
+
+
 def test_failed_refresh_leaves_completed_cache_readable(tmp_path, monkeypatch) -> None:
     manager = CacheManager(tmp_path)
     request = _request()

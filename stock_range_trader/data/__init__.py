@@ -24,6 +24,7 @@ from .price_policy import (
     price_policy_manifest_fields,
     provider_price_basis,
     validate_backtest_price_contract,
+    validate_signal_price_contract,
 )
 from .reconciliation import ProviderComparisonResult, compare_providers
 from .validation import DataValidationError, validate_ohlcv
@@ -54,5 +55,6 @@ __all__ = [
     "require_single_provider",
     "validate_canonical_bars",
     "validate_backtest_price_contract",
+    "validate_signal_price_contract",
     "validate_ohlcv",
 ]

@@ -113,7 +113,8 @@ def test_mock_pipeline_download_cache_screen_backtest_and_report(tmp_path) -> No
     assert calls == 1
     assert len(screened.ranking) == 2
     assert screened.exclusions.empty
-    assert set(batch.summary["status"]) == {"ok"}
+    assert set(batch.summary["status"]) == {"unsupported"}
+    assert batch.summary["error"].str.contains("always unsupported").all()
     assert ranking_path.is_file()
     assert summary_path.is_file()
     assert manifest_path.is_file()

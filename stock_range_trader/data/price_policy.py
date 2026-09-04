@@ -10,17 +10,22 @@ import pandas as pd
 from .validation import validate_ohlcv
 
 SIGNAL_PRICE_MODE = "provider_adjusted_ohlc"
-EXECUTION_PRICE_MODE = "provider_reported_ohlcv_basis_not_assumed_unadjusted"
+EXECUTION_PRICE_MODE = (
+    "provider_reported_ohlcv_executable_only_if_price_basis_verified;"
+    "yfinance_unsupported"
+)
 DIVIDEND_POLICY = "excluded_from_strategy_and_benchmarks"
 CORPORATE_ACTION_MODE = (
-    "split_detected_means_executable_unsupported;"
+    "yfinance_executable_always_unsupported;"
+    "other_unverified_corporate_actions_unsupported;"
     "share_adjustment_disabled;no_cash_dividends"
 )
 THEORETICAL_BENCHMARK_MODE = (
-    "provider_reported_close_price_return_split_free_intervals_no_dividends"
+    "verified_provider_reported_close_price_return_no_dividends;yfinance_unsupported"
 )
 EXECUTABLE_BENCHMARK_MODE = (
-    "provider_reported_open_fill_close_valuation_split_free_intervals_no_dividends"
+    "verified_provider_reported_open_fill_close_valuation_no_dividends;"
+    "yfinance_unsupported"
 )
 
 _PROVIDER_PRICE_BASES: Mapping[str, str] = {
@@ -71,19 +76,10 @@ def has_dual_price_lanes(frame: pd.DataFrame) -> bool:
 def validate_backtest_price_contract(frame: pd.DataFrame) -> None:
     """Validate explicit lanes and reject unsupported corporate actions."""
 
+    validate_signal_price_contract(frame)
     if not has_dual_price_lanes(frame):
         return
-    for legacy, signal in zip(
-        ("open", "high", "low", "close", "volume"), SIGNAL_COLUMNS, strict=True
-    ):
-        if not np.allclose(
-            frame[legacy].to_numpy(dtype=float),
-            frame[signal].to_numpy(dtype=float),
-            rtol=0.0,
-            atol=0.0,
-            equal_nan=True,
-        ):
-            raise ValueError(f"legacy {legacy} must equal explicit {signal}")
+
     execution = pd.DataFrame(
         {
             "date": frame["date"],
@@ -114,9 +110,27 @@ def validate_backtest_price_contract(frame: pd.DataFrame) -> None:
         )
     if not supported.astype(bool).all():
         raise UnsupportedCorporateActionError(
-            "corporate action detected but the provider price basis is not "
-            "verified; executable results are unsupported"
+            "provider price basis is not verified for executable results; "
+            "yfinance executable backtests are always unsupported"
         )
+
+
+def validate_signal_price_contract(frame: pd.DataFrame) -> None:
+    """Validate the adjusted signal lane without authorizing execution."""
+
+    if not has_dual_price_lanes(frame):
+        return
+    for legacy, signal in zip(
+        ("open", "high", "low", "close", "volume"), SIGNAL_COLUMNS, strict=True
+    ):
+        if not np.allclose(
+            frame[legacy].to_numpy(dtype=float),
+            frame[signal].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        ):
+            raise ValueError(f"legacy {legacy} must equal explicit {signal}")
 
 
 def provider_price_basis(provider: str) -> str:

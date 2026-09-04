@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -98,7 +100,20 @@ def test_non_unit_split_ratio_is_rejected_before_share_adjustment() -> None:
         _engine().run("7203", frame)
 
 
-def test_yfinance_split_event_marks_entire_interval_unsupported() -> None:
+def test_7011_pre_split_window_is_still_executable_unsupported() -> None:
+    bars = canonical_bars("7011.T", periods=5, end=date(2024, 3, 27))
+
+    adapted = canonical_to_phase1(bars, symbol="7011.T")
+
+    assert bars["date"].dt.date.max() < date(2024, 3, 28)
+    assert bars["stock_split"].eq(0.0).all()
+    assert adapted["split_ratio"].eq(1.0).all()
+    assert not adapted["corporate_action_supported"].any()
+    with pytest.raises(UnsupportedCorporateActionError, match="always unsupported"):
+        validate_backtest_price_contract(adapted)
+
+
+def test_yfinance_split_event_remains_executable_unsupported() -> None:
     bars = canonical_bars(periods=4)
     bars.loc[2, "stock_split"] = 2.0
 
@@ -108,7 +123,7 @@ def test_yfinance_split_event_marks_entire_interval_unsupported() -> None:
     assert not adapted["corporate_action_supported"].any()
     with pytest.raises(
         UnsupportedCorporateActionError,
-        match="provider price basis is not verified",
+        match="always unsupported",
     ):
         validate_backtest_price_contract(adapted)
 

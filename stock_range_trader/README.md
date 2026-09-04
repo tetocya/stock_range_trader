@@ -134,7 +134,7 @@ Trade LogのGross Profitはスリッページ反映済みの売買価格差、Ne
 
 Backtest Engineは日付昇順の各行を次の順序で処理します。
 
-1. 対象期間に未検証の企業行動または`split_ratio != 1`があればExecutable処理を開始せず`unsupported`とする
+1. yfinance、未検証の企業行動、または`split_ratio != 1`を含む入力はExecutable処理を開始せず`unsupported`とする
 2. 前営業日から保留されたシグナルを当日のProvider報告始値・出来高で約定判定
 3. Provider報告約定価格で現金とポジションを更新
 4. 当日のProvider報告終値で時価評価し、保有日数とドローダウンを更新
@@ -155,8 +155,8 @@ Backtest Engineは日付昇順の各行を次の順序で処理します。
 - Sortino Ratio：日次超過リターンの平均を負の超過リターンの二乗平均平方根で除し、年率換算
 - Average Holding Period：完結取引の保有営業日数の平均
 - Exposure：終値時点のPosition Valueが正である営業日の割合
-- Theoretical Buy & Hold：企業行動が検出されない区間の初日と最終日のProvider報告終値を使う価格リターン。資金・単元株・残余現金・コスト・配当は反映しません
-- Executable Buy & Hold：企業行動が検出されない区間でStrategyと同じ初期資金を使い、初日のProvider報告始値へBUY側SlippageとCommissionを適用し、設定単元株で買える最大株数を購入してProvider報告終値で時価評価します。`max_position_pct`、配当、税金、強制売却は含みません
+- Theoretical Buy & Hold：価格basisを確認でき、企業行動が検出されない区間の初日と最終日のProvider報告終値を使う価格リターン。資金・単元株・残余現金・コスト・配当は反映しません。yfinanceでは出力しません
+- Executable Buy & Hold：価格basisを確認でき、企業行動が検出されない区間でStrategyと同じ初期資金を使い、初日のProvider報告始値へBUY側SlippageとCommissionを適用し、設定単元株で買える最大株数を購入してProvider報告終値で時価評価します。`max_position_pct`、配当、税金、強制売却は含みません。yfinanceでは出力しません
 - Strategy vs Executable Buy & Hold：Total ReturnからExecutable Buy & Hold Returnを引いた比較可能な差
 
 旧APIの`buy_and_hold_return`はTheoretical Buy & Holdを意味する非推奨aliasです。新規コードでは曖昧さのない各フィールドを使用してください。Equity Curve比較グラフはExecutable Buy & Holdを表示します。
@@ -216,11 +216,11 @@ Phase 1.1 AdapterはCanonicalデータを下記の2本の価格laneへ分けま�
 | Signal lane | Providerの調整済みOHLCV | SMA・ATR・ADX、Range特徴量、Range Score、エントリー／イグジットシグナル、Stop Loss判定 |
 | Execution lane | Provider報告OHLCV（basisはmanifest参照） | 翌営業日始値約定、Position Sizing、Commission、Slippage Cost、Cash、終値時価評価、Benchmark |
 
-`open/high/low/close/volume`は後方互換のSignal laneです。`signal_*`と`execution_*`を別列とし、企業行動のない対象区間では後者を約定シミュレーションへ使います。調整済みSignal価格をFill、購入可能株数、手数料、現金残高に使用しません。当日終値のSignalは引き続き次に現れる営業日のExecution Openでのみ約定します。
+`open/high/low/close/volume`は後方互換のSignal laneです。`signal_*`と`execution_*`を別列とし、価格basisを確認できるProviderの企業行動がない区間だけで後者を約定シミュレーションへ使います。調整済みSignal価格をFill、購入可能株数、手数料、現金残高に使用しません。当日終値のSignalは引き続き次に現れる営業日のExecution Openでのみ約定します。
 
 配当はCanonicalに保持しますが、StrategyとTheoretical／Executable Buy & Holdのいずれの利益・現金にも加算しない「配当除外の価格リターン」規約です。YahooのSignal laneは`Adj Close / Close`由来のため配当調整の影響を含み得ますが、これは指標の尺度調整であり、配当金を利益とする意味ではありません。
 
-yfinanceは選択期間に`Stock Splits != 0`が1件でもあれば、区間全体のStrategy／Executable Buy & Holdを`UnsupportedCorporateActionError`で停止します。Yahooの`Open/High/Low/Close/Volume`は`auto_adjust=False`で取得したProvider報告値ですが、歴史的な未調整basisだとは仮定しません。J-Quantsも選択期間に`AdjFactor != 1`があれば停止します。価格系列のbasisを実データで確認できるまで、Engine、Portfolio、Benchmarkのいずれも分割比率を株数へ適用しません。
+yfinanceはスクリーニング、指標、Range Score等のSignal分析専用です。Yahooの`Open/High/Low/Close/Volume`は`auto_adjust=False`で取得したProvider報告値ですが、歴史的な未調整basisだとは仮定しません。要求期間に分割行がなくても、排他的`end`より後の分割によって過去OHLCが遡及変更された可能性を否定できないため、すべてのyfinance Strategy Backtest／Theoretical・Executable Buy & Holdを`UnsupportedCorporateActionError`で停止します。J-Quantsも選択期間に`AdjFactor != 1`があれば停止します。価格系列のbasisを実データで確認できるまで、Engine、Portfolio、Benchmarkのいずれも分割比率を株数へ適用しません。
 
 ### 将来の実取引価格復元方針（未実装）
 
@@ -248,7 +248,7 @@ J-Quantsは`AdjO / AdjH / AdjL / AdjC / AdjVo`を調整済みOHLCV、`Va`を売�
 
 ### yfinanceの5年価格
 
-yfinanceは個人の研究・バックテスト用に限定し、直近5年の日足取得に使います。[公式`download`リファレンス](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)に従い、取得引数は`interval="1d"`、`auto_adjust=False`、`actions=True`、`keepna=True`、`progress=False`、`threads=False`を明示します。50銘柄ずつのbatchに分割し、空応答、不明ticker、部分失敗は銘柄別のstatusと理由に記録します。
+yfinanceは個人の研究・Signal分析用に限定し、直近5年の日足取得に使います。[公式`download`リファレンス](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)に従い、取得引数は`interval="1d"`、`auto_adjust=False`、`actions=True`、`keepna=True`、`progress=False`、`threads=False`を明示します。`start`は包含、`end`は排他的です。このため要求終了後の企業行動は取得結果へ現れず、期間内イベントがゼロでもExecutableを許可する根拠にはしません。50銘柄ずつのbatchに分割し、空応答、不明ticker、部分失敗は銘柄別のstatusと理由に記録します。
 
 Yahoo報告のOpen/High/Low/Close/VolumeとDividends/Stock SplitsをCanonicalの既存`raw_*`列へ保持し、`Adj Close / Close`比をOHLCにだけ適用します。この比率には配当の影響が含まれ得るため、Volumeに逆数を掛けて分割調整量と見なすことはしません。`adjusted_volume`はYahoo報告Volume、`turnover_value`はYahoo報告Close × Volumeです。`auto_adjust=False`という取得設定だけからYahoo報告OHLCを「historical unadjusted」とは呼びません。`provider_price_basis`には`historical_split_basis_unverified`を記録し、J-Quantsとの調整規約差は自動補正せずProvider比較に残します。
 
@@ -290,8 +290,14 @@ python examples/run_screening.py \
   --as-of YYYY-MM-DD \
   --top 30
 
+# Executableは同一ProviderのJ-Quantsランキングと価格でのみ実行
+python examples/run_screening.py \
+  --provider jquants \
+  --as-of YYYY-MM-DD \
+  --top 30
+
 python examples/run_batch_backtest.py \
-  --provider yfinance \
+  --provider jquants \
   --ranking outputs/range_ranking_YYYY-MM-DD.csv
 
 python examples/compare_providers.py \
@@ -310,19 +316,19 @@ J-Quantsのキャッシュmiss時は、APIを呼ぶ前に対象銘柄数、1銘�
 
 Screeningは同一`as_of_date`の観測を持つ銘柄だけをRange Score降順、同点はJ-Quantsコード昇順で決定論的に並べます。取得失敗、空応答、履歴・Warm-up不足、基準日の欠測、不正OHLCVは`screening_exclusions_<date>.csv`に理由を残します。上位初期値は30銘柄で、利益率はランキングに使いません。
 
-Batch Backtestは各銘柄でPhase 1.1 Engineを新規生成し、各々の初期資金で独立実行します。共通資金のPortfolioではありません。`batch_backtest_summary.csv`、`batch_trade_log.csv`、`batch_order_log.csv`を出力し、1銘柄の失敗で全体を停止させません。
+Batch Backtestは各銘柄でPhase 1.1 Engineを新規生成し、各々の初期資金で独立実行します。共通資金のPortfolioではありません。`batch_backtest_summary.csv`、`batch_trade_log.csv`、`batch_order_log.csv`を出力し、1銘柄の失敗で全体を停止させません。yfinance候補は分割行の有無にかかわらず銘柄別に`unsupported`となり、損益や誤ったBenchmarkを出力しません。
 
 Provider比較は重複日のRaw OHLC、Volume、Adjusted Close、Turnoverの相対差を計算し、Provider間差異が許容幅を超える列をWarningにします。J-Quantsを公式基準としますが、どちらのデータも書き換えず、5年yfinance時系列の一部をJ-Quantsで置換しません。
 
-Range Scoreの時系列評価は各月末にデータをその日付まで切り、Range DetectorとScorerを再計算します。0–40、40–60、60–80、80–100の固定Binごとに銘柄数と観測数、Forward Returnの平均・中央値、評価日SMAへの平均回帰到達率、Win Rate、平均MAE/MFE、Maximum Drawdown、Forward Returnの標準誤差と95%正規近似信頼区間を出力します。売買規則を適用しない観測評価のためProfit FactorはN/Aです。閾値や戦略パラメータの最適化は行いません。
+Range Scoreの時系列評価は各月末にデータをその日付まで切り、Range DetectorとScorerを再計算します。Forward ReturnとMAE/MFEはProvider調整済みSignal Closeで計算し、現金配当を別加算しませんが、Providerの調整値に分配の影響が含まれる可能性をmanifestへ明記します。0–40、40–60、60–80、80–100の固定Binごとに銘柄数と観測数、Forward Returnの平均・中央値、評価日SMAへの平均回帰到達率、Win Rate、平均MAE/MFE、Maximum Drawdown、Forward Returnの標準誤差と95%正規近似信頼区間を出力します。売買規則を適用しない観測評価のためProfit FactorはN/Aです。閾値や戦略パラメータの最適化は行いません。
 
-`range_score_observations.csv`、`range_score_bin_summary.csv`、`range_score_evaluation_manifest.json`を出力します。入力にUniverse Snapshotを要求しないCLIのため、manifestの`universe_as_of_date`は`null`とし、供給された銘柄集合にSurvivorship biasが残り得ると記録します。月次観測のForward期間は隣接月と重複し得るため、観測数は独立サンプル数ではありません。見かけ上のサンプル数増加と信頼区間の過小評価に注意が必要です。
+`range_score_observations.csv`、`range_score_bin_summary.csv`、`range_score_exclusions.csv`、`range_score_evaluation_manifest.json`を出力します。yfinanceの`Stock Splits != 0`またはJ-Quantsの`adjustment_factor != 1`を含む銘柄は`unsupported`として除外し、残りの銘柄は評価を継続します。CSVには銘柄・status・理由、manifestには除外ファイル名・除外銘柄数・件数・明細を記録します。入力にUniverse Snapshotを要求しないCLIのため、manifestの`universe_as_of_date`は`null`とし、供給された銘柄集合にSurvivorship biasが残り得ると記録します。月次観測のForward期間は隣接月と重複し得るため、観測数は独立サンプル数ではありません。見かけ上のサンプル数増加と信頼区間の過小評価に注意が必要です。
 
 ## Phase 2のデータ品質と制限
 
 - J-Quants Freeの遅延と期間制限により、希望する5年価格はyfinanceに依存します。取得可能期間はAPI応答とmanifestで確認が必要です。
 - Yahooの非公式性、tickerの対応関係、配当・分割・銘柄コード変更、通貨・価格単位、売買停止、上場廃止は別途確認が必要です。欠損価格を自動補間しません。
-- J-QuantsとYahooは調整規約や日付、出来高、売買代金が完全一致するとは限りません。J-Quantsの`AdjFactor != 1`またはyfinanceの`Stock Splits != 0`がある期間はExecutableバックテストをUnsupportedとします。比較Warningは品質調査の入口であり、正しい値の自動決定ではありません。
+- J-QuantsとYahooは調整規約や日付、出来高、売買代金が完全一致するとは限りません。yfinanceは期間内の`Stock Splits`がゼロでもExecutableバックテストを常にUnsupportedとします。J-Quantsは`AdjFactor != 1`がある期間をUnsupportedとします。比較Warningは品質調査の入口であり、正しい値の自動決定ではありません。
 - 価格がある日だけでカレンダーを完全再現することはできません。Freeで公式カレンダーを取得できない実行では、長期欠損率の判定に利用できません。
 - 5年前の上場廃止銘柄を含む完全なpoint-in-time UniverseがなければSurvivorship biasが残ります。現在のRange Scoreで銘柄を選び過去5年を表示しても予測性能の検証にはなりません。
 - Phase 2はパラメータ最適化、Walk-forward、Out-of-sample、機械学習、分足・Tick、共通資金Portfolio、Paper Trading、Broker API、実注文を実装しません。
@@ -336,15 +342,15 @@ ruff check .
 ruff format --check .
 ```
 
-Unit Testに加え、Phase 1.1の実サンプルCLI、Phase 2の固定fixtureとmockによるdownload→cache→screening→batch backtest→reportのend-to-end test、禁止されたネットワーク／注文送信コードの構造検査、Look-ahead bias専用テストを含みます。通常のpytestは外部APIを呼びません。Live Testは`RUN_LIVE_JQUANTS_TESTS=1`または`RUN_LIVE_YFINANCE_TESTS=1`を明示した場合だけ最小範囲で実行され、J-Quantsはさらに`JQUANTS_API_KEY`がなければskipされます。yfinance Live Golden Testは[三菱重工業の公式分割履歴](https://www.mhi.com/jp/finance/stock/allotment)にある7011の2024年1:10分割イベントを取得し、Executableが`unsupported`になることを検証します。
+Unit Testに加え、Phase 1.1の実サンプルCLI、Phase 2の固定fixtureとmockによるdownload→cache→screening→batch backtest→reportのend-to-end test、禁止されたネットワーク／注文送信コードの構造検査、Look-ahead bias専用テストを含みます。通常のpytestは外部APIを呼びません。Live Testは`RUN_LIVE_JQUANTS_TESTS=1`または`RUN_LIVE_YFINANCE_TESTS=1`を明示した場合だけ最小範囲で実行され、J-Quantsはさらに`JQUANTS_API_KEY`がなければskipされます。yfinance Live Golden Testは[三菱重工業の公式分割履歴](https://www.mhi.com/jp/finance/stock/allotment)にある7011の2024年1:10分割イベントを取得します。Yahooイベント行を含む区間に加え、排他的`end`を2024-03-28としてイベント行を含まない区間でもExecutableが`unsupported`になることを検証します。
 
 Look-ahead専用テストは、未来データ改変に対する過去結果の不変性、シグナル日と約定日の厳格な前後関係、中央ローリング・未来方向shift・backfillの不使用を検証します。
 
 ## 現在の制限事項
 
 - 入力銘柄集合が現時点の上場銘柄だけで作られている場合、Survivorship biasが残ります。上場廃止銘柄を含むpoint-in-time universeはPhase 1では提供しません。
-- yfinanceの明示的な株式分割・併合は現在、株数と取得原価へ反映しません。対象期間に存在すればExecutable結果を停止します。端数株のCash-in-lieu、配当再投資、配当税、銘柄コード変更、上場廃止、売買停止も再現しません。
-- Theoretical Buy & Holdは資金制約、単元株、残余現金、配当、手数料、税金を含みません。Executable Buy & Holdは企業行動のない区間だけを対象に初回BUYの単元株、残余現金、Slippage、Commissionを含めますが、配当・税金・売却費用は含みません。
+- yfinanceの明示的な株式分割・併合は現在、株数と取得原価へ反映しません。期間内イベントの有無にかかわらずExecutable結果を停止します。端数株のCash-in-lieu、配当再投資、配当税、銘柄コード変更、上場廃止、売買停止も再現しません。
+- Theoretical Buy & Holdは資金制約、単元株、残余現金、配当、手数料、税金を含みません。Executable Buy & Holdは価格basisを確認できたProviderの企業行動がない区間だけを対象に初回BUYの単元株、残余現金、Slippage、Commissionを含めますが、配当・税金・売却費用は含みません。yfinanceでは両Benchmarkを出力しません。
 - 単一銘柄、Long Only、日足、1ポジション、全数量EXITのみです。空売り、信用取引、部分約定、複数銘柄の資金競合は扱いません。
 - 約定モデルは翌営業日始値への一定率Slippageで、出来高ゼロだけを非約定として扱います。Bid/Ask spread、板の厚さ、出来高参加率、値幅制限、ストップ高・安、寄付成立時刻、市場インパクトは再現しません。
 - Stop Lossは当日終値で判定し、翌営業日始値で約定します。日中に閾値へ到達した瞬間の約定ではありません。
@@ -358,7 +364,7 @@ Look-ahead専用テストは、未来データ改変に対する過去結果の�
 
 1. **Phase 1.1（完了）**：Phase 1にOrder Log、出来高ゼロ失効、実行可能ベンチマーク、売買代金流動性、ADX互換性、CIを追加
 2. **Phase 2（完了）**：J-Quants API V2 Free、yfinance、国内普通株Universe、Provider別cache、Range Scoreランキング、銘柄別Backtest集計、Provider間比較
-3. **Phase 2.1（現在）**：Signal/Execution Price分離、分割会計、J-Quants実HTTP Rate Limit、Range Score固定Bin評価
+3. **Phase 2.1（現在）**：Signal/Execution Price分離、未検証価格basisのfail-closed、J-Quants実HTTP Rate Limit、Range Score固定Bin評価
 4. **Phase 3**：Parameter Search、Walk-forward validation、Out-of-sample test
 5. **Phase 4**：Paper Trading
 6. **Phase 5**：証券会社API連携
