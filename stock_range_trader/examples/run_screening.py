@@ -19,7 +19,11 @@ from phase2_common import (
 
 from config import load_strategy_config
 from data import require_single_provider
-from data.providers import DownloadIssue
+from data.providers import (
+    JQUANTS_ADJUSTMENT_MODE,
+    YFINANCE_ADJUSTMENT_MODE,
+    DownloadIssue,
+)
 from reports import Phase2RunMetadata, write_phase2_csv, write_run_manifest
 from screening import BatchScreener
 
@@ -85,9 +89,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         actual_start=actual_start,
         actual_end=actual_end,
         adjustment_mode=(
-            "adj_close_ratio_for_ohlc_raw_volume"
+            YFINANCE_ADJUSTMENT_MODE
             if args.provider == "yfinance"
-            else "jquants_official_adjusted_ohlcv"
+            else JQUANTS_ADJUSTMENT_MODE
         ),
         universe_as_of_date=pd.Timestamp(universe["as_of_date"].iloc[0]).date(),
     )

@@ -14,6 +14,7 @@ from data import (
     CanonicalDataError,
     assess_symbol_data,
     canonical_to_phase1,
+    provider_price_basis,
     require_single_provider,
     validate_canonical_bars,
 )
@@ -63,6 +64,13 @@ def test_canonical_validation_and_phase1_adapter_use_adjusted_prices() -> None:
 
     assert adapted["close"].equals(bars["adjusted_close"])
     assert adapted["turnover_value"].equals(bars["turnover_value"])
+
+
+def test_provider_price_basis_does_not_claim_yahoo_is_historically_unadjusted() -> None:
+    basis = provider_price_basis("yfinance")
+
+    assert "yahoo_reported" in basis
+    assert "historical_split_basis_unverified" in basis
 
 
 def test_canonical_rejects_future_data_and_provider_mixing() -> None:

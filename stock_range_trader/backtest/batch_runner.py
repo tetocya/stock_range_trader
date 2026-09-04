@@ -12,6 +12,7 @@ from data import (
     UnsupportedCorporateActionError,
     canonical_to_phase1,
     require_single_provider,
+    validate_backtest_price_contract,
 )
 from metrics import calculate_backtest_metrics
 from universe import jquants_to_yfinance
@@ -110,6 +111,7 @@ class BatchBacktestRunner:
                     bars["symbol"].astype(str) == provider_symbol
                 ].copy()
                 phase1 = canonical_to_phase1(symbol_bars, symbol=provider_symbol)
+                validate_backtest_price_contract(phase1)
                 detected = self.strategy_config.create_detector().transform(phase1)
                 scored = self.strategy_config.create_scorer().transform(detected)
                 result = self.strategy_config.create_engine().run(symbol, scored)

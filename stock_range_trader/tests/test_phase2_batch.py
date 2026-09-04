@@ -124,21 +124,21 @@ def test_screening_rejects_a_relabelled_universe_snapshot() -> None:
 
 def test_batch_failure_does_not_stop_successful_symbol_and_matches_single_run() -> None:
     config = load_strategy_config("config/strategy.yaml")
-    bars = canonical_bars("7203.T", periods=180)
+    bars = canonical_bars("72030", provider="jquants", periods=180)
     ranking = pd.DataFrame(
         [
             {
                 "rank": 1,
                 "symbol": "72030",
                 "company_name": "Toyota",
-                "provider": "yfinance",
+                "provider": "jquants",
                 "range_score": 81.0,
             },
             {
                 "rank": 2,
                 "symbol": "99840",
                 "company_name": "Missing",
-                "provider": "yfinance",
+                "provider": "jquants",
                 "range_score": 80.0,
             },
         ]
@@ -148,7 +148,7 @@ def test_batch_failure_does_not_stop_successful_symbol_and_matches_single_run() 
     successful = batch.summary.loc[batch.summary["symbol"] == "72030"].iloc[0]
     failed = batch.summary.loc[batch.summary["symbol"] == "99840"].iloc[0]
 
-    phase1 = canonical_to_phase1(bars, symbol="7203.T")
+    phase1 = canonical_to_phase1(bars, symbol="72030")
     scored = config.create_scorer().transform(
         config.create_detector().transform(phase1)
     )
@@ -228,4 +228,24 @@ def test_batch_marks_unreproducible_jquants_corporate_action_unsupported() -> No
     result = BatchBacktestRunner(config).run(ranking, bars)
 
     assert result.summary.loc[0, "status"] == "unsupported"
-    assert "split share ratio" in result.summary.loc[0, "error"]
+    assert "provider price basis" in result.summary.loc[0, "error"]
+
+
+def test_batch_marks_every_yfinance_interval_unsupported() -> None:
+    config = load_strategy_config("config/strategy.yaml")
+    bars = canonical_bars("7203.T", provider="yfinance", periods=180)
+    ranking = pd.DataFrame(
+        [
+            {
+                "symbol": "72030",
+                "company_name": "Toyota",
+                "provider": "yfinance",
+                "range_score": 80.0,
+            }
+        ]
+    )
+
+    result = BatchBacktestRunner(config).run(ranking, bars)
+
+    assert result.summary.loc[0, "status"] == "unsupported"
+    assert "always unsupported" in result.summary.loc[0, "error"]

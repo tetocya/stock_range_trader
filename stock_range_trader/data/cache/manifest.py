@@ -73,6 +73,7 @@ class DataManifest:
     request_key: str
     data_file: str
     columns: list[str]
+    provider_price_basis: str = ""
     universe_as_of_date: str | None = None
     status_counts: dict[str, int] = field(default_factory=dict)
     issues: list[dict[str, str]] = field(default_factory=list)

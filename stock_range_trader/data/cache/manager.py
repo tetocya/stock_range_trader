@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from ..price_policy import provider_price_basis
 from .manifest import CacheRequest, DataManifest
 
 
@@ -131,6 +132,7 @@ class CacheManager:
                 request_key=request.key,
                 data_file=data_file,
                 columns=list(frame.columns),
+                provider_price_basis=provider_price_basis(request.provider),
                 universe_as_of_date=_iso(request.universe_as_of_date),
                 status_counts=dict(status_counts or {}),
                 issues=[dict(issue) for issue in issues or []],
@@ -195,6 +197,8 @@ class CacheManager:
             raise CacheCorruptionError(
                 f"cache schema mismatch: {manifest.schema_version} != {self.schema_version}"
             )
+        if manifest.provider_price_basis != provider_price_basis(request.provider):
+            raise CacheCorruptionError("cache manifest provider_price_basis mismatch")
         expected = request.to_dict()
         for key in (
             "provider",

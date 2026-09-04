@@ -276,9 +276,11 @@ def canonical_to_phase1(
     )
     provider = str(selected["provider"].iloc[0])
     if provider == "yfinance":
-        split = pd.to_numeric(selected["stock_split"], errors="coerce")
-        result["split_ratio"] = split.where(split > 0.0, 1.0)
-        result["corporate_action_supported"] = True
+        # Even a split after the exclusive requested end can retrospectively
+        # alter Yahoo's historical basis. Signal analysis remains available,
+        # but this adapter never authorizes yfinance executable results.
+        result["split_ratio"] = 1.0
+        result["corporate_action_supported"] = False
     elif provider == "jquants":
         result["split_ratio"] = 1.0
         result["corporate_action_supported"] = bool(

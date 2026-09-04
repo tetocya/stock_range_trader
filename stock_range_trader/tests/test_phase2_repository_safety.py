@@ -26,7 +26,9 @@ def test_phase2_readme_documents_required_policies() -> None:
         "Adj Close / Close",
         "Provider間差異",
         "Survivorship bias",
-        "個人の研究・バックテスト用に限定",
+        "個人の研究・Signal分析用に限定",
+        "Executableバックテストを常にUnsupported",
+        "range_score_exclusions.csv",
         "Raw DataをGitHubへ掲載してはいけません",
         "利益や将来の成績を保証しません",
     ):
