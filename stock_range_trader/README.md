@@ -346,6 +346,42 @@ Unit Testに加え、Phase 1.1の実サンプルCLI、Phase 2の固定fixtureと
 
 Look-ahead専用テストは、未来データ改変に対する過去結果の不変性、シグナル日と約定日の厳格な前後関係、中央ローリング・未来方向shift・backfillの不使用を検証します。
 
+## Phase 3 Walk-forward CLI（STEP 8）
+
+Phase 3のSignal ValidationとExecutable Validationは別のローカルCLIです。どちらもCanonical Parquetと、単一の明示的な`as_of_date`を持つUniverse Snapshotを必須入力とし、外部データをダウンロードしません。`--end`は半開区間の終了日です。
+
+まず`--preflight-only`でProvider、価格basis、fold、Candidate、Universe時点、Git状態、Formal OOS適格性、出力衝突を確認します。この段階ではValidationもTestも実行せず、ファイルも出力しません。
+
+```bash
+python examples/run_walk_forward_signal.py \
+  --input outputs/yfinance_prices.parquet \
+  --universe outputs/universe_latest.csv \
+  --config config/phase3.yaml \
+  --strategy-config config/strategy.yaml \
+  --start 2021-01-01 \
+  --end 2026-01-01 \
+  --output-dir outputs/phase3_signal \
+  --preflight-only
+```
+
+内容を確認した後だけ、`--preflight-only`を`--confirm-test-evaluation`へ置き換えて実行します。Formal OOS条件を満たさない実行を拒否する場合は`--require-formal-oos`も指定します。同じExperiment IDの完成済みdirectoryは上書きされません。
+
+Executable ValidationはJ-Quantsの検証済み価格契約だけを許可し、yfinanceはRunnerの開始前に拒否します。
+
+```bash
+python examples/run_walk_forward_executable.py \
+  --input outputs/jquants_prices.parquet \
+  --universe outputs/universe_latest.csv \
+  --config config/phase3.yaml \
+  --strategy-config config/strategy.yaml \
+  --start 2025-01-01 \
+  --end 2026-01-01 \
+  --output-dir outputs/phase3_executable \
+  --preflight-only
+```
+
+出力先は`<output-dir>/<experiment_id>/`です。共通CSVにはfold境界、実観測境界、Validation Cohort、Universe coverage、Validation結果、選択済みパラメータ、選択頻度、除外、OOS集約を記録します。Signal modeは調整価格上のSignal outcomeだけを出力し、約定損益を含みません。Executable modeのTrade／Order／EquityとMetricsは、独立資金の`symbol-fold`分布であり、共通Portfolioやfold連結複利ではありません。`walk_forward_manifest.json`には入力・Universe・Git・価格契約・設定・fold・選択規則・除外集計・成果物hash・制限事項を保存します。
+
 ## 現在の制限事項
 
 - 入力銘柄集合が現時点の上場銘柄だけで作られている場合、Survivorship biasが残ります。上場廃止銘柄を含むpoint-in-time universeはPhase 1では提供しません。
@@ -356,7 +392,7 @@ Look-ahead専用テストは、未来データ改変に対する過去結果の�
 - Stop Lossは当日終値で判定し、翌営業日始値で約定します。日中に閾値へ到達した瞬間の約定ではありません。
 - 最終行のシグナルは翌営業日データがないため約定しません。未決済ポジションは最終終値で時価評価され、完結Trade Logには含まれません。
 - 最大ドローダウン停止は、一度発動すると当該バックテスト終了まで新規BUYを再開しない保守的な仕様です。
-- パラメータ最適化、Walk-forward、Out-of-sample検証は未実装です。サンプルCSVは人工データであり、戦略の有効性を示しません。
+- パラメータ最適化は未実装です。Phase 3のWalk-forward基盤はSTEP 8まで実装済みですが、包括的なLook-ahead試験、Mock end-to-end強化、Live Test、最終ドキュメントは後続STEPの対象です。サンプルCSVは人工データであり、戦略の有効性を示しません。
 - 機械学習、ニュース・SNS解析、リアルタイムデータ、高頻度・分足・Tick取引はPhase 1の対象外です。
 - 実注文機能は存在しません。将来Broker Interfaceを追加する場合も、Paper Tradingと実売買を明示的に分離する必要があります。
 
@@ -365,7 +401,7 @@ Look-ahead専用テストは、未来データ改変に対する過去結果の�
 1. **Phase 1.1（完了）**：Phase 1にOrder Log、出来高ゼロ失効、実行可能ベンチマーク、売買代金流動性、ADX互換性、CIを追加
 2. **Phase 2（完了）**：J-Quants API V2 Free、yfinance、国内普通株Universe、Provider別cache、Range Scoreランキング、銘柄別Backtest集計、Provider間比較
 3. **Phase 2.1（現在）**：Signal/Execution Price分離、未検証価格basisのfail-closed、J-Quants実HTTP Rate Limit、Range Score固定Bin評価
-4. **Phase 3**：Parameter Search、Walk-forward validation、Out-of-sample test
+4. **Phase 3（STEP 8まで実装）**：Walk-forward validation、Out-of-sample集約、監査CSV・Manifest・ローカルCLI
 5. **Phase 4**：Paper Trading
 6. **Phase 5**：証券会社API連携
 7. **Phase 6**：十分な検証とリスク制限を前提とした小規模Live Trading

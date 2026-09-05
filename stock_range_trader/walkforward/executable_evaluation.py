@@ -24,6 +24,12 @@ from data import (
 )
 from metrics import PerformanceMetrics, calculate_backtest_metrics
 
+from .audit import (
+    ExecutableTestEquityRecord,
+    ExecutableTestOrderRecord,
+    ExecutableTestTradeRecord,
+    freeze_executable_test_audit,
+)
 from .candidates import ExecutableCandidateCatalog, ExecutableCandidateDefinition
 from .capabilities import AnalysisMode, ProviderCapabilityRegistry
 from .folds import WalkForwardFold
@@ -401,6 +407,9 @@ class ExecutableTestEvaluationResult:
     symbol_outcomes: tuple[ExecutableTestSymbolOutcome, ...]
     symbol_exclusions: tuple[ExecutableTestSymbolExclusion, ...]
     summary: ExecutableTestSummary
+    trade_records: tuple[ExecutableTestTradeRecord, ...]
+    order_records: tuple[ExecutableTestOrderRecord, ...]
+    equity_records: tuple[ExecutableTestEquityRecord, ...]
 
     def __post_init__(self) -> None:
         for name in ("provider", "provider_price_basis", "fold_id", "candidate_id"):
@@ -430,6 +439,15 @@ class ExecutableTestEvaluationResult:
         )
         if not isinstance(self.summary, ExecutableTestSummary):
             raise TypeError("summary must be ExecutableTestSummary")
+        _require_tuple_of(
+            "trade_records", self.trade_records, ExecutableTestTradeRecord
+        )
+        _require_tuple_of(
+            "order_records", self.order_records, ExecutableTestOrderRecord
+        )
+        _require_tuple_of(
+            "equity_records", self.equity_records, ExecutableTestEquityRecord
+        )
         excluded_symbols = tuple(item.symbol for item in self.symbol_exclusions)
         outcome_symbols = tuple(item.symbol for item in self.symbol_outcomes)
         if excluded_symbols != tuple(sorted(excluded_symbols)) or len(
@@ -481,6 +499,98 @@ class ExecutableTestEvaluationResult:
                 "Executable Test summary symbol counts must match result"
             )
         _validate_test_summary_against_outcomes(self.summary, self.symbol_outcomes)
+        self._validate_audit_records(set(excluded_symbols))
+
+    def _validate_audit_records(self, excluded_symbols: set[str]) -> None:
+        expected_prefix = (self.fold_id, self.provider, self.candidate_id)
+        outcome_by_symbol = {item.symbol: item for item in self.symbol_outcomes}
+        for name, records in (
+            ("trade", self.trade_records),
+            ("order", self.order_records),
+            ("equity", self.equity_records),
+        ):
+            keys = tuple((item.symbol, item.sequence) for item in records)
+            if keys != tuple(sorted(keys)) or len(keys) != len(set(keys)):
+                raise ExecutableEvaluationError(
+                    f"Executable Test {name} records must be unique and sorted"
+                )
+            for item in records:
+                if (item.fold_id, item.provider, item.candidate_id) != expected_prefix:
+                    raise ExecutableEvaluationError(
+                        f"Executable Test {name} record contract must match result"
+                    )
+                if item.symbol not in self.requested_symbols:
+                    raise ExecutableEvaluationError(
+                        f"Executable Test {name} record symbol was not requested"
+                    )
+                if item.symbol in excluded_symbols:
+                    raise ExecutableEvaluationError(
+                        "excluded symbols cannot contain Executable Test audit records"
+                    )
+            for symbol in sorted({item.symbol for item in records}):
+                sequences = tuple(
+                    item.sequence for item in records if item.symbol == symbol
+                )
+                if sequences != tuple(range(len(sequences))):
+                    raise ExecutableEvaluationError(
+                        f"Executable Test {name} sequences must start at zero "
+                        "and be contiguous per symbol"
+                    )
+
+        trades_by_symbol: dict[str, list[ExecutableTestTradeRecord]] = {
+            symbol: [] for symbol in outcome_by_symbol
+        }
+        orders_by_symbol: dict[str, list[ExecutableTestOrderRecord]] = {
+            symbol: [] for symbol in outcome_by_symbol
+        }
+        equities_by_symbol: dict[str, list[ExecutableTestEquityRecord]] = {
+            symbol: [] for symbol in outcome_by_symbol
+        }
+        for item in self.trade_records:
+            trades_by_symbol[item.symbol].append(item)
+        for item in self.order_records:
+            orders_by_symbol[item.symbol].append(item)
+        for item in self.equity_records:
+            equities_by_symbol[item.symbol].append(item)
+
+        for symbol, outcome in outcome_by_symbol.items():
+            equities = equities_by_symbol[symbol]
+            if not equities:
+                raise ExecutableEvaluationError(
+                    "each admitted Test symbol requires equity records"
+                )
+            if any(
+                item.date < outcome.test_first_observation_date
+                or item.date > outcome.test_last_observation_date
+                for item in equities
+            ):
+                raise ExecutableEvaluationError(
+                    "equity record date is outside the Test observation bounds"
+                )
+            if not math.isclose(
+                equities[-1].total_equity,
+                outcome.final_equity,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ExecutableEvaluationError(
+                    "final equity audit record must match the symbol outcome"
+                )
+            if len(trades_by_symbol[symbol]) != outcome.number_of_trades:
+                raise ExecutableEvaluationError(
+                    "trade audit record count must match the symbol outcome"
+                )
+            statuses = tuple(item.status for item in orders_by_symbol[symbol])
+            if (
+                statuses.count(OrderStatus.FILLED.value) != outcome.filled_order_count
+                or statuses.count(OrderStatus.REJECTED.value)
+                != outcome.rejected_order_count
+                or statuses.count(OrderStatus.CANCELED.value)
+                != outcome.canceled_order_count
+            ):
+                raise ExecutableEvaluationError(
+                    "order audit status counts must match the symbol outcome"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +850,9 @@ class ExecutableOutcomeEvaluator:
 
         window = BacktestWindow(fold.test_start, fold.test_end)
         outcomes: list[ExecutableTestSymbolOutcome] = []
+        trade_records: list[ExecutableTestTradeRecord] = []
+        order_records: list[ExecutableTestOrderRecord] = []
+        equity_records: list[ExecutableTestEquityRecord] = []
         for symbol in sorted(admitted_frames):
             features = _prepare_features(admitted_frames[symbol], config)
             engine = config.create_engine()
@@ -748,6 +861,13 @@ class ExecutableOutcomeEvaluator:
                 result,
                 annual_trading_days=config.annual_trading_days,
                 risk_free_rate=config.risk_free_rate,
+            )
+            trades, orders, equities = freeze_executable_test_audit(
+                result,
+                fold_id=fold.fold_id,
+                provider=provider,
+                candidate_id=candidate.candidate_id,
+                window=window,
             )
             outcomes.append(
                 _test_outcome_from_backtest(
@@ -758,6 +878,9 @@ class ExecutableOutcomeEvaluator:
                     metrics=metrics,
                 )
             )
+            trade_records.extend(trades)
+            order_records.extend(orders)
+            equity_records.extend(equities)
 
         summary = _executable_test_summary(
             candidate.candidate_id,
@@ -775,6 +898,9 @@ class ExecutableOutcomeEvaluator:
             symbol_outcomes=tuple(outcomes),
             symbol_exclusions=tuple(symbol_exclusions),
             summary=summary,
+            trade_records=tuple(trade_records),
+            order_records=tuple(order_records),
+            equity_records=tuple(equity_records),
         )
 
 
