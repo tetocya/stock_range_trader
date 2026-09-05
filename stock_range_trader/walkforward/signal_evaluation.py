@@ -482,9 +482,15 @@ class SignalOutcomeEvaluator:
         validate_canonical_bars(before_test_start, expected_provider=raw_provider)
         symbols = tuple(sorted(set(before_test_start["symbol"].astype(str))))
         input_symbol_count = len(symbols)
-        session_scope = in_scope_bars.loc[
-            in_scope_bars["symbol"].astype(str).isin(symbols)
-        ].copy()
+        session_scope = (
+            in_scope_bars.loc[
+                (in_scope_bars["date"].dt.date >= fold.train_start)
+                & in_scope_bars["symbol"].astype(str).isin(symbols),
+                ["symbol", "date"],
+            ]
+            .drop_duplicates(["symbol", "date"], keep="first")
+            .reset_index(drop=True)
+        )
         _validate_session_structure(session_scope)
 
         signal_frames: dict[str, pd.DataFrame] = {}
@@ -494,8 +500,8 @@ class SignalOutcomeEvaluator:
         first_candidate = catalog.candidates[0]
 
         for symbol in symbols:
-            symbol_bars = session_scope.loc[
-                session_scope["symbol"].astype(str) == symbol
+            symbol_bars = before_test_start.loc[
+                before_test_start["symbol"].astype(str) == symbol
             ].copy()
             evaluation_bars = symbol_bars.loc[
                 (symbol_bars["date"].dt.date >= fold.train_start)
@@ -533,8 +539,8 @@ class SignalOutcomeEvaluator:
             ].copy()
             signal_frames[symbol] = signal_frame
             session_dates[symbol] = tuple(
-                symbol_bars.loc[
-                    symbol_bars["date"].dt.date >= fold.train_start, "date"
+                session_scope.loc[
+                    session_scope["symbol"].astype(str) == symbol, "date"
                 ].dt.date
             )
 

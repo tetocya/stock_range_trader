@@ -18,10 +18,13 @@ from phase3_adversarial_helpers import (
 )
 
 import walkforward.executable_evaluation as executable_module
+from config import SignalSelectionPolicy
+from data import CanonicalDataError
 from walkforward import (
     ExecutableOutcomeEvaluator,
     ProviderCapabilityRegistry,
     PurgePolicy,
+    SignalCandidateSelector,
     SignalOutcomeEvaluator,
     derive_executable_validation_cohort,
     derive_signal_validation_cohort,
@@ -35,6 +38,21 @@ def _constant_features(frame, config):
     result["adx"] = 10.0
     result["range_score"] = 90.0
     return result
+
+
+def _signal_selector() -> SignalCandidateSelector:
+    return SignalCandidateSelector(
+        SignalSelectionPolicy(
+            primary_metric="mean_reversion_target_hit_rate",
+            mean_reversion_target="signal_date_sma",
+            minimum_observation_count=1,
+            tie_breakers=(
+                "median_forward_return_desc",
+                "median_mae_magnitude_asc",
+                "candidate_id_asc",
+            ),
+        )
+    )
 
 
 def test_signal_validation_ignores_test_provider_metadata(
@@ -88,6 +106,62 @@ def test_signal_validation_ignores_added_test_row_from_another_provider(
     )
 
     assert extended == baseline
+
+
+@pytest.mark.parametrize("duplicate_provider", ("jquants", "unknown_provider"))
+def test_signal_validation_collapses_duplicate_test_sessions_before_provider_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_provider: str,
+) -> None:
+    dates = adversarial_dates()
+    fold = adversarial_fold()
+    bars = canonical_bars(provider="yfinance")
+    install_signal_pipeline(monkeypatch, {dates[17].date()})
+    evaluator = SignalOutcomeEvaluator(strategy_config(), ProviderCapabilityRegistry())
+    duplicate = bars.loc[bars["date"].dt.date >= fold.test_start].iloc[[0]].copy()
+    assert len(duplicate) == 1
+    duplicate.loc[:, "provider"] = duplicate_provider
+    mutated = pd.concat([bars, duplicate], ignore_index=True)
+
+    baseline = evaluator.evaluate_validation(
+        bars, fold, signal_catalog(), PurgePolicy(3)
+    )
+    modified = evaluator.evaluate_validation(
+        mutated, fold, signal_catalog(), PurgePolicy(3)
+    )
+
+    assert modified == baseline
+    assert _signal_selector().select(signal_catalog(), modified.scores) == (
+        _signal_selector().select(signal_catalog(), baseline.scores)
+    )
+
+
+@pytest.mark.parametrize("duplicate_provider", ("jquants", "unknown_provider"))
+def test_signal_test_still_rejects_duplicate_session_from_another_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    duplicate_provider: str,
+) -> None:
+    dates = adversarial_dates()
+    fold = adversarial_fold()
+    bars = canonical_bars(provider="yfinance")
+    install_signal_pipeline(monkeypatch, {dates[17].date(), dates[25].date()})
+    evaluator = SignalOutcomeEvaluator(strategy_config(), ProviderCapabilityRegistry())
+    validation = evaluator.evaluate_validation(
+        bars, fold, signal_catalog(), PurgePolicy(3)
+    )
+    cohort = derive_signal_validation_cohort(bars, fold, validation)
+    duplicate = bars.loc[bars["date"].dt.date >= fold.test_start].iloc[[0]].copy()
+    assert len(duplicate) == 1
+    duplicate.loc[:, "provider"] = duplicate_provider
+
+    with pytest.raises(CanonicalDataError, match="provider"):
+        evaluator.evaluate_test(
+            pd.concat([bars, duplicate], ignore_index=True),
+            fold,
+            signal_catalog().candidates[0],
+            PurgePolicy(3),
+            cohort,
+        )
 
 
 def test_signal_validation_uses_only_adjusted_lane(
