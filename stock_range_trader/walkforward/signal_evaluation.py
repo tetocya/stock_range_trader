@@ -309,7 +309,12 @@ class SignalOutcomeEvaluator:
         missing = sorted(set(CANONICAL_COLUMNS).difference(bars.columns))
         if missing:
             raise CanonicalDataError("Missing canonical columns: " + ", ".join(missing))
-        raw_provider = require_single_provider(bars)
+        _validate_date_column(bars)
+        in_scope_bars = bars.loc[bars["date"].dt.date < fold.test_end].copy()
+        if in_scope_bars.empty:
+            raise SignalEvaluationError("no observations exist before fold.test_end")
+
+        raw_provider = require_single_provider(in_scope_bars)
         capability = self.capability_registry.require(
             raw_provider, AnalysisMode.SIGNAL_VALIDATION
         )
@@ -326,15 +331,13 @@ class SignalOutcomeEvaluator:
                 f"({purge_policy.forward_sessions})"
             )
         provider = capability.provider
-        _validate_date_column(bars)
-        before_test_end = bars.loc[bars["date"].dt.date < fold.test_end].copy()
-        before_test_start = before_test_end.loc[
-            before_test_end["date"].dt.date < fold.test_start
+        before_test_start = in_scope_bars.loc[
+            in_scope_bars["date"].dt.date < fold.test_start
         ].copy()
-        test_bars = before_test_end.loc[
-            before_test_end["date"].dt.date >= fold.test_start
+        test_bars = in_scope_bars.loc[
+            in_scope_bars["date"].dt.date >= fold.test_start
         ].copy()
-        _validate_session_structure(before_test_end)
+        _validate_session_structure(in_scope_bars)
         if not before_test_start.empty:
             validate_canonical_bars(before_test_start, expected_provider=raw_provider)
         if not test_bars.empty:
@@ -342,7 +345,7 @@ class SignalOutcomeEvaluator:
             # comparison across the Validation/Test boundary. Test OHLCV never
             # reaches the feature pipeline or outcome calculations.
             validate_canonical_bars(test_bars, expected_provider=raw_provider)
-        symbols = tuple(sorted(set(before_test_end["symbol"].astype(str))))
+        symbols = tuple(sorted(set(in_scope_bars["symbol"].astype(str))))
         input_symbol_count = len(symbols)
 
         signal_frames: dict[str, pd.DataFrame] = {}
@@ -352,8 +355,8 @@ class SignalOutcomeEvaluator:
         first_candidate = catalog.candidates[0]
 
         for symbol in symbols:
-            symbol_bars = before_test_end.loc[
-                before_test_end["symbol"].astype(str) == symbol
+            symbol_bars = in_scope_bars.loc[
+                in_scope_bars["symbol"].astype(str) == symbol
             ].copy()
             evaluation_bars = symbol_bars.loc[
                 (symbol_bars["date"].dt.date >= fold.train_start)

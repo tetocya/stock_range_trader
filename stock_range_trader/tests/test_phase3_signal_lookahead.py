@@ -16,7 +16,14 @@ from test_phase3_signal_evaluation import (
     _install_pipeline,
 )
 
-from walkforward import PurgePolicy, SignalOutcomeEvaluator
+from data import CanonicalDataError
+from walkforward import (
+    AnalysisMode,
+    ProviderCapabilityRegistry,
+    PurgePolicy,
+    SignalEvaluationError,
+    SignalOutcomeEvaluator,
+)
 
 
 def _replace_ohlcv(frame: pd.DataFrame, mask: pd.Series, multiplier: float) -> None:
@@ -174,6 +181,102 @@ def test_appending_rows_after_test_end_preserves_complete_result(
     )
 
     assert extended == baseline
+
+
+@pytest.mark.parametrize("future_provider", ("jquants", "unknown_provider"))
+def test_out_of_scope_provider_does_not_affect_result(
+    monkeypatch: pytest.MonkeyPatch,
+    future_provider: str,
+) -> None:
+    dates = _dates()
+    original = _bars(provider="yfinance")
+    future_dates = pd.bdate_range(_fold().test_end, periods=3)
+    future = _bars(
+        "9999.T",
+        provider=future_provider,
+        dates=future_dates,
+        closes=np.full(3, 9_999.0),
+    )
+    _install_pipeline(monkeypatch, {dates[6].date()})
+    evaluator = _evaluator()
+
+    baseline = evaluator.evaluate_validation(
+        original, _fold(), _catalog(), PurgePolicy(2)
+    )
+    extended = evaluator.evaluate_validation(
+        pd.concat([original, future], ignore_index=True),
+        _fold(),
+        _catalog(),
+        PurgePolicy(2),
+    )
+
+    assert extended == baseline
+
+
+def test_in_scope_provider_mixing_is_still_rejected_before_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("pipeline must not run")
+
+    monkeypatch.setattr(SignalOutcomeEvaluator, "_prepare_candidate", forbidden)
+    other = _bars("9999.T", provider="jquants").iloc[[-1]].copy()
+    other.loc[:, "date"] = pd.Timestamp(_fold().test_end - timedelta(days=1))
+
+    with pytest.raises(CanonicalDataError, match="exactly one provider"):
+        _evaluator().evaluate_validation(
+            pd.concat([_bars(), other], ignore_index=True),
+            _fold(),
+            _catalog(),
+            PurgePolicy(2),
+        )
+    assert calls == []
+
+
+def test_empty_in_scope_range_has_deterministic_error() -> None:
+    future_dates = pd.bdate_range(_fold().test_end, periods=3)
+
+    with pytest.raises(
+        SignalEvaluationError,
+        match="no observations exist before fold.test_end",
+    ):
+        _evaluator().evaluate_validation(
+            _bars(dates=future_dates),
+            _fold(),
+            _catalog(),
+            PurgePolicy(2),
+        )
+
+
+def test_capability_gate_receives_only_in_scope_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingRegistry(ProviderCapabilityRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[str, object]] = []
+
+        def require(self, provider, mode, *, require_benchmark=False):
+            self.calls.append((provider, mode))
+            return super().require(provider, mode, require_benchmark=require_benchmark)
+
+    dates = _dates()
+    future_dates = pd.bdate_range(_fold().test_end, periods=3)
+    future = _bars("9999.T", provider="unknown", dates=future_dates)
+    _install_pipeline(monkeypatch, {dates[6].date()})
+    registry = RecordingRegistry()
+
+    _evaluator(registry).evaluate_validation(
+        pd.concat([_bars(provider="yfinance"), future], ignore_index=True),
+        _fold(),
+        _catalog(),
+        PurgePolicy(2),
+    )
+
+    assert registry.calls == [("yfinance", AnalysisMode.SIGNAL_VALIDATION)]
 
 
 def test_test_dates_are_available_only_to_purge_not_outcome_prices(
