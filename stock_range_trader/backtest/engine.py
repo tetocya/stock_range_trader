@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import TypeAlias
 
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 
 from data import validate_backtest_price_contract
-from data.validation import validate_ohlcv
+from data.validation import validate_ohlcv, validate_required_columns
 from risk import RiskManager
 from strategy import PositionContext, Signal, SignalAction, Strategy
 
@@ -23,6 +24,7 @@ from .trade import (
     OrderSide,
     OrderStatus,
 )
+from .window import BacktestWindow, BacktestWindowError
 
 PathLike: TypeAlias = str | Path
 
@@ -131,7 +133,13 @@ class BacktestEngine:
         if not isinstance(self.risk_manager, RiskManager):
             raise TypeError("risk_manager must be a RiskManager")
 
-    def run(self, symbol: str, frame: pd.DataFrame) -> BacktestResult:
+    def run(
+        self,
+        symbol: str,
+        frame: pd.DataFrame,
+        *,
+        window: BacktestWindow | None = None,
+    ) -> BacktestResult:
         """Run a single-symbol daily backtest.
 
         For each row, an earlier pending signal is processed at the current
@@ -142,9 +150,31 @@ class BacktestEngine:
 
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError("symbol must not be empty")
-        validate_ohlcv(frame)
-        validate_backtest_price_contract(frame)
-        prepared = self.strategy.prepare(frame)
+        if window is None:
+            validate_ohlcv(frame)
+            validate_backtest_price_contract(frame)
+            prepared = self.strategy.prepare(frame)
+        else:
+            if not isinstance(window, BacktestWindow):
+                raise TypeError("window must be BacktestWindow or None")
+            _validate_window_frame_structure(frame)
+            causal_history = frame.loc[
+                frame["date"].dt.date < window.trading_end
+            ].copy()
+            if causal_history.empty:
+                raise BacktestWindowError(
+                    "no observations exist before the backtest window end"
+                )
+            validate_ohlcv(causal_history)
+            validate_backtest_price_contract(causal_history)
+            trading_data = causal_history.loc[
+                causal_history["date"].dt.date >= window.trading_start
+            ].copy()
+            if trading_data.empty:
+                raise BacktestWindowError(
+                    "no observations exist inside the backtest trading window"
+                )
+            prepared = self.strategy.prepare(trading_data)
         portfolio = Portfolio(self.initial_capital)
         self.risk_manager.reset()
 
@@ -372,3 +402,13 @@ def _write_csv(frame: pd.DataFrame, path: PathLike) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination, index=False)
+
+
+def _validate_window_frame_structure(frame: pd.DataFrame) -> None:
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("OHLCV data must be provided as a pandas DataFrame")
+    validate_required_columns(frame.columns)
+    if not is_datetime64_any_dtype(frame["date"].dtype):
+        raise BacktestWindowError("date must have a pandas datetime dtype")
+    if frame["date"].isna().any():
+        raise BacktestWindowError("date must not contain missing values")
