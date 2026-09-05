@@ -33,6 +33,7 @@ from .folds import (
     PurgePolicy,
     WalkForwardFold,
 )
+from .result import SignalTestSummary, ValidationCohort
 from .selection import SignalValidationScore
 
 SIGNAL_OUTCOME_FORWARD_RETURN_MODE = RANGE_SCORE_FORWARD_RETURN_MODE
@@ -40,6 +41,7 @@ SIGNAL_OUTCOME_DIVIDEND_POLICY = RANGE_SCORE_DIVIDEND_POLICY
 UNSUPPORTED_CORPORATE_ACTION_REASON = "unsupported_corporate_action"
 INSUFFICIENT_FEATURE_HISTORY_REASON = "insufficient_feature_history"
 OVERLAPPING_FORWARD_WINDOW_REASON = "overlapping_forward_window"
+NO_TEST_OBSERVATIONS_REASON = "no_test_observations"
 
 
 class SignalEvaluationError(ValueError):
@@ -273,6 +275,141 @@ class SignalOutcomeEvaluationResult:
                 raise SignalEvaluationError(
                     "score observation_count must match retained observations"
                 )
+
+
+@dataclass(frozen=True, slots=True)
+class SignalTestSymbolExclusion:
+    """One Validation-cohort symbol excluded from Signal Test evaluation."""
+
+    fold_id: str
+    provider: str
+    symbol: str
+    status: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        for name in ("fold_id", "provider", "symbol", "status", "reason"):
+            _require_non_empty_string(name, getattr(self, name))
+        allowed = {
+            UNSUPPORTED_CORPORATE_ACTION_REASON: "unsupported",
+            NO_TEST_OBSERVATIONS_REASON: "excluded",
+            INSUFFICIENT_FEATURE_HISTORY_REASON: "excluded",
+        }
+        if self.reason not in allowed:
+            raise SignalEvaluationError("unknown Signal Test symbol exclusion reason")
+        if self.status != allowed[self.reason]:
+            raise SignalEvaluationError(
+                "Signal Test symbol exclusion status does not match its reason"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SignalTestEvaluationResult:
+    """One selected Signal candidate's observations on a Test interval."""
+
+    provider: str
+    provider_price_basis: str
+    fold_id: str
+    candidate_id: str
+    requested_symbols: tuple[str, ...]
+    requested_symbol_count: int
+    admitted_symbol_count: int
+    observations: tuple[SignalOutcomeObservation, ...]
+    observation_exclusions: tuple[SignalObservationExclusion, ...]
+    symbol_exclusions: tuple[SignalTestSymbolExclusion, ...]
+    summary: SignalTestSummary
+
+    def __post_init__(self) -> None:
+        for name in ("provider", "provider_price_basis", "fold_id", "candidate_id"):
+            _require_non_empty_string(name, getattr(self, name))
+        if not isinstance(self.requested_symbols, tuple) or any(
+            not isinstance(symbol, str) or not symbol.strip()
+            for symbol in self.requested_symbols
+        ):
+            raise TypeError("requested_symbols must be a tuple of non-empty strings")
+        if self.requested_symbols != tuple(sorted(self.requested_symbols)):
+            raise SignalEvaluationError("requested_symbols must be sorted")
+        if len(self.requested_symbols) != len(set(self.requested_symbols)):
+            raise SignalEvaluationError("requested_symbols must be unique")
+        _require_non_negative_int("requested_symbol_count", self.requested_symbol_count)
+        _require_non_negative_int("admitted_symbol_count", self.admitted_symbol_count)
+        if self.requested_symbol_count != len(self.requested_symbols):
+            raise SignalEvaluationError(
+                "requested_symbol_count must match requested_symbols"
+            )
+        _require_tuple_of("observations", self.observations, SignalOutcomeObservation)
+        _require_tuple_of(
+            "observation_exclusions",
+            self.observation_exclusions,
+            SignalObservationExclusion,
+        )
+        _require_tuple_of(
+            "symbol_exclusions", self.symbol_exclusions, SignalTestSymbolExclusion
+        )
+        if not isinstance(self.summary, SignalTestSummary):
+            raise TypeError("summary must be SignalTestSummary")
+        excluded_symbols = tuple(item.symbol for item in self.symbol_exclusions)
+        if excluded_symbols != tuple(sorted(excluded_symbols)):
+            raise SignalEvaluationError("Signal Test symbol exclusions must be sorted")
+        if len(excluded_symbols) != len(set(excluded_symbols)):
+            raise SignalEvaluationError("Signal Test symbol exclusions must be unique")
+        if not set(excluded_symbols).issubset(self.requested_symbols):
+            raise SignalEvaluationError(
+                "Signal Test exclusions must belong to requested_symbols"
+            )
+        if self.requested_symbol_count != (
+            self.admitted_symbol_count + len(self.symbol_exclusions)
+        ):
+            raise SignalEvaluationError(
+                "requested_symbol_count must equal admitted symbols plus exclusions"
+            )
+        expected_prefix = (self.fold_id, self.provider, self.candidate_id)
+        for item in (*self.observations, *self.observation_exclusions):
+            if (item.fold_id, item.provider, item.candidate_id) != expected_prefix:
+                raise SignalEvaluationError(
+                    "Signal Test observation fold/provider/candidate must match result"
+                )
+            if item.symbol not in self.requested_symbols:
+                raise SignalEvaluationError(
+                    "Signal Test observations must belong to requested_symbols"
+                )
+        for item in self.symbol_exclusions:
+            if (item.fold_id, item.provider) != expected_prefix[:2]:
+                raise SignalEvaluationError(
+                    "Signal Test exclusion fold/provider must match result"
+                )
+        observation_keys = tuple(
+            (item.symbol, item.feature_date) for item in self.observations
+        )
+        if observation_keys != tuple(sorted(observation_keys)) or len(
+            observation_keys
+        ) != len(set(observation_keys)):
+            raise SignalEvaluationError(
+                "Signal Test observations must be unique and sorted"
+            )
+        exclusion_keys = tuple(
+            (item.symbol, item.feature_date, item.reason)
+            for item in self.observation_exclusions
+        )
+        if exclusion_keys != tuple(sorted(exclusion_keys)):
+            raise SignalEvaluationError(
+                "Signal Test observation exclusions must be sorted"
+            )
+        if any(
+            item.symbol in set(excluded_symbols)
+            for item in (*self.observations, *self.observation_exclusions)
+        ):
+            raise SignalEvaluationError(
+                "symbol-level Test exclusions cannot have observations"
+            )
+        if self.summary.candidate_id != self.candidate_id:
+            raise SignalEvaluationError(
+                "Signal Test summary candidate must match result"
+            )
+        if self.summary.observation_count != len(self.observations):
+            raise SignalEvaluationError(
+                "Signal Test summary observation_count must match observations"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +652,205 @@ class SignalOutcomeEvaluator:
             scores=scores,
         )
 
+    def evaluate_test(
+        self,
+        bars: pd.DataFrame,
+        fold: WalkForwardFold,
+        candidate: SignalCandidateDefinition,
+        purge_policy: PurgePolicy,
+        cohort: ValidationCohort,
+    ) -> SignalTestEvaluationResult:
+        """Evaluate one selected Signal candidate exactly on the Test interval."""
+
+        if not isinstance(bars, pd.DataFrame):
+            raise TypeError("bars must be a pandas DataFrame")
+        if not isinstance(fold, WalkForwardFold):
+            raise TypeError("fold must be WalkForwardFold")
+        if not isinstance(candidate, SignalCandidateDefinition):
+            raise TypeError("candidate must be SignalCandidateDefinition")
+        if not isinstance(purge_policy, PurgePolicy):
+            raise TypeError("purge_policy must be PurgePolicy")
+        if not isinstance(cohort, ValidationCohort):
+            raise TypeError("cohort must be ValidationCohort")
+        if not cohort.symbols:
+            raise SignalEvaluationError("Signal Test cohort must not be empty")
+        missing = sorted(set(CANONICAL_COLUMNS).difference(bars.columns))
+        if missing:
+            raise CanonicalDataError("Missing canonical columns: " + ", ".join(missing))
+        _validate_date_column(bars)
+        if fold.embargo_sessions < purge_policy.forward_sessions:
+            raise FoldValidationError(
+                f"{fold.fold_id} embargo_sessions ({fold.embargo_sessions}) must "
+                "be greater than or equal to PurgePolicy.forward_sessions "
+                f"({purge_policy.forward_sessions})"
+            )
+
+        capability = self.capability_registry.require(
+            cohort.provider, AnalysisMode.SIGNAL_VALIDATION
+        )
+        expected_basis = provider_price_basis(cohort.provider)
+        if (
+            capability.provider_price_basis != expected_basis
+            or cohort.provider_price_basis != expected_basis
+        ):
+            raise SignalEvaluationError(
+                "provider_price_basis does not match the frozen Validation cohort"
+            )
+        evaluation_bars = bars.loc[
+            (bars["date"].dt.date >= fold.train_start)
+            & (bars["date"].dt.date < fold.test_end)
+            & bars["symbol"].astype(str).isin(cohort.symbols)
+        ].copy()
+        if not evaluation_bars.empty:
+            raw_provider = require_single_provider(evaluation_bars)
+            if raw_provider != cohort.provider:
+                raise SignalEvaluationError(
+                    "Test provider does not match the frozen Validation cohort"
+                )
+            _validate_session_structure(evaluation_bars)
+            validate_canonical_bars(evaluation_bars, expected_provider=cohort.provider)
+
+        provider = capability.provider
+        signal_frames: dict[str, pd.DataFrame] = {}
+        session_dates: dict[str, tuple[date, ...]] = {}
+        prepared_frames: dict[str, pd.DataFrame] = {}
+        symbol_exclusions: list[SignalTestSymbolExclusion] = []
+        for symbol in cohort.symbols:
+            symbol_bars = evaluation_bars.loc[
+                evaluation_bars["symbol"].astype(str) == symbol
+            ].copy()
+            test_bars = symbol_bars.loc[symbol_bars["date"].dt.date >= fold.test_start]
+            if test_bars.empty:
+                symbol_exclusions.append(
+                    _test_symbol_exclusion(
+                        fold,
+                        provider,
+                        symbol,
+                        "excluded",
+                        NO_TEST_OBSERVATIONS_REASON,
+                    )
+                )
+                continue
+            try:
+                _reject_unverified_corporate_action(symbol_bars, provider)
+            except UnsupportedCorporateActionError:
+                symbol_exclusions.append(
+                    _test_symbol_exclusion(
+                        fold,
+                        provider,
+                        symbol,
+                        "unsupported",
+                        UNSUPPORTED_CORPORATE_ACTION_REASON,
+                    )
+                )
+                continue
+            adapted = canonical_to_phase1(symbol_bars, symbol=symbol)
+            validate_signal_price_contract(adapted)
+            signal_frame = adapted.loc[
+                :, ["date", "open", "high", "low", "close", "volume"]
+            ].copy()
+            prepared = self._prepare_candidate(signal_frame, candidate)
+            if _usable_test_features(prepared, fold).empty:
+                symbol_exclusions.append(
+                    _test_symbol_exclusion(
+                        fold,
+                        provider,
+                        symbol,
+                        "excluded",
+                        INSUFFICIENT_FEATURE_HISTORY_REASON,
+                    )
+                )
+                continue
+            signal_frames[symbol] = signal_frame
+            prepared_frames[symbol] = prepared
+            session_dates[symbol] = tuple(symbol_bars["date"].dt.date)
+
+        observations: list[SignalOutcomeObservation] = []
+        observation_exclusions: list[SignalObservationExclusion] = []
+        for symbol in sorted(signal_frames):
+            prepared = prepared_frames[symbol]
+            test = prepared.loc[prepared["date"].dt.date.map(fold.contains_test_date)]
+            signal_rows = test.loc[
+                test["entry_condition"].fillna(False).astype(bool)
+            ].copy()
+            assessed = purge_policy.assess_test(
+                fold,
+                symbol,
+                tuple(signal_rows["date"].dt.date),
+                session_dates[symbol],
+            )
+            retained: list[ForwardObservation] = []
+            for assessment in assessed:
+                if not assessment.retained:
+                    observation_exclusions.append(
+                        SignalObservationExclusion(
+                            fold_id=fold.fold_id,
+                            provider=provider,
+                            candidate_id=candidate.candidate_id,
+                            symbol=symbol,
+                            feature_date=assessment.feature_date,
+                            reason=assessment.purge_reason or "",
+                        )
+                    )
+                    continue
+                if retained and assessment.feature_date <= retained[-1].label_end_date:
+                    observation_exclusions.append(
+                        SignalObservationExclusion(
+                            fold_id=fold.fold_id,
+                            provider=provider,
+                            candidate_id=candidate.candidate_id,
+                            symbol=symbol,
+                            feature_date=assessment.feature_date,
+                            reason=OVERLAPPING_FORWARD_WINDOW_REASON,
+                        )
+                    )
+                    continue
+                retained.append(assessment)
+
+            row_by_date = {
+                value.date(): row
+                for value, row in zip(
+                    signal_rows["date"],
+                    (row for _, row in signal_rows.iterrows()),
+                    strict=True,
+                )
+            }
+            close_by_date = dict(
+                zip(
+                    signal_frames[symbol]["date"].dt.date,
+                    signal_frames[symbol]["close"].astype(float),
+                    strict=True,
+                )
+            )
+            for assessment in retained:
+                observations.append(
+                    _build_observation(
+                        fold=fold,
+                        provider=provider,
+                        candidate=candidate,
+                        assessment=assessment,
+                        signal_row=row_by_date[assessment.feature_date],
+                        observed_sessions=session_dates[symbol],
+                        close_by_date=close_by_date,
+                        forward_sessions=purge_policy.forward_sessions,
+                    )
+                )
+
+        summary = _signal_test_summary(candidate.candidate_id, observations)
+        return SignalTestEvaluationResult(
+            provider=provider,
+            provider_price_basis=expected_basis,
+            fold_id=fold.fold_id,
+            candidate_id=candidate.candidate_id,
+            requested_symbols=cohort.symbols,
+            requested_symbol_count=len(cohort.symbols),
+            admitted_symbol_count=len(signal_frames),
+            observations=tuple(observations),
+            observation_exclusions=tuple(observation_exclusions),
+            symbol_exclusions=tuple(symbol_exclusions),
+            summary=summary,
+        )
+
     def _prepare_candidate(
         self,
         signal_frame: pd.DataFrame,
@@ -620,6 +956,29 @@ def _aggregate_scores(
     return tuple(scores)
 
 
+def _signal_test_summary(
+    candidate_id: str,
+    observations: list[SignalOutcomeObservation],
+) -> SignalTestSummary:
+    if not observations:
+        return SignalTestSummary(candidate_id, 0, None, None, None)
+    return SignalTestSummary(
+        candidate_id=candidate_id,
+        observation_count=len(observations),
+        mean_reversion_target_hit_rate=float(
+            np.mean([item.mean_reversion_target_hit for item in observations])
+        ),
+        median_forward_return=float(
+            np.median([item.forward_return for item in observations])
+        ),
+        median_mae_magnitude=float(
+            np.median(
+                [item.maximum_adverse_excursion_magnitude for item in observations]
+            )
+        ),
+    )
+
+
 def _usable_validation_features(
     prepared: pd.DataFrame, fold: WalkForwardFold
 ) -> pd.DataFrame:
@@ -628,6 +987,15 @@ def _usable_validation_features(
     ]
     required = ("sma", "atr", "adx", "range_score", "buy_threshold")
     return validation.loc[validation.loc[:, required].notna().all(axis=1)]
+
+
+def _usable_test_features(
+    prepared: pd.DataFrame, fold: WalkForwardFold
+) -> pd.DataFrame:
+    test = prepared.loc[prepared["date"].dt.date.map(fold.contains_test_date)]
+    required = ("sma", "atr", "adx", "range_score", "buy_threshold")
+    finite = np.isfinite(test.loc[:, required].to_numpy(dtype=float)).all(axis=1)
+    return test.loc[finite]
 
 
 def _reject_unverified_corporate_action(
@@ -677,6 +1045,22 @@ def _symbol_exclusion(
     reason: str,
 ) -> SignalSymbolExclusion:
     return SignalSymbolExclusion(
+        fold_id=fold.fold_id,
+        provider=provider,
+        symbol=symbol,
+        status=status,
+        reason=reason,
+    )
+
+
+def _test_symbol_exclusion(
+    fold: WalkForwardFold,
+    provider: str,
+    symbol: str,
+    status: str,
+    reason: str,
+) -> SignalTestSymbolExclusion:
+    return SignalTestSymbolExclusion(
         fold_id=fold.fold_id,
         provider=provider,
         symbol=symbol,
