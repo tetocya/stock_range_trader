@@ -986,7 +986,6 @@ def _manifest(metadata, result, aggregate, tables):
         },
         "source": {
             "source_state": metadata.source.source_state.value,
-            "git_root": metadata.source.git_root,
             "git_commit_sha": metadata.source.git_commit_sha,
             "git_branch": metadata.source.git_branch,
             "worktree_dirty": metadata.source.worktree_dirty,
@@ -1389,7 +1388,7 @@ def _table(filename, columns, rows, sort_by):
     ]
     normalized.sort(
         key=lambda row: tuple(
-            (row.get(column) is None, str(row.get(column) or "")) for column in sort_by
+            (row.get(column) is None, row.get(column)) for column in sort_by
         )
     )
     return WalkForwardReportTable(

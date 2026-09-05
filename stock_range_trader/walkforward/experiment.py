@@ -271,6 +271,11 @@ class ExperimentIdentity:
             ) from error
         if _canonical_json(decoded) != self.normalized_payload_json:
             raise ExperimentError("identity payload is not canonical JSON")
+        actual_digest = hashlib.sha256(
+            self.normalized_payload_json.encode("ascii")
+        ).hexdigest()
+        if actual_digest != self.payload_sha256:
+            raise ExperimentError("payload_sha256 must match normalized_payload_json")
 
 
 @dataclass(frozen=True, slots=True)

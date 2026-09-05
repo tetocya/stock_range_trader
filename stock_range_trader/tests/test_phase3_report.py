@@ -33,6 +33,7 @@ from test_phase3_executable_test_evaluation import _test_trade_bars
 from test_phase3_experiment_identity import _clean_source, _universe
 from test_phase3_signal_evaluation import _bars
 
+import reports.walk_forward_report as report_module
 from config import (
     ExecutableCandidateCatalogConfig,
     ExecutableCandidateConfig,
@@ -44,8 +45,11 @@ from config import (
 from data import provider_price_basis
 from reports import (
     COMMON_FILENAMES,
+    EQUITY_COLUMNS,
     EXECUTABLE_FILENAMES,
+    ORDER_COLUMNS,
     SIGNAL_FILENAMES,
+    TRADE_COLUMNS,
     ExecutableWalkForwardReportBuilder,
     ExperimentAlreadyExistsError,
     SignalWalkForwardReportBuilder,
@@ -366,6 +370,34 @@ def test_atomic_writer_records_artifact_hashes_without_self_hash(
         assert sha256_file(destination / artifact["filename"]) == artifact["sha256"]
     assert "NaN" not in manifest_path.read_text(encoding="utf-8")
     assert "Infinity" not in manifest_path.read_text(encoding="utf-8")
+    assert "git_root" not in manifest["source"]
+    assert "/repo" not in manifest_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("filename", "columns"),
+    (
+        ("oos_trade_log.csv", TRADE_COLUMNS),
+        ("oos_order_log.csv", ORDER_COLUMNS),
+        ("oos_equity_curve.csv", EQUITY_COLUMNS),
+    ),
+)
+def test_audit_csv_sequence_uses_numeric_order(
+    filename: str, columns: tuple[str, ...]
+) -> None:
+    rows = [
+        {"fold_id": "fold_0001", "symbol": "72030", "sequence": sequence}
+        for sequence in reversed(range(12))
+    ]
+
+    table = report_module._table(
+        filename,
+        columns,
+        rows,
+        sort_by=("fold_id", "symbol", "sequence"),
+    )
+
+    assert list(table.to_frame()["sequence"]) == list(range(12))
 
 
 def test_fixed_clock_manifest_is_byte_identical_across_output_roots(

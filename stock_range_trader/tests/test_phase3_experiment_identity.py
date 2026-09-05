@@ -19,6 +19,7 @@ from walkforward import (
     AnalysisMode,
     ExecutableCandidateCatalog,
     ExperimentError,
+    ExperimentIdentity,
     ExperimentIdentityBuilder,
     SourceSnapshot,
     SourceState,
@@ -167,6 +168,65 @@ def test_identity_rejects_nonfinite_payload(tmp_path: Path) -> None:
             input_artifact=artifact,
             universe=universe,
             source=_clean_source(),
+        )
+
+
+def test_identity_rejects_modified_payload_with_original_digest(
+    tmp_path: Path,
+) -> None:
+    config, strategy, schedule, universe, artifact, catalog = _identity_inputs(tmp_path)
+    identity = ExperimentIdentityBuilder().build(
+        phase3_config=config,
+        strategy_config=strategy,
+        candidate_catalog=catalog,
+        selection_policy=config.executable_selection,
+        schedule=schedule,
+        provider="jquants",
+        analysis_mode=AnalysisMode.EXECUTABLE_VALIDATION,
+        provider_price_basis=provider_price_basis("jquants"),
+        input_artifact=artifact,
+        universe=universe,
+        source=_clean_source(),
+    )
+    payload = identity.normalized_payload_json.replace(
+        '"provider":"jquants"', '"provider":"yfinance"'
+    )
+    assert payload != identity.normalized_payload_json
+
+    with pytest.raises(ExperimentError, match="payload_sha256"):
+        ExperimentIdentity(
+            experiment_id=identity.experiment_id,
+            analysis_mode=identity.analysis_mode,
+            payload_sha256=identity.payload_sha256,
+            normalized_payload_json=payload,
+        )
+
+
+def test_identity_rejects_forged_digest_even_when_id_matches_it(
+    tmp_path: Path,
+) -> None:
+    config, strategy, schedule, universe, artifact, catalog = _identity_inputs(tmp_path)
+    identity = ExperimentIdentityBuilder().build(
+        phase3_config=config,
+        strategy_config=strategy,
+        candidate_catalog=catalog,
+        selection_policy=config.executable_selection,
+        schedule=schedule,
+        provider="jquants",
+        analysis_mode=AnalysisMode.EXECUTABLE_VALIDATION,
+        provider_price_basis=provider_price_basis("jquants"),
+        input_artifact=artifact,
+        universe=universe,
+        source=_clean_source(),
+    )
+    forged_digest = "0" * 64
+
+    with pytest.raises(ExperimentError, match="payload_sha256"):
+        ExperimentIdentity(
+            experiment_id=f"wf3-{identity.analysis_mode.value}-{forged_digest}",
+            analysis_mode=identity.analysis_mode,
+            payload_sha256=forged_digest,
+            normalized_payload_json=identity.normalized_payload_json,
         )
 
 
