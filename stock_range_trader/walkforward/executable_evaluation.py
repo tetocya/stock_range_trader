@@ -632,6 +632,9 @@ class ExecutableOutcomeEvaluator:
             raise ExecutableEvaluationError(
                 "no observations exist in the executable evaluation range"
             )
+        evaluation_bars = evaluation_bars.sort_values(
+            ["symbol", "date"], kind="mergesort"
+        ).reset_index(drop=True)
 
         raw_provider = require_single_provider(evaluation_bars)
         capability = self.capability_registry.require(
@@ -786,6 +789,9 @@ class ExecutableOutcomeEvaluator:
             & (bars["date"].dt.date < fold.test_end)
             & bars["symbol"].astype(str).isin(cohort.symbols)
         ].copy()
+        evaluation_bars = evaluation_bars.sort_values(
+            ["symbol", "date"], kind="mergesort"
+        ).reset_index(drop=True)
         if not evaluation_bars.empty:
             raw_provider = require_single_provider(evaluation_bars)
             if raw_provider != cohort.provider:

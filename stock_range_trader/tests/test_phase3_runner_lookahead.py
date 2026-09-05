@@ -107,7 +107,7 @@ def test_symbol_appearing_only_in_test_cannot_enter_frozen_cohort(
     )
     fold_result = result.fold_results[0]
 
-    assert fold_result.validation_result.input_symbol_count == 2
+    assert fold_result.validation_result.input_symbol_count == 1
     assert fold_result.validation_cohort.symbols == ("7203.T",)
     assert fold_result.test_result.requested_symbols == ("7203.T",)
 

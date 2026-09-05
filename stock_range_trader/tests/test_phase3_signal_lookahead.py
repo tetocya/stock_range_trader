@@ -223,8 +223,8 @@ def test_in_scope_provider_mixing_is_still_rejected_before_pipeline(
         raise AssertionError("pipeline must not run")
 
     monkeypatch.setattr(SignalOutcomeEvaluator, "_prepare_candidate", forbidden)
-    other = _bars("9999.T", provider="jquants").iloc[[-1]].copy()
-    other.loc[:, "date"] = pd.Timestamp(_fold().test_end - timedelta(days=1))
+    other = _bars("9999.T", provider="jquants").iloc[[0]].copy()
+    other.loc[:, "date"] = pd.Timestamp(_fold().validation_start)
 
     with pytest.raises(CanonicalDataError, match="exactly one provider"):
         _evaluator().evaluate_validation(

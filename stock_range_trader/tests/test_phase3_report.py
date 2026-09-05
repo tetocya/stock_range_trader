@@ -372,6 +372,7 @@ def test_atomic_writer_records_artifact_hashes_without_self_hash(
     assert "Infinity" not in manifest_path.read_text(encoding="utf-8")
     assert "git_root" not in manifest["source"]
     assert "/repo" not in manifest_path.read_text(encoding="utf-8")
+    assert str(tmp_path) not in manifest_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -400,7 +401,7 @@ def test_audit_csv_sequence_uses_numeric_order(
     assert list(table.to_frame()["sequence"]) == list(range(12))
 
 
-def test_fixed_clock_manifest_is_byte_identical_across_output_roots(
+def test_fixed_clock_bundle_is_byte_identical_across_output_roots(
     tmp_path: Path,
 ) -> None:
     bundle, *_ = _fixture(tmp_path)
@@ -408,9 +409,49 @@ def test_fixed_clock_manifest_is_byte_identical_across_output_roots(
     first = writer.write(bundle, tmp_path / "first")
     second = writer.write(bundle, tmp_path / "second")
 
-    assert (first / "walk_forward_manifest.json").read_bytes() == (
-        second / "walk_forward_manifest.json"
-    ).read_bytes()
+    first_files = {
+        path.name: path.read_bytes() for path in first.iterdir() if path.is_file()
+    }
+    second_files = {
+        path.name: path.read_bytes() for path in second.iterdir() if path.is_file()
+    }
+
+    assert second_files == first_files
+
+
+def test_report_building_never_reruns_evaluator_or_backtest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle, run, aggregate, metadata, bars, catalog = _fixture(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("report construction must use in-memory results")
+
+    monkeypatch.setattr("backtest.BacktestEngine.run", forbidden)
+    monkeypatch.setattr(
+        "walkforward.SignalOutcomeEvaluator.evaluate_validation", forbidden
+    )
+    monkeypatch.setattr("walkforward.SignalOutcomeEvaluator.evaluate_test", forbidden)
+
+    rebuilt = SignalWalkForwardReportBuilder().build(
+        run, aggregate, metadata, bars, catalog
+    )
+
+    assert rebuilt == bundle
+
+
+def test_report_tables_ignore_canonical_input_row_order(tmp_path: Path) -> None:
+    bundle, run, aggregate, metadata, bars, catalog = _fixture(tmp_path)
+
+    rebuilt = SignalWalkForwardReportBuilder().build(
+        run,
+        aggregate,
+        metadata,
+        bars.sample(frac=1.0, random_state=41).reset_index(drop=True),
+        catalog,
+    )
+
+    assert rebuilt == bundle
 
 
 def test_existing_experiment_is_never_overwritten(tmp_path: Path) -> None:

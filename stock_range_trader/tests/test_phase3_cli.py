@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -274,3 +275,99 @@ def test_all_fold_no_eligible_is_a_completed_bundle(
     summary = pd.read_csv(bundles[0] / "walk_forward_summary.csv")
     assert summary.loc[0, "aggregate_status"] == "completed_no_test_folds"
     assert summary.loc[0, "no_eligible_fold_count"] == 1
+
+
+def test_require_formal_oos_rejects_future_universe_before_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path, flag="--confirm-test-evaluation")
+    universe_path = Path(arguments[3])
+    universe = pd.read_csv(universe_path)
+    universe.loc[:, "as_of_date"] = "2030-01-01"
+    universe.to_csv(universe_path, index=False)
+    calls: list[str] = []
+
+    def forbidden(*args, **kwargs):
+        calls.append("runner")
+        raise AssertionError("Runner must not run for future Universe")
+
+    monkeypatch.setattr("examples.phase3_common.SignalWalkForwardRunner.run", forbidden)
+
+    with pytest.raises(ValueError, match="point_in_time_universe_not_satisfied"):
+        signal_main([*arguments, "--require-formal-oos"])
+
+    assert calls == []
+    assert not (tmp_path / "reports").exists()
+
+
+def test_test_failure_publishes_only_one_safe_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    arguments = _arguments(tmp_path, flag="--confirm-test-evaluation")
+    config_path = Path(arguments[5])
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["signal_selection"]["minimum_observation_count"] = 1
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    tested_candidates: list[str] = []
+    secret = "JQUANTS_API_KEY=must-not-appear"
+
+    def prepare(self, frame, candidate):
+        result = frame.copy()
+        result["sma"] = 105.0
+        result["atr"] = 5.0
+        result["adx"] = 10.0
+        result["range_score"] = 80.0
+        result["buy_threshold"] = 95.0
+        result["entry_condition"] = True
+        return result
+
+    def fail_test(self, bars, fold, candidate, policy, cohort):
+        tested_candidates.append(candidate.candidate_id)
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        "walkforward.SignalOutcomeEvaluator._prepare_candidate", prepare
+    )
+    monkeypatch.setattr("walkforward.SignalOutcomeEvaluator.evaluate_test", fail_test)
+
+    with pytest.raises(RuntimeError):
+        signal_main(arguments)
+
+    output = tmp_path / "reports"
+    receipts = list((output / "_failed").glob("*.json"))
+    completed = list(output.glob("wf3-*"))
+    assert len(tested_candidates) == 1
+    assert completed == []
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["exception_type"] == "RuntimeError"
+    assert secret not in receipts[0].read_text(encoding="utf-8")
+
+
+def test_both_clis_are_offline_for_artificial_local_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def forbidden(*args, **kwargs):
+        calls.append("external")
+        raise AssertionError("Phase 3 CLI must not call a provider or socket")
+
+    monkeypatch.setattr("socket.create_connection", forbidden)
+    monkeypatch.setattr("data.providers.YFinanceProvider.get_daily_bars", forbidden)
+    monkeypatch.setattr("data.providers.JQuantsV2Provider.get_daily_bars", forbidden)
+    monkeypatch.setattr("data.providers.JQuantsV2Provider.get_universe", forbidden)
+
+    signal_arguments = _arguments(tmp_path, flag="--preflight-only")
+    assert signal_main(signal_arguments) == 0
+
+    executable_root = tmp_path / "executable"
+    executable_root.mkdir()
+    executable_arguments = _arguments(executable_root, flag="--preflight-only")
+    dates = pd.bdate_range("2024-01-01", "2024-03-29")
+    executable_bars("72030", dates=dates).to_parquet(
+        executable_arguments[1], index=False
+    )
+    assert executable_main(executable_arguments) == 0
+    assert calls == []

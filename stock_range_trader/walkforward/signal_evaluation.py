@@ -451,7 +451,18 @@ class SignalOutcomeEvaluator:
         if in_scope_bars.empty:
             raise SignalEvaluationError("no observations exist before fold.test_end")
 
-        raw_provider = require_single_provider(in_scope_bars)
+        in_scope_bars = in_scope_bars.sort_values(
+            ["symbol", "date"], kind="mergesort"
+        ).reset_index(drop=True)
+        before_test_start = in_scope_bars.loc[
+            in_scope_bars["date"].dt.date < fold.test_start
+        ].copy()
+        if before_test_start.empty:
+            raise SignalEvaluationError("no observations exist before fold.test_start")
+
+        # Test rows supply observed session dates to PurgePolicy only. Freeze the
+        # evaluation provider and symbol population before Test metadata exists.
+        raw_provider = require_single_provider(before_test_start)
         capability = self.capability_registry.require(
             raw_provider, AnalysisMode.SIGNAL_VALIDATION
         )
@@ -468,22 +479,13 @@ class SignalOutcomeEvaluator:
                 f"({purge_policy.forward_sessions})"
             )
         provider = capability.provider
-        before_test_start = in_scope_bars.loc[
-            in_scope_bars["date"].dt.date < fold.test_start
-        ].copy()
-        test_bars = in_scope_bars.loc[
-            in_scope_bars["date"].dt.date >= fold.test_start
-        ].copy()
-        _validate_session_structure(in_scope_bars)
-        if not before_test_start.empty:
-            validate_canonical_bars(before_test_start, expected_provider=raw_provider)
-        if not test_bars.empty:
-            # Validate the input contract independently, avoiding a price-ratio
-            # comparison across the Validation/Test boundary. Test OHLCV never
-            # reaches the feature pipeline or outcome calculations.
-            validate_canonical_bars(test_bars, expected_provider=raw_provider)
-        symbols = tuple(sorted(set(in_scope_bars["symbol"].astype(str))))
+        validate_canonical_bars(before_test_start, expected_provider=raw_provider)
+        symbols = tuple(sorted(set(before_test_start["symbol"].astype(str))))
         input_symbol_count = len(symbols)
+        session_scope = in_scope_bars.loc[
+            in_scope_bars["symbol"].astype(str).isin(symbols)
+        ].copy()
+        _validate_session_structure(session_scope)
 
         signal_frames: dict[str, pd.DataFrame] = {}
         session_dates: dict[str, tuple[date, ...]] = {}
@@ -492,8 +494,8 @@ class SignalOutcomeEvaluator:
         first_candidate = catalog.candidates[0]
 
         for symbol in symbols:
-            symbol_bars = in_scope_bars.loc[
-                in_scope_bars["symbol"].astype(str) == symbol
+            symbol_bars = session_scope.loc[
+                session_scope["symbol"].astype(str) == symbol
             ].copy()
             evaluation_bars = symbol_bars.loc[
                 (symbol_bars["date"].dt.date >= fold.train_start)
@@ -701,6 +703,9 @@ class SignalOutcomeEvaluator:
             & (bars["date"].dt.date < fold.test_end)
             & bars["symbol"].astype(str).isin(cohort.symbols)
         ].copy()
+        evaluation_bars = evaluation_bars.sort_values(
+            ["symbol", "date"], kind="mergesort"
+        ).reset_index(drop=True)
         if not evaluation_bars.empty:
             raw_provider = require_single_provider(evaluation_bars)
             if raw_provider != cohort.provider:

@@ -244,14 +244,14 @@ def derive_signal_validation_cohort(
     fold: WalkForwardFold,
     validation_result: SignalOutcomeEvaluationResult,
 ) -> ValidationCohort:
-    """Freeze Signal symbols using the exact STEP 5 validation input scope."""
+    """Freeze Signal symbols before Test metadata becomes observable."""
 
     if not isinstance(fold, WalkForwardFold):
         raise TypeError("fold must be WalkForwardFold")
     if not isinstance(validation_result, SignalOutcomeEvaluationResult):
         raise TypeError("validation_result must be SignalOutcomeEvaluationResult")
     _validate_runner_bars(bars)
-    scope = bars.loc[bars["date"].dt.date < fold.test_end]
+    scope = bars.loc[bars["date"].dt.date < fold.test_start]
     return _derive_cohort(scope, validation_result)
 
 
