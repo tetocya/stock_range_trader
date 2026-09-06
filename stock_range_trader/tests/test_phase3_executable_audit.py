@@ -18,12 +18,24 @@ from test_phase3_executable_test_evaluation import _cohort, _test_trade_bars
 from backtest import BacktestEngine
 from backtest.engine import EQUITY_CURVE_COLUMNS, ORDER_LOG_COLUMNS, TRADE_LOG_COLUMNS
 from walkforward import (
+    ExecutableAuditError,
     ExecutableEvaluationError,
     ExecutableTestEquityRecord,
     ExecutableTestOrderRecord,
     ExecutableTestTradeRecord,
     audit_record_columns,
 )
+from walkforward import audit as audit_module
+
+
+def test_audit_integer_conversion_accepts_dataframe_integral_float() -> None:
+    assert audit_module._optional_int_value(20000.0) == 20000
+
+
+@pytest.mark.parametrize("value", (1.5, float("inf"), "2", True))
+def test_audit_integer_conversion_rejects_non_integral_values(value: object) -> None:
+    with pytest.raises(ExecutableAuditError, match="must be integral"):
+        audit_module._optional_int_value(value)
 
 
 def test_one_engine_run_produces_outcome_and_complete_immutable_audit(

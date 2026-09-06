@@ -376,7 +376,12 @@ def _int_value(value: object) -> int:
 def _optional_int_value(value: object) -> int | None:
     if value is None or pd.isna(value):
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ExecutableAuditError("audit integer must be integral")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not numeric.is_integer():
         raise ExecutableAuditError("audit integer must be integral")
     return int(value)
 
