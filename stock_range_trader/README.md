@@ -1,8 +1,8 @@
-# 日本株レンジ・平均回帰型バックテスト（Phase 2.1）
+# 日本株レンジ・平均回帰型バックテスト（Phase 3）
 
 ## プロジェクトの目的
 
-日本株の中から一定価格帯を往復する銘柄を検出し、レンジ下側で買って上側で売るLong Onlyの平均回帰戦略を検証します。Phase 2.1ではPhase 2のデータパイプラインを維持しつつ、Signal PriceとProvider報告Execution Priceの分離、未検証の企業行動を含むExecutable結果の停止、J-Quantsの実HTTP retry制御、Range Score時系列評価CLIを追加します。
+日本株の中から一定価格帯を往復する銘柄を検出し、レンジ下側で買って上側で売るLong Onlyの平均回帰戦略を検証します。Phase 3ではPhase 1・2の価格契約と売買ロジックを維持しつつ、Signal ValidationとExecutable Validationを分離したWalk-forward検証、ValidationだけによるCandidate選択、一回限りのTest評価、監査CSVとManifestを追加しています。
 
 > **重要:** 本システムは調査・バックテスト専用です。証券会社API、実注文、ペーパートレード、投資助言機能はありません。出力は将来の運用成績を保証しません。
 
@@ -230,7 +230,7 @@ yfinanceはスクリーニング、指標、Range Score等のSignal分析専用�
 
 ### J-Quants API V2 Free
 
-[公式Pythonクライアント](https://github.com/J-Quants/jquants-api-client-python)の`ClientV2`トランスポートを使い、上場銘柄マスタ、日足、取引カレンダーのV2 endpointを扱います。Freeは5年分の価格取得に使わず、12週間遅延した利用可能期間でUniverse、公式価格との重複期間比較、J-Quants単独の短期実行に使います。取得可能日を固定日付で仮定せず、実際の最古日・最新日をmanifestに保存します。
+[公式Pythonクライアント](https://github.com/J-Quants/jquants-api-client-python)の`ClientV2`トランスポートを使い、上場銘柄マスタ、日足、取引カレンダーのV2 endpointを扱います。2026-09-06時点のFree契約は株価・上場銘柄情報等が2年履歴・12週間遅延であり、5年分の価格取得には使えません。Universe、公式価格との重複期間比較、J-Quants単独の短期実行に使い、取得可能日を固定日付で推測せず、実際の最古日・最新日をmanifestに保存します。外部契約は将来変更され得るため、[データ提供期間](https://jpx-jquants.com/en/spec/data-spec)と[Rate Limit](https://jpx-jquants.com/en/spec/rate-limits)を実行前に再確認してください。
 
 `config/data_sources.yaml`は`plan: free`、`rate_limit_per_minute: 5`、`min_request_interval_seconds: 13`を固定します。ページネーションも含めて全リクエストを直列実行し、公式クライアントの並列`*_range`に依存しません。公式`ClientV2`がSessionに設定するurllib3 Retryは`total/connect/read/redirect/status/other=0`のAdapterで無効化し、すべての実HTTP試行を外側の逐次Rate Limiter経由にします。外側のみが429、5xx、network errorをretryし、429は`Retry-After`を優先、それ以外は指数バックオフ＋jitterを使います。`timeout_seconds`は各`Session.get(..., timeout=...)`へ実際に渡します。
 
@@ -346,11 +346,89 @@ Unit Testに加え、Phase 1.1の実サンプルCLI、Phase 2の固定fixtureと
 
 Look-ahead専用テストは、未来データ改変に対する過去結果の不変性、シグナル日と約定日の厳格な前後関係、中央ローリング・未来方向shift・backfillの不使用を検証します。
 
-## Phase 3 Walk-forward CLI（STEP 8）
+## Phase 3 Walk-forward Validation（STEP 12完了）
 
-Phase 3のSignal ValidationとExecutable Validationは別のローカルCLIです。どちらもCanonical Parquetと、単一の明示的な`as_of_date`を持つUniverse Snapshotを必須入力とし、外部データをダウンロードしません。`--end`は半開区間の終了日です。
+Phase 3は、時系列に分離したValidationだけで固定Candidateを選び、選択後のTestではそのCandidateだけを一回評価する監査可能な基盤です。Test価格、Test Provider、Test-only symbol、Test結果をCandidate選択へ使用しません。入力、Universe、価格契約、Git状態、除外、選択、OOS結果、成果物hashを記録しますが、パラメータ最適化や収益最大化を目的としません。
 
-まず`--preflight-only`でProvider、価格basis、fold、Candidate、Universe時点、Git状態、Formal OOS適格性、出力衝突を確認します。この段階ではValidationもTestも実行せず、ファイルも出力しません。
+完成Manifestの規範的な契約は[Phase 3 Manifest仕様](docs/phase3_manifest_spec.md)を参照してください。
+
+### Signal ValidationとExecutable Validation
+
+| 項目 | Signal Validation | Executable Validation |
+|---|---|---|
+| 主用途 | Provider調整済みSignal価格上の平均回帰Outcome評価 | 検証済みExecution価格上の約定・資産評価 |
+| Provider | yfinanceまたはCapabilityで許可されたSignal Provider | 現在はJ-Quantsのみ |
+| Fill／株数／Cash | 禁止 | 使用 |
+| Commission／Slippage | 禁止 | 使用 |
+| Portfolio P&L | 出力しない | 銘柄・foldごとの独立資金で算出 |
+| 共通資金Portfolio | なし | なし |
+| Benchmark | Executable利益として扱わない | 価格契約が許可した場合のみ |
+
+Signalの`forward_return`、SMA Target Hit、MAE、MFEは調整済みSignal価格上のOutcomeであり、約定可能な利益、Backtest Return、Portfolio Returnではありません。Primary targetはSignal日時点の`signal_date_sma`への回帰です。Candidate固有のSELL閾値到達率をPrimary selectionには使いません。
+
+Executableの集約値は、`symbol-fold`ごとに同じ初期資金から独立実行した結果の分布です。銘柄間で資金を取り合う共通Portfolio、fold間をつないだ複利、実口座の資金制約を表しません。zero-tradeのadmitted `symbol-fold`もReturn／Drawdown分布へ含め、非有限SharpeだけをSharpe集計から除外します。
+
+### Providerと価格契約
+
+#### yfinance
+
+yfinanceはSignal Validation専用です。Executable Validation、Theoretical Buy & Hold、Executable Buy & Holdは常に`unsupported`であり、期間内に分割eventが見つからない場合も許可しません。`download()`の`start`は包含、`end`は排他的です。Provider調整済みSignal OHLCVをOutcome評価に使用し、調整値には分配の影響が含まれ得ます。Yahoo報告`raw_*`列をhistorical unadjustedとは呼びません。
+
+STEP 11では2026-09-06に`yfinance 0.2.66`、`7203.T`、要求期間`[2025-09-01, 2026-09-01)`で最小Live Signal Validation経路を確認しました。この成功はProviderの将来安定性や戦略の有効性を保証しません。公式の`download()`引数と半開区間は[yfinance download仕様](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)で確認してください。
+
+#### J-Quants API V2 Free
+
+2026-09-06時点で、Free契約の株価・上場銘柄情報等は**2年履歴・12週間遅延**、基本Rate Limitは**5 requests/min**です。[データ提供期間](https://jpx-jquants.com/en/spec/data-spec)と[Rate Limit](https://jpx-jquants.com/en/spec/rate-limits)は将来変更され得ます。固定日付から取得可能範囲を推測せず、実入力範囲とManifestを確認してください。Free契約で5年のExecutable OOSを実行できるとは主張しません。
+
+Executable ValidationはCapabilityと`provider_price_basis`が許可するJ-Quants Canonical入力に限定します。Providerを跨いだ時系列連結、欠損期間の別Provider補完、暗黙fallbackは行いません。STEP 11では`JQUANTS_API_KEY`が未設定だったため、J-Quants Live Executable経路は**未検証**です。skipをpassやLive確認済みとは扱いません。
+
+### Foldと情報境界
+
+すべての期間は半開区間`[start, end)`です。configured calendar dateを休日や実在観測日へ丸めず、実観測境界は別に記録します。処理順はTrain → Validation → embargo／purge → Testです。
+
+- TrainはIndicator warm-up、データ充足、契約確認に使い、Candidate rankingには使いません。
+- Candidate selectionはValidation結果だけを使います。
+- Test価格、Test Provider、Test-only symbol、Test結果はValidation selectionへ渡しません。
+- Validation開始時とTest開始時にPosition、Cash、Pending Signal、Risk状態をリセットします。
+- Test失敗後に別Candidateへfallbackせず、再選択・再実行もしません。
+- `no_eligible_candidate`の場合はTestを実行せず、baselineへ暗黙fallbackしません。
+
+### Purgeとright-censoring
+
+Signal Forward Labelでは`embargo_sessions >= forward_sessions`を契約として必須にします。銘柄ごとの実観測sessionから`label_start_date`と`label_end_date`を決め、Validation観測は`label_end_date < test_start`の場合だけ残します。`label_end_date == test_start`は除外します。Test終了までにForward horizonが完了しない観測は`right_censored_at_test_end`として除外します。欠損営業日を推測・補間したり、カレンダー上の空白期間を挿入したりしません。
+
+### CandidateとSelection
+
+Catalogは設定順を保持する固定Candidateで、modeごとに最大12件です。初期資金、手数料、Slippage、Lot Size、Risk設定、指標期間はCandidateで変更できません。
+
+- Signal Candidate: `buy_atr_multiplier`、`range_score_threshold`、`adx_entry_max`
+- Executable Candidate: `buy_atr_multiplier`、`sell_atr_multiplier`、`range_score_threshold`、`adx_entry_max`
+
+Signalは`minimum_observation_count`を満たした候補を、Primaryの`mean_reversion_target_hit_rate`降順、tie breakerの`median_forward_return_desc`、`median_mae_magnitude_asc`、`candidate_id_asc`の順で並べます。Executableは`minimum_traded_symbol_count`、`minimum_trading_symbol_ratio`、`minimum_total_trade_count`、`minimum_finite_sharpe_count`、`maximum_drawdown_limit`を満たした候補を、Primaryの`median_symbol_sharpe_ratio`降順、tie breakerの`median_symbol_maximum_drawdown_magnitude_asc`、`median_symbol_net_return_desc`、`candidate_id_asc`の順で並べます。規範値は`config/phase3.py`と`config/phase3.yaml`です。
+
+### Universe、bias、Formal OOS
+
+`temporal_oos`はTestが時系列上の選択情報から隔離されたか、`point_in_time_universe`は各Test開始時点で利用可能だったUniverse Snapshotかを表す別の判定です。`universe_as_of_date > test_start`のfoldが1つでもあれば、時系列OOSでも`point_in_time_universe=false`となり、`survivorship_bias_status=present`です。
+
+`not_indicated_by_snapshot_timing`はSnapshot時点からfuture Universe利用が検出されなかっただけで、完全なbias排除を意味しません。上場廃止、銘柄コード変更、売買停止等を完全復元していません。
+
+`formal_oos_eligible=true`は、コードが検証できる次の条件を満たしたことだけを意味します。
+
+- clean Git sourceとcommit／source-tree hash
+- 入力、Universe、設定、成果物のhash
+- 許可されたProvider Capabilityと価格basis
+- 時系列順序、Purge、Validation-only selection
+- foldごとのTest Candidate数が0または1
+- Test再選択、fallback、Report再実行なし
+- point-in-time Universe、lineageなし、出力衝突なし
+
+これは、人が過去にTest結果を見ていないこと、完全なSurvivorship bias排除、統計的有意性、将来利益、Paper／Live Tradingへ進む妥当性を証明しません。`dirty`または`git_unavailable`では再現性を`degraded`とし、Formal OOS対象外です。
+
+### Phase 3 CLI
+
+SignalとExecutableは別のローカルCLIです。Canonical Parquetと単一の`as_of_date`を持つUniverse Snapshotを読み、CLI自身は市場データをdownloadしません。`--end`は排他的です。
+
+`--preflight-only`はProvider、価格basis、fold、Candidate、Universe、Git状態、Formal OOS適格性、出力衝突を確認します。Evaluator、Selector、Runner、Test、Reportは実行せず、成果物も生成しません。
 
 ```bash
 python examples/run_walk_forward_signal.py \
@@ -364,9 +442,21 @@ python examples/run_walk_forward_signal.py \
   --preflight-only
 ```
 
-内容を確認した後だけ、`--preflight-only`を`--confirm-test-evaluation`へ置き換えて実行します。Formal OOS条件を満たさない実行を拒否する場合は`--require-formal-oos`も指定します。同じExperiment IDの完成済みdirectoryは上書きされません。
+`--confirm-test-evaluation`は、選択後にTest情報を見る操作への明示的な確認です。`--require-formal-oos`を追加すると、不適格な実験を実行前に拒否します。
 
-Executable ValidationはJ-Quantsの検証済み価格契約だけを許可し、yfinanceはRunnerの開始前に拒否します。
+```bash
+python examples/run_walk_forward_signal.py \
+  --input outputs/yfinance_prices.parquet \
+  --universe outputs/universe_latest.csv \
+  --config config/phase3.yaml \
+  --strategy-config config/strategy.yaml \
+  --start 2021-01-01 \
+  --end 2026-01-01 \
+  --output-dir outputs/phase3_signal \
+  --confirm-test-evaluation
+```
+
+ExecutableはJ-Quants Canonical入力だけを使用します。
 
 ```bash
 python examples/run_walk_forward_executable.py \
@@ -380,7 +470,60 @@ python examples/run_walk_forward_executable.py \
   --preflight-only
 ```
 
-出力先は`<output-dir>/<experiment_id>/`です。共通CSVにはfold境界、実観測境界、Validation Cohort、Universe coverage、Validation結果、選択済みパラメータ、選択頻度、除外、OOS集約を記録します。Signal modeは調整価格上のSignal outcomeだけを出力し、約定損益を含みません。Executable modeのTrade／Order／EquityとMetricsは、独立資金の`symbol-fold`分布であり、共通Portfolioやfold連結複利ではありません。`walk_forward_manifest.json`には入力・Universe・Git・価格契約・設定・fold・選択規則・除外集計・成果物hash・制限事項を保存します。
+```bash
+python examples/run_walk_forward_executable.py \
+  --input outputs/jquants_prices.parquet \
+  --universe outputs/universe_latest.csv \
+  --config config/phase3.yaml \
+  --strategy-config config/strategy.yaml \
+  --start 2025-01-01 \
+  --end 2026-01-01 \
+  --output-dir outputs/phase3_executable \
+  --confirm-test-evaluation
+```
+
+`--parent-experiment-id`と`--change-reason`は同時指定します。lineage付き実験はTest確認後の派生としてFormal OOS対象外です。出力先は`<output-dir>/<experiment_id>/`で、既存Experiment directoryを上書きしません。自動suffix、暗黙削除、`--force`等の迂回optionはありません。
+
+### Phase 3出力ファイル
+
+空のCSVでも固定列Schemaを維持します。全CSVにはExperiment、mode、Provider、価格basis、fold、Candidate、Universe時点、OOS判定のprovenance列が付きます。
+
+| 共通CSV | 内容 |
+|---|---|
+| `walk_forward_folds.csv` | configured fold境界、実観測境界、選択・Test状態 |
+| `fold_observation_bounds.csv` | 銘柄別のTrain／Validation／Test実観測境界と件数 |
+| `validation_cohort.csv` | Validationで確定しTestへ固定した銘柄cohort |
+| `universe_coverage.csv` | Universe内外と価格availability |
+| `candidate_validation_results.csv` | 全CandidateのValidation score、eligible理由、順位 |
+| `selected_parameters.csv` | foldごとの選択状態、選択Candidateと許可パラメータ |
+| `candidate_selection_frequency.csv` | Candidateの全fold／評価foldでの選択頻度 |
+| `walk_forward_exclusions.csv` | stage・scope・status・reason別に追跡できる除外明細 |
+| `walk_forward_summary.csv` | mode固有のTest-only OOS集約 |
+
+| Signal専用CSV | 内容 |
+|---|---|
+| `oos_signal_observations.csv` | 選択CandidateのTest Signal outcome、Forward Return、SMA Target Hit、MAE／MFE |
+| `oos_signal_fold_summary.csv` | foldごとのTest Signal outcome集約 |
+
+Signal bundleは共通9 CSV＋Signal専用2 CSV＋`walk_forward_manifest.json`の**合計12ファイル**です。
+
+| Executable専用CSV | 内容 |
+|---|---|
+| `oos_executable_metrics.csv` | 独立した`symbol-fold`口座のReturn、DD、Sharpe、取引・注文件数、Benchmark |
+| `oos_trade_log.csv` | 完結済みTest Tradeの監査記録 |
+| `oos_order_log.csv` | filled／rejected／canceledを含む全Test Orderの監査記録 |
+| `oos_equity_curve.csv` | 独立`symbol-fold`口座の日次Cash、Position Value、Equity、Drawdown |
+
+Executable bundleは共通9 CSV＋Executable専用4 CSV＋`walk_forward_manifest.json`の**合計14ファイル**です。Report Builder／Writerは完成済みの型付き結果だけを受け取り、Strategy、Indicator pipeline、Evaluator、Candidate Selector、Backtest Engine、Test評価を再実行しません。
+
+### STEP 11 Live Validationの状態
+
+- yfinance Signal Live: `7203.T`でValidationまで確認済み
+- J-Quants Executable Live: API Key未設定のため未検証
+- 通常pytest: 明示的opt-inなしではLive Testを実行しない
+- Live範囲: Selector、Test評価、Report、Formal OOSを実行しない
+- 既知Low事項: yfinance由来の`Pandas4Warning`
+- 既知の非ブロッカー: GitHub ActionsのNode.js 20警告
 
 ## 現在の制限事項
 
@@ -392,17 +535,36 @@ python examples/run_walk_forward_executable.py \
 - Stop Lossは当日終値で判定し、翌営業日始値で約定します。日中に閾値へ到達した瞬間の約定ではありません。
 - 最終行のシグナルは翌営業日データがないため約定しません。未決済ポジションは最終終値で時価評価され、完結Trade Logには含まれません。
 - 最大ドローダウン停止は、一度発動すると当該バックテスト終了まで新規BUYを再開しない保守的な仕様です。
-- パラメータ最適化は未実装です。Phase 3のWalk-forward基盤はSTEP 8まで実装済みですが、包括的なLook-ahead試験、Mock end-to-end強化、Live Test、最終ドキュメントは後続STEPの対象です。サンプルCSVは人工データであり、戦略の有効性を示しません。
+- Phase 3は固定CandidateのWalk-forward検証基盤まで実装済みですが、パラメータ最適化は行いません。Signal OutcomeをExecutable利益として扱わず、Executable集約は独立資金`symbol-fold`分布であり共通Portfolioやfold連結複利ではありません。サンプルCSVは人工データであり、戦略の有効性を示しません。
+- Universe Snapshot timingだけでは、上場廃止、銘柄コード変更、売買停止を含む完全なSurvivorship bias排除を証明できません。future Universe foldは`point_in_time_universe=false`かつ`survivorship_bias_status=present`です。
+- J-Quants Freeは2年履歴・12週間遅延の制約を受け、STEP 11のLive Executable経路は未検証です。Corporate Actionを安全に処理できない銘柄は`unsupported`として除外します。
+- Phase 3 Manifestの`formal_oos_eligible`は機械検証可能な前提だけの主張で、人による過去Test閲覧、統計的有意性、将来利益を証明しません。
 - 機械学習、ニュース・SNS解析、リアルタイムデータ、高頻度・分足・Tick取引はPhase 1の対象外です。
 - 実注文機能は存在しません。将来Broker Interfaceを追加する場合も、Paper Tradingと実売買を明示的に分離する必要があります。
+
+## Phase 4を検討する前提
+
+Phase 3のコード完成だけでPaper Tradingへ自動移行しません。少なくとも次を別途確認し、未充足事項と例外判断を記録する必要があります。本STEPでは判定ロジックやPaper Brokerを実装していません。
+
+- 複数の非重複OOS foldで結果が再現される
+- 成績が単一銘柄、単一期間、単一Candidateだけに依存しない
+- Candidate選択がfoldごとに極端に不安定でない
+- Costを悪化させたstress testでも破綻しない
+- Range Breakdown時の損失が許容範囲に収まる
+- point-in-time Universe不足の影響を説明できる
+- J-Quants利用可能期間の制約を結果へ明記している
+- yfinance Signal結果をExecutable利益として扱っていない
+- 実データで価格basisと企業行動を追加検証している
+- J-Quants Live Executable経路を実APIで確認している
+- Formal OOS不適格理由が残る場合、その影響と例外判断を明示している
 
 ## Roadmap
 
 1. **Phase 1.1（完了）**：Phase 1にOrder Log、出来高ゼロ失効、実行可能ベンチマーク、売買代金流動性、ADX互換性、CIを追加
 2. **Phase 2（完了）**：J-Quants API V2 Free、yfinance、国内普通株Universe、Provider別cache、Range Scoreランキング、銘柄別Backtest集計、Provider間比較
-3. **Phase 2.1（現在）**：Signal/Execution Price分離、未検証価格basisのfail-closed、J-Quants実HTTP Rate Limit、Range Score固定Bin評価
-4. **Phase 3（STEP 8まで実装）**：Walk-forward validation、Out-of-sample集約、監査CSV・Manifest・ローカルCLI
-5. **Phase 4**：Paper Trading
+3. **Phase 2.1（完了）**：Signal/Execution Price分離、未検証価格basisのfail-closed、J-Quants実HTTP Rate Limit、Range Score固定Bin評価
+4. **Phase 3（STEP 12完了）**：Walk-forward validation、OOS集約、因果境界試験、Mock／Live受入、監査CSV・Manifest・ローカルCLI・規範文書
+5. **Phase 4（未着手）**：上記移行条件を満たした場合にのみPaper Tradingを検討
 6. **Phase 5**：証券会社API連携
 7. **Phase 6**：十分な検証とリスク制限を前提とした小規模Live Trading
 
