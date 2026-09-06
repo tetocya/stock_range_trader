@@ -1,8 +1,17 @@
 # stock_range_trader
 
-日本株の日足データを対象に、レンジ相場の検出とLong Onlyの平均回帰戦略を検証するバックテストプロジェクトです。Phase 2.1では調整済みSignal PriceとProvider報告Execution Priceの分離、未検証の企業行動を含むExecutable結果の停止、J-Quants実HTTP Rate Limit、Range Score時系列評価を実装しています。yfinanceは価格basisを実証できるまでスクリーニング／Signal分析専用で、Executable結果は常に`unsupported`です。Pythonプロジェクト本体は [`stock_range_trader/`](stock_range_trader/) にあります。設計、調整規約、データ制約の詳細は[プロジェクトREADME](stock_range_trader/README.md)を参照してください。
+日本株の日足データを対象に、レンジ相場の検出とLong Onlyの平均回帰戦略を検証する研究用プロジェクトです。Phase 3 Walk-forward Validationまで実装済みで、調整済み価格上のSignal Validationと、検証済みExecution価格上のExecutable Validationを別の分析modeとして扱います。
 
-> 本システムは調査・バックテスト専用です。実注文機能や投資助言機能はありません。
+yfinanceはスクリーニング／Signal Validation専用です。yfinanceによるExecutable ValidationとBenchmarkは常に`unsupported`として拒否されます。Executable Validationは、現在は検証済み価格契約を持つJ-Quants入力だけに限定されます。Pythonプロジェクト本体は[`stock_range_trader/`](stock_range_trader/)にあります。
+
+> 本システムは調査・バックテスト専用です。実注文機能ではなく、投資助言や利益保証も行いません。
+
+## Phase 3の公開契約
+
+- [プロジェクトREADME](stock_range_trader/README.md)：価格、Fold、Purge、Candidate選択、CLI、制限事項
+- [Phase 3 Manifest仕様](stock_range_trader/docs/phase3_manifest_spec.md)：`walk_forward_manifest.json`と12／14ファイルbundleの規範
+
+詳細仕様は上記文書に集約し、このREADMEでは重複しません。
 
 ## Installation
 

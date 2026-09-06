@@ -63,4 +63,5 @@ include = [
     "screening*",
     "strategy*",
     "universe*",
+    "walkforward*",
 ]

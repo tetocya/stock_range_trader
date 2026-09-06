@@ -1,0 +1,82 @@
+schema_version: "3.0"
+random_seed: 0
+require_clean_worktree_for_formal_oos: true
+git_unavailable_source_state: git_unavailable
+git_unavailable_reproducibility_status: degraded
+git_unavailable_formal_oos_eligible: false
+
+signal_fold_schedule:
+  train_months: 24
+  validation_months: 6
+  test_months: 6
+  step_months: 6
+  forward_sessions: 20
+  embargo_sessions: 20
+  minimum_folds: 3
+  purge_rule: label_end_date_lt_test_start
+
+executable_fold_schedule:
+  train_months: 12
+  validation_months: 3
+  test_months: 3
+  step_months: 3
+  forward_sessions: 0
+  embargo_sessions: 0
+  minimum_folds: 2
+  purge_rule: label_end_date_lt_test_start
+
+signal_selection:
+  primary_metric: mean_reversion_target_hit_rate
+  mean_reversion_target: signal_date_sma
+  minimum_observation_count: 30
+  tie_breakers:
+    - median_forward_return_desc
+    - median_mae_magnitude_asc
+    - candidate_id_asc
+
+executable_selection:
+  primary_metric: median_symbol_sharpe_ratio
+  minimum_traded_symbol_count: 3
+  minimum_trading_symbol_ratio: 0.10
+  minimum_total_trade_count: 10
+  minimum_finite_sharpe_count: 3
+  maximum_drawdown_limit: 0.30
+  tie_breakers:
+    - median_symbol_maximum_drawdown_magnitude_asc
+    - median_symbol_net_return_desc
+    - candidate_id_asc
+
+signal_candidate_catalog:
+  maximum_candidates: 12
+  candidates:
+    - id: baseline
+      buy_atr_multiplier: 1.5
+      range_score_threshold: 70
+      adx_entry_max: 25
+    - id: conservative
+      buy_atr_multiplier: 1.75
+      range_score_threshold: 75
+      adx_entry_max: 22
+    - id: moderate
+      buy_atr_multiplier: 1.5
+      range_score_threshold: 65
+      adx_entry_max: 25
+
+executable_candidate_catalog:
+  maximum_candidates: 12
+  candidates:
+    - id: baseline
+      buy_atr_multiplier: 1.5
+      sell_atr_multiplier: 1.5
+      range_score_threshold: 70
+      adx_entry_max: 25
+    - id: conservative
+      buy_atr_multiplier: 1.75
+      sell_atr_multiplier: 1.5
+      range_score_threshold: 75
+      adx_entry_max: 22
+    - id: moderate
+      buy_atr_multiplier: 1.5
+      sell_atr_multiplier: 1.25
+      range_score_threshold: 65
+      adx_entry_max: 25
