@@ -12,3 +12,5 @@ outputs/
 *.parquet
 .data_cache/
 data/raw/
+# Local delayed-replay audit databases and their SQLite journals (not fixtures).
+.delayed_replay/
