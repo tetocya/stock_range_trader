@@ -71,17 +71,29 @@ deadline・公開policyが未確定ならDraftを保持できますが、測定�
 | 1 | invalid証拠あり | INVALID／N/A |
 | 2 | 3M市場期間未完了 | PENDING／N/A |
 | 3 | 1M gateが未確定 | PENDING／N/A |
-| 4 | 1M外部欠測が確定 | INCONCLUSIVE |
-| 5 | R1M < −0.05 | FAIL |
-| 6 | 3M標本証拠が未確定／外部欠測確定 | PENDING／INCONCLUSIVE |
+| 4 | 1M評価の外部欠測が確定（1M gateを測定不能） | INCONCLUSIVE |
+| 5 | R1M < −0.05が確定（3M評価・標本が待機中／外部欠測でも適用） | FAIL |
+| 6 | 1M gate通過後、3M標本証拠が未確定／外部欠測確定 | PENDING／INCONCLUSIVE |
 | 7 | 約定20銘柄未満または完了100取引未満 | INCONCLUSIVE |
-| 8 | 3M評価が未確定／外部欠測確定 | PENDING／INCONCLUSIVE |
+| 8 | 1M gate通過・標本充足後、3M評価が未確定／外部欠測確定 | PENDING／INCONCLUSIVE |
 | 9 | R3M > 0／それ以外 | PASS／FAIL |
 
 −5%ちょうどはgate通過。標本充足時の3M=0%はFAIL。
 標本不足なら3Mが負でもINCONCLUSIVE。ただし1M失敗やinvalidの優先順位を維持します。
 3M期間終了後に1M失敗が確定していれば、不要な3M評価／標本の取得待ちでFAILを遅らせません。
 3M途中ならgate=failedを保存しても最終label=PENDINGです。
+
+外部欠測を一律にINCONCLUSIVEへ変換しません。以下はすべて3M期間終了後の例です。
+
+| ケース | 判定 | reason_codes |
+| --- | --- | --- |
+| 1M評価が外部欠測確定、3Mは正・標本充足 | INCONCLUSIVE | one_month_return_unavailable |
+| R1M = −6%確定、3M評価が外部欠測（標本は確定／待機／外部欠測） | FAIL | early_downside_gate_breached |
+| R1M = −5%でgate通過、標本充足、3M評価が外部欠測確定 | INCONCLUSIVE | three_month_return_unavailable |
+| R1M = −6%確定でも、3M証拠が内部不整合でinvalid | INVALID／N/A | invalid_evidence |
+
+内部不整合は外部欠測ではありません。上記FAILよりINVALIDを優先します。
+これらは`test_fixed_decision_table`および欠測優先順位の専用回帰テストで検証します。
 
 `lifecycle`、`validity`、`outcome`、`one_month_gate`を分離します。
 `evidence_kind=synthetic`のPASSは実OOS成功ではありません。

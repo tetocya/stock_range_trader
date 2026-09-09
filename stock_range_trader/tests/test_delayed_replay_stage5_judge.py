@@ -194,6 +194,65 @@ def test_fixed_decision_table(first, last, count, v1, v3, s3, label):
     assert result["formal_registration_performed"] is False
 
 
+@pytest.mark.parametrize(
+    "sample_state", ["available", "pending", "unavailable_external"]
+)
+def test_finalized_one_month_failure_overrides_external_three_month_missing(
+    sample_state,
+):
+    one = checkpoint(1, "188000")
+    three = checkpoint(
+        3, None, value_state="unavailable_external", sample_state=sample_state
+    )
+    assert NOW >= datetime.combine(three.boundary, time.min, JST)
+    assert one.return_value == "-0.06"
+    result = ProtocolJudge().evaluate(one, three, now=NOW).to_dict()
+    assert result["label"] == result["outcome"] == "FAIL"
+    assert result["lifecycle"] == "finalized"
+    assert result["validity"] == "valid"
+    assert result["one_month_gate"] == "failed"
+    assert result["reason_codes"] == ["early_downside_gate_breached"]
+
+
+@pytest.mark.parametrize(
+    "one,three,label,gate,reason",
+    [
+        pytest.param(
+            checkpoint(1, None, value_state="unavailable_external"),
+            checkpoint(3, "220000"),
+            "INCONCLUSIVE",
+            "unavailable",
+            "one_month_return_unavailable",
+            id="one-month-external-missing",
+        ),
+        pytest.param(
+            checkpoint(1, "190000"),
+            checkpoint(3, None, value_state="unavailable_external"),
+            "INCONCLUSIVE",
+            "passed",
+            "three_month_return_unavailable",
+            id="passed-gate-three-month-external-missing",
+        ),
+        pytest.param(
+            checkpoint(1, "188000"),
+            checkpoint(3, None, value_state="invalid"),
+            "INVALID",
+            "failed",
+            "invalid_evidence",
+            id="invalid-overrides-failed-gate",
+        ),
+    ],
+)
+def test_missing_checkpoint_precedence_reasons(one, three, label, gate, reason):
+    result = ProtocolJudge().evaluate(one, three, now=NOW).to_dict()
+    assert result["label"] == label
+    assert result["outcome"] == ("N/A" if label == "INVALID" else label)
+    assert result["lifecycle"] == "finalized"
+    assert result["validity"] == ("invalid" if label == "INVALID" else "valid")
+    assert result["one_month_gate"] == gate
+    assert result["reason_codes"] == [reason]
+
+
 def test_during_three_months_gate_failure_remains_pending():
     now = datetime(2024, 3, 1, tzinfo=UTC)
     one = checkpoint(1, "188000")
