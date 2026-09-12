@@ -1,0 +1,145 @@
+{
+  "assumptions": [
+    "fixed_quantity_at_reported_open_plus_slippage",
+    "no_queue_market_impact_partial_fill_or_auction_participation",
+    "actual_trade_time_and_actual_quantity_not_proven",
+    "daily_volume_is_ex_post_contradiction_check_not_open_liquidity"
+  ],
+  "candidate_id": "baseline",
+  "candidate_supply": "predeclared_single_candidate",
+  "candidates": [
+    {
+      "adx_entry_max": "25",
+      "buy_atr_multiplier": "1.5",
+      "candidate_id": "baseline",
+      "range_score_threshold": "70",
+      "sell_atr_multiplier": "1.5"
+    }
+  ],
+  "captures": {
+    "calendar": "1c27cc5a5a05a43742e2ad1cc51fc2b31167ae76cc553385bb366a5c4a48c930",
+    "daily_capture": "ced0e4f20e3fcbb40fad1185fec30ba4fc204c1a25f1bf7df6e406e73bfd7176",
+    "daily_source": "7bb5521540f730ef97ff206dc7c79e1a9f6d7ec1c612c64c7e834e9895ffa3fc",
+    "master": "8c520e92d36b00627464e1989f18f5fcba5edf4e5e98a48fedc089345c4677ff"
+  },
+  "history_packets": [],
+  "model_hash": "b595467e0c7b7b646d1dd2357791b57ab1373baa850c21411999ef71e2c6afcf",
+  "monthly_reference": {
+    "lookback_months": null,
+    "minimum_warmup_sessions": null,
+    "status": "not_selected_for_this_proposal",
+    "warmup_months": null
+  },
+  "packets": [
+    "ffd0d6f719d526ec09aabd461f1a1b5ecd932b02672abeae24ca39789646eaf8",
+    "038d60c702ba94e893e38d12d404d7c33965179737e29a705ec3233997773161"
+  ],
+  "provenance": "saved_jquants",
+  "references": {
+    "external_price": null,
+    "halt": {
+      "coverage": "unknown",
+      "observations": {}
+    },
+    "lot": null,
+    "price": {
+      "basis": "jquants_reported_ohlcv_with_separate_official_adjusted_ohlcv",
+      "review_scope": "provider_contract_and_saved_capture_only",
+      "volume_unit": "execution_shares"
+    }
+  },
+  "repetition": "continuous_and_split_resume_same_plan",
+  "rules": {
+    "availability": "session_phase_not_actual_publication_v1",
+    "corporate_action": "stop_preserve",
+    "end": "mark_without_forced_exit",
+    "expiry": "explicit_finalization_not_implemented",
+    "missing": "wait_without_expiry",
+    "no_trade": "terminal_no_fill",
+    "provider_price_basis": "jquants_reported_ohlcv_with_separate_official_adjusted_ohlcv",
+    "risk": "no_new_dd_stop",
+    "temporary_halt": "allow_daily_proxy_without_time_condition",
+    "time_condition": "none",
+    "volume_excess": "reject_instrument_batch",
+    "volume_unit": "execution_shares"
+  },
+  "schema": "limited-proxy-plan-v1",
+  "scope": {
+    "actual_trade_at": null,
+    "end": "2026-06-01",
+    "fill_kind": "simulated_fill",
+    "mode": "research_only",
+    "model_id": "daily_open_proxy_v1",
+    "purpose": "historical_saved_data_validation",
+    "registration_status": "draft_not_registered",
+    "start": "2026-05-01",
+    "symbol": "72030"
+  },
+  "source_identity": "stage7b:7bb5521540f730ef97ff206dc7c79e1a9f6d7ec1c612c64c7e834e9895ffa3fc",
+  "strategy": {
+    "adx_entry_max": "25.0",
+    "adx_exit_min": "30.0",
+    "adx_period": 14,
+    "adx_score_limit": "50.0",
+    "annual_trading_days": 252,
+    "atr_method": "wilder",
+    "atr_period": 20,
+    "buy_atr_multiplier": "1.5",
+    "commission_rate": "0.0",
+    "crossing_target": 6,
+    "initial_capital": 200000,
+    "liquidity_window": 60,
+    "lot_size": 100,
+    "max_drawdown_stop": "0.2",
+    "max_holding_days": 40,
+    "max_position_pct": "0.1",
+    "max_positions": 1,
+    "median_trading_value_target": 100000000,
+    "normalized_slope_limit": "0.001",
+    "range_breakdown_days": 3,
+    "range_exit_threshold": "50.0",
+    "range_score_threshold": "70.0",
+    "range_score_weights": {
+      "liquidity": "0.2",
+      "mean_reversion": "0.3",
+      "stability": "0.2",
+      "trend": "0.3"
+    },
+    "range_window": 60,
+    "risk_free_rate": "0.0",
+    "sell_atr_multiplier": "1.5",
+    "slippage_pct": "0.001",
+    "slope_lookback": 20,
+    "sma_period": 20,
+    "stability_cv_limit": "0.5",
+    "stability_window": 20,
+    "stop_loss_pct": "0.05",
+    "trend_adx_weight": "0.5",
+    "trend_slope_weight": "0.5"
+  },
+  "terms": {
+    "amount_rounding": "half_even",
+    "basis_evidence_hash": "ced0e4f20e3fcbb40fad1185fec30ba4fc204c1a25f1bf7df6e406e73bfd7176",
+    "budget_rounding": "floor",
+    "buy_price_rounding": "ceiling",
+    "commission_rate": "0",
+    "cost_model": "proportional",
+    "dividend_policy": "excluded",
+    "expiry_mode": "explicit_target_session_only",
+    "fee_rounding": "ceiling",
+    "fill_mode": "all_or_reject",
+    "initial_capital": "200000",
+    "lot_size": 100,
+    "max_position_pct": "0.1",
+    "max_positions": 1,
+    "money_quantum": "0.01",
+    "position_mode": "single_position_full_exit",
+    "price_quantum": "0.01",
+    "priority_mode": "sell_then_score_desc_instrument",
+    "proceeds_mode": "hold_until_later_decision_session",
+    "reservation_buffer_pct": "0.01",
+    "reservation_rounding": "ceiling",
+    "sell_price_rounding": "floor",
+    "slippage_pct": "0.001"
+  }
+}

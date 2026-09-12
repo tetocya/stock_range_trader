@@ -88,7 +88,9 @@ def resolve_batch(orders, observations, policy, cash, other_reserved="0"):
         return _resolve_batch(orders, observations, policy, cash, other_reserved)
 
 
-def _resolve_batch(orders, observations, policy, cash, other_reserved):
+def _resolve_batch(
+    orders, observations, policy, cash, other_reserved, *, result_factory=None
+):
     arithmetic = policy.require()
     frozen = [
         FrozenProxyOrder(JsonObject.from_value(o)).value.to_dict() for o in orders
@@ -103,6 +105,8 @@ def _resolve_batch(orders, observations, policy, cash, other_reserved):
     batch_hash = digest(dict(orders=frozen))
 
     def answer(status, reason, results=None):
+        if result_factory is not None:
+            return result_factory(batch_hash, status, reason, results or [])
         return ProxyResolution(
             JsonObject.from_value(
                 dict(

@@ -41,6 +41,9 @@ def visible_rows(s, replayed_at):
 class ProxyReducer:
     identity = "daily-open-proxy-reducer-v1"
 
+    def _resolve(self, orders, today, policy, cash, other):
+        return resolve_batch(orders, today, policy, cash, other)
+
     def __call__(self, raw, command):
         with localcontext() as context:
             context.prec = 128
@@ -208,7 +211,7 @@ class ProxyReducer:
                 s["reason"] = "held_corporate_action"
                 return
             other = reserved(s) - sum((D(o["reserved"]) for o in orders), D("0"))
-            resolution = resolve_batch(
+            resolution = self._resolve(
                 orders, today, policy, s["cash"], M(other)
             ).value.to_dict()
             if resolution["status"] != "resolved":
