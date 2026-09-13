@@ -10,16 +10,19 @@ from delayed_replay.sizing import size_buy
 from delayed_replay.validation import ReplayContractError
 
 from .inputs import LimitedEvidenceBlocked, SavedProxyInputs
-from .models import SCOPE, implementation_hash, warmup_requirements
+from .models import implementation_hash, warmup_requirements
 
 
 class LimitedTrialPreflight:
-    @staticmethod
-    def evaluate(plan, packet_root, evidence_root, authorization=None):
+    _inputs = SavedProxyInputs
+
+    @classmethod
+    def evaluate(cls, plan, packet_root, evidence_root, authorization=None):
+        scope = plan.scope
         p = plan.payload.to_dict()
         result = dict(
             schema="limited-preflight-v1",
-            scope=SCOPE,
+            scope=scope,
             plan_hash=plan.sha256,
             model_hash=p["model_hash"],
             model_approval="unapproved",
@@ -90,7 +93,7 @@ class LimitedTrialPreflight:
                 else "unsupported_configuration",
             )
         try:
-            bundle = SavedProxyInputs.load(plan, packet_root, evidence_root)
+            bundle = cls._inputs.load(plan, packet_root, evidence_root)
             result["inventory"] = bundle.inventory.to_dict()
             check("saved_inputs", "verified", "hash_scope_calendar_and_capture_lineage")
         except LimitedEvidenceBlocked:
@@ -113,8 +116,8 @@ class LimitedTrialPreflight:
             elif lot.lot_size != 100:
                 check("lot", "unsupported", "lot_size_unsupported")
             else:
-                for day in (SCOPE["start"], "2026-05-31"):
-                    lot.require(SCOPE["symbol"], date.fromisoformat(day))
+                for day in (scope["start"], "2026-05-31"):
+                    lot.require(scope["symbol"], date.fromisoformat(day))
                 check(
                     "lot",
                     "verified",
@@ -166,7 +169,7 @@ class LimitedTrialPreflight:
             )
             if isinstance(halt, dict) and isinstance(halt.get("observations"), dict):
                 for day, state in halt["observations"].items():
-                    row = rows.get(SCOPE["symbol"] + "|" + day, {}).get("row")
+                    row = rows.get(scope["symbol"] + "|" + day, {}).get("row")
                     if day not in bundle.sessions or (
                         state == "full"
                         and row
@@ -176,7 +179,7 @@ class LimitedTrialPreflight:
             if signals:
                 requirements = warmup_requirements(signals.config(p["candidate_id"]))
                 before = sum(
-                    v["row"]["session"] < SCOPE["start"] for v in rows.values()
+                    v["row"]["session"] < scope["start"] for v in rows.values()
                 )
                 needed = max(requirements.values()) - 1
                 result["history"] = dict(
@@ -199,7 +202,7 @@ class LimitedTrialPreflight:
             if policy:
                 try:
                     a = policy.require()
-                    first = rows[SCOPE["symbol"] + "|" + bundle.sessions[0]]["row"]
+                    first = rows[scope["symbol"] + "|" + bundle.sessions[0]]["row"]
                     q = size_buy(
                         first["close"], a.initial_capital, a.initial_capital, a
                     )

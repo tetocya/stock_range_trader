@@ -66,6 +66,10 @@ class SavedProxyInputs:
     sessions: tuple[str, ...]
     inventory: JsonObject
 
+    @staticmethod
+    def _generated_rows(source, symbol):
+        return artificial_response_rows(source["fixture_sessions"])
+
     @classmethod
     def load(cls, plan, packet_root, evidence_root):
         p = plan.payload.to_dict()
@@ -111,11 +115,7 @@ class SavedProxyInputs:
         artificial = raw_source.get("fixture_generator") == "limited-artificial-v1"
         if artificial != (p["provenance"] == "artificial_fixture"):
             raise ReplayContractError("limited_provenance_mismatch")
-        generated = (
-            artificial_response_rows(raw_source["fixture_sessions"])
-            if artificial
-            else None
-        )
+        generated = cls._generated_rows(raw_source, symbol) if artificial else None
         source = raw_source["data"]
         source_by_day = {}
         for r in source:

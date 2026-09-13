@@ -43,13 +43,15 @@ def logical(state):
     )
 
 
-def compare(plan, authorization, saved_run, output, wall):
+def compare(
+    plan, authorization, saved_run, output, wall, *, _service=LimitedTrialService
+):
     packet_root, evidence_root = saved_run / "inputs", saved_run
-    LimitedTrialService._prepare(plan, authorization, packet_root, evidence_root)
+    _service._prepare(plan, authorization, packet_root, evidence_root)
     if output.exists():
         raise ReplayContractError("limited_output_exists")
     output.mkdir(parents=True, exist_ok=False)
-    continuous = LimitedTrialService.create(
+    continuous = _service.create(
         output / "continuous.sqlite",
         plan,
         authorization,
@@ -62,7 +64,7 @@ def compare(plan, authorization, saved_run, output, wall):
         report = continuous.report()
     finally:
         continuous.store.close()
-    split = LimitedTrialService.create(
+    split = _service.create(
         output / "split.sqlite",
         plan,
         authorization,
@@ -77,7 +79,7 @@ def compare(plan, authorization, saved_run, output, wall):
         prefix = split.store.read().events
     finally:
         split.store.close()
-    split = LimitedTrialService.resume(
+    split = _service.resume(
         output / "split.sqlite",
         plan,
         authorization,

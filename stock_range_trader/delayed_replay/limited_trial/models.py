@@ -3,7 +3,7 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import get_type_hints
+from typing import ClassVar, get_type_hints
 
 from config.settings import StrategyConfig
 from delayed_replay.proxy.policy import ASSUMPTIONS, DailyOpenProxyPolicy
@@ -49,6 +49,9 @@ def implementation_hash():
         for p in sorted((root / directory).rglob("*.py"))
     ]
     files.append(root / "examples/validate_limited_proxy.py")
+    selected_cli = root / "examples/selected_proxy_trial.py"
+    if selected_cli.exists():
+        files.append(selected_cli)
     return digest(
         {
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -76,6 +79,15 @@ class LimitedArithmeticPolicy(DailyOpenProxyPolicy):
 @dataclass(frozen=True)
 class LimitedProxyTrialPlan:
     payload: JsonObject
+    _schema: ClassVar[str] = "limited-proxy-plan-v1"
+
+    @staticmethod
+    def _valid_scope(scope):
+        return scope == SCOPE
+
+    @property
+    def scope(self):
+        return self.payload.to_dict()["scope"]
 
     def __post_init__(self):
         p = self.payload.to_dict()
@@ -101,10 +113,10 @@ class LimitedProxyTrialPlan:
                 "repetition",
                 "assumptions",
             }
-            or p["schema"] != "limited-proxy-plan-v1"
+            or p["schema"] != self._schema
         ):
             raise ReplayContractError("limited_plan_schema")
-        if p["scope"] != SCOPE or p["provenance"] not in (
+        if not self._valid_scope(p["scope"]) or p["provenance"] not in (
             "saved_jquants",
             "artificial_fixture",
         ):

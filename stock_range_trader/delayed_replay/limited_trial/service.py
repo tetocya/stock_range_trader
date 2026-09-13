@@ -27,6 +27,10 @@ class _Resolution:
 
 class _LimitedReducer(ProxyReducer):
     identity = "limited-daily-open-proxy-reducer-v1"
+    _plan_type = LimitedProxyTrialPlan
+
+    def _resolution_scope(self, policy):
+        return SCOPE
 
     def _resolve(self, orders, today, policy, cash, other):
         # Reuse numerical decisions, not the synthetic evidence envelope/Gate.
@@ -35,7 +39,7 @@ class _LimitedReducer(ProxyReducer):
                 JsonObject.from_value(
                     dict(
                         schema="limited-resolution-v1",
-                        scope=SCOPE,
+                        scope=self._resolution_scope(policy),
                         batch_hash=batch_hash,
                         status=status,
                         reason=reason,
@@ -53,13 +57,13 @@ class _LimitedReducer(ProxyReducer):
             context.prec = 128
             s = JsonObject.from_value(raw).to_dict()
             identity = s["identity"]
-            plan = LimitedProxyTrialPlan(JsonObject.from_value(identity["plan"]))
+            plan = self._plan_type(JsonObject.from_value(identity["plan"]))
             auth = ScopedResearchAuthorization(
                 JsonObject.from_value(identity["authorization"])
             )
             auth.require(plan)
             if s["schema"] != "limited-proxy-state-v1" or s["capability"] != dict(
-                **SCOPE,
+                **plan.scope,
                 model_approval="unapproved",
                 approval_status=auth.payload.to_dict()["status"],
                 provenance=plan.payload.to_dict()["provenance"],
@@ -150,23 +154,29 @@ def signal_view(state, symbol, end, wall):
 
 
 class LimitedTrialService:
+    _inputs = SavedProxyInputs
+    _preflight = LimitedTrialPreflight
+    _reducer = _LimitedReducer
+
     def __init__(self, store, plan, authorization, packet_root, evidence_root):
         self.store, self.plan, self.authorization = store, plan, authorization
         self.packet_root, self.evidence_root = Path(packet_root), Path(evidence_root)
 
-    @staticmethod
-    def _prepare(plan, authorization, packet_root, evidence_root):
+    @classmethod
+    def _prepare(cls, plan, authorization, packet_root, evidence_root):
+        if type(plan) is not cls._reducer._plan_type:
+            raise ReplayContractError("limited_plan_type_mismatch")
         if type(authorization) is not ScopedResearchAuthorization:
             raise ReplayContractError("limited_approval_required")
         authorization.require(plan)
-        diagnosis = LimitedTrialPreflight.evaluate(
+        diagnosis = cls._preflight.evaluate(
             plan, packet_root, evidence_root, authorization
         ).to_dict()
         if not diagnosis["ready"]:
             raise ReplayContractError(
                 "limited_trial_not_ready:" + ",".join(diagnosis["reasons"])
             )
-        return SavedProxyInputs.load(plan, packet_root, evidence_root)
+        return cls._inputs.load(plan, packet_root, evidence_root)
 
     @staticmethod
     def _initial(plan, authorization, bundle, style):
@@ -188,7 +198,7 @@ class LimitedTrialService:
             style=style,
             source_identity=p["source_identity"],
             run_sessions=list(bundle.sessions),
-            symbols=[SCOPE["symbol"]],
+            symbols=[plan.scope["symbol"]],
             observation_sessions=sorted({v["row"]["session"] for v in rows.values()}),
             candidate_hashes={
                 c.candidate_id: signal.config_hash(c.candidate_id)
@@ -204,7 +214,7 @@ class LimitedTrialService:
                 schema="limited-proxy-state-v1",
                 identity=identity,
                 capability=dict(
-                    **SCOPE,
+                    **plan.scope,
                     model_approval="unapproved",
                     approval_status=authorization.payload.to_dict()["status"],
                     provenance=p["provenance"],
@@ -249,7 +259,7 @@ class LimitedTrialService:
             config_hash=digest(initial.to_dict()["identity"]),
             protocol_hash=plan.sha256,
             source_identity=plan.payload.to_dict()["source_identity"],
-            reducer_identity=_LimitedReducer.identity,
+            reducer_identity=cls._reducer.identity,
             initial_state=initial,
         )
         return cls(
@@ -270,11 +280,11 @@ class LimitedTrialService:
             config_hash=digest(initial.to_dict()["identity"]),
             protocol_hash=plan.sha256,
             source_identity=plan.payload.to_dict()["source_identity"],
-            reducer_identity=_LimitedReducer.identity,
+            reducer_identity=cls._reducer.identity,
             initial_state=initial,
         )
         return cls(
-            EventStore.resume(path, identity, _LimitedReducer()),
+            EventStore.resume(path, identity, cls._reducer()),
             plan,
             authorization,
             packet_root,
@@ -312,7 +322,7 @@ class LimitedTrialService:
         )
 
     def accept(self, sha, extension_id, parent, wall):
-        bundle = SavedProxyInputs.load(self.plan, self.packet_root, self.evidence_root)
+        bundle = self._inputs.load(self.plan, self.packet_root, self.evidence_root)
         records = self.store.read()
         rows = {k: v for k, v in bundle.rows.to_dict().items() if v["packet"] == sha}
         command = self.command(
@@ -322,10 +332,10 @@ class LimitedTrialService:
             "extension:" + extension_id,
             wall,
         )
-        return self.store.commit_event(command, records.head, _LimitedReducer())
+        return self.store.commit_event(command, records.head, self._reducer())
 
     def advance(self, wall, *, fault=None):
-        SavedProxyInputs.load(self.plan, self.packet_root, self.evidence_root)
+        self._inputs.load(self.plan, self.packet_root, self.evidence_root)
         records = self.store.read()
         s, p = records.current_state.to_dict(), self.plan.payload.to_dict()
         if s["status"] in ("completed", "stopped_contract"):
@@ -338,8 +348,11 @@ class LimitedTrialService:
                 selection_evidence=None,
                 selection_mode="predeclared_single_candidate_not_performance_selected",
             )
-        elif s["phase"] == "decide" and SCOPE["symbol"] + "|" + day in s["inputs"]:
-            symbol = SCOPE["symbol"]
+        elif (
+            s["phase"] == "decide"
+            and self.plan.scope["symbol"] + "|" + day in s["inputs"]
+        ):
+            symbol = self.plan.scope["symbol"]
             pos = s["positions"].get(symbol)
             candidate = pos["candidate_id"] if pos else p["candidate_id"]
             decision = self.plan.signals().decide(
@@ -350,7 +363,7 @@ class LimitedTrialService:
                     wall,
                 ),
                 candidate,
-                date.fromisoformat(SCOPE["start"]),
+                date.fromisoformat(self.plan.scope["start"]),
                 pos,
             )
             import math
@@ -376,7 +389,7 @@ class LimitedTrialService:
         )
         command = self.command(records, "phase", data, "phase:" + digest(data), wall)
         self.store.commit_event(
-            command, records.head, _LimitedReducer(), _fault_hook=fault
+            command, records.head, self._reducer(), _fault_hook=fault
         )
         return self.state["status"]
 
@@ -403,7 +416,7 @@ class LimitedTrialService:
             reasons.append(
                 "no_signal"
                 if not any(
-                    d[SCOPE["symbol"]]["action"] == "buy"
+                    d[self.plan.scope["symbol"]]["action"] == "buy"
                     for d in s["decisions"].values()
                 )
                 else "insufficient_lot_budget"
@@ -411,7 +424,7 @@ class LimitedTrialService:
         return JsonObject.from_value(
             dict(
                 schema="limited-trial-report-v1",
-                scope=SCOPE,
+                scope=self.plan.scope,
                 plan_hash=self.plan.sha256,
                 capability=s["capability"],
                 status=s["status"],
