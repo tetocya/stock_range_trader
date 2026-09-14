@@ -41,10 +41,16 @@ def clearing_command(args):
     try:
         if args.action == "accept-inputs":
             state = service.state
+            packet = plan.payload.to_dict()["packets"][1]
+            if packet in state["accepted_packets"]:
+                return dict(
+                    status="additional_input_already_accepted_not_advanced",
+                    input_head=state["input_head"],
+                )
             if state["status"] != "waiting_for_input":
                 raise ValueError("waiting_account_required")
             service.accept(
-                plan.payload.to_dict()["packets"][1],
+                packet,
                 "june-part-2",
                 state["input_head"],
                 wall,
@@ -129,7 +135,17 @@ def main(argv=None):
                 dict(
                     status="blocked",
                     reason="june_contract_evidence_permission_or_budget",
-                    clearing="not_executed",
+                    clearing=(
+                        "unverified_inspect_account_if_created"
+                        if args.action
+                        in (
+                            "start-clearing",
+                            "accept-inputs",
+                            "resume-clearing",
+                            "compare-clearing",
+                        )
+                        else "not_executed"
+                    ),
                 )
             )
         )

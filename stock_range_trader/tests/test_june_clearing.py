@@ -1,6 +1,7 @@
 """Artificial June only. These tests do not verify real-data clearing."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from delayed_replay_e2e_helpers import network_guard as network_guard
@@ -11,7 +12,7 @@ from delayed_replay import june_clearing as clear
 from delayed_replay import june_trial as june
 from delayed_replay.selected_trial.acquisition import Receipt
 from delayed_replay.serialization import JsonObject, digest, time_text
-from examples.june_proxy_trial import main
+from examples.june_proxy_trial import clearing_command, main
 
 pytestmark = pytest.mark.usefixtures("network_guard")
 
@@ -368,3 +369,55 @@ def test_actual_entry_rejects_unapproved_without_account(prepared, tmp_path):
         == 2
     )
     assert not account.exists()
+
+
+def test_cli_accept_retry_does_not_change_parent_or_advance(prepared, monkeypatch):
+    root, may, plan, auth, clock, _ = built(prepared)
+    payload = plan.payload.to_dict()
+    payload["provenance"] = "saved_jquants"
+    (root / "clearing_plan.json").write_text(JsonObject.from_value(payload).encoded)
+    (root / "fixture_grant.json").write_text(auth.grant.encoded)
+    closed = []
+    # CLI routing only; no real account or real clearing is instantiated.
+    service = SimpleNamespace(
+        state=dict(
+            status="waiting_for_input",
+            accepted_packets=payload["packets"],
+            input_head="already-accepted-head",
+        ),
+        store=SimpleNamespace(close=lambda: closed.append(True)),
+    )
+    monkeypatch.setattr(clear.JuneClearingService, "resume", lambda *args: service)
+    args = SimpleNamespace(
+        action="accept-inputs",
+        root=root,
+        may_root=may,
+        execute_saved_data=True,
+        clearing_authorization=root / "fixture_grant.json",
+        replayed_at=time_text(clock.now()),
+        account=root / "unused.sqlite",
+        style="split_resume",
+    )
+    result = clearing_command(args)
+    assert result["status"] == "additional_input_already_accepted_not_advanced"
+    assert closed == [True]
+    assert not (root / "unused.sqlite").exists()
+
+
+def test_cli_failure_never_claims_no_partial_clearing(tmp_path, monkeypatch, capsys):
+    import examples.june_proxy_trial as cli
+
+    def fail(_):
+        raise ValueError("artificial_post_event_failure")
+
+    monkeypatch.setattr(cli, "clearing_command", fail)
+    assert (
+        cli.main(
+            ["start-clearing", "--root", str(tmp_path), "--may-root", str(tmp_path)]
+        )
+        == 2
+    )
+    assert (
+        json.loads(capsys.readouterr().out)["clearing"]
+        == "unverified_inspect_account_if_created"
+    )

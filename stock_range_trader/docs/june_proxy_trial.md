@@ -23,8 +23,8 @@
 
 | 対象 | SHA-256 |
 | --- | --- |
-| 6月取得準備plan（清算planとは別） | `b3b6c6777741cae1e5dd56b7c655b37adab6c743198c588dcf92bce590528553` |
-| 6月実装 | `ad76a2363817504bf4203a0230bd6c6b2edc18201f711b6262e3f4a7545c0540` |
+| 6月取得準備plan（清算planとは別） | `b6015fdeeb990689b13ecf930146b1c6e8347ab2505fc2b83862f3a593ce2e47` |
+| 6月実装 | `bac4ed3904f7176182b35fd4316369c2e185ca101e15134169321eef1a76860b` |
 | 維持した設定 | `69cd67379ea44b39c1084a7c19042e3277180a5815b8d055c0040f111c538b38` |
 | 新単元レビュー | `7e85f6b7034b260f0b01c0030ed59d3d5345ee5aaa1b5aeba0a150ef5683f4c2` |
 | 参照元5月plan | `e6edf4316a2bb7eb173da0b1761bae89519243420bc536b5f7ae03f252c2fed5` |
@@ -35,7 +35,8 @@ plan/reviewのhashは正規化JSONのSHA-256。整形済み公開JSONのファ�
 `config/june_proxy_lot_review.json`。価格やDBは含まない。
 旧準備plan `83d31b3de263b8672458365415215955ab41e5f3fb0810b5b3609b62c3231d7a`
 は元のv1フォルダに保持した。旧receiptがplan記録1件・HTTP試行0件であることを確認した上で、
-新実装を指すv2を別フォルダに作成した。既存通信予算・取得済みデータのリセットではない。
+新実装を指すv3を別フォルダに作成した。途中のv2も通信0件のまま保持する。
+既存通信予算・取得済みデータのリセットではない。
 単元レビュー内容・日時・hashも維持する。新旧とも実取得・実清算は未承認。
 
 ## 履歴・単元・価格・calendar
@@ -93,7 +94,7 @@ planに絶対パスを含めない。
 ```bash
 cd /Users/harimatakeuchi/stock_range_trader/stock_range_trader
 june_saved_may=.delayed_replay/selected_trial/owner-approved-fixed-baseline-v1
-june_preparation_root=.delayed_replay/june_trial/46890-202606-clearing-preparation-v2
+june_preparation_root=.delayed_replay/june_trial/46890-202606-clearing-preparation-v3
 
 # 現在実行可能な読み取り検査。取得・清算を開始しない。
 .venv/bin/python -m examples.june_proxy_trial inspect \
@@ -214,6 +215,9 @@ june_account="$june_preparation_root/research_split.sqlite"
 `start-clearing --style continuous`は全packetを持つ新口座を作る。
 `resume`はHTTP取得再開、`resume-clearing`は保存済み口座の再開であり、用途を混同しない。
 口座再開にHTTP予算のリセットや追加取得は含まれない。
+`accept-inputs`の再送は既受理packetを検出して追加イベントなしで返す。
+清算系コマンドのエラー表示は`unverified_inspect_account_if_created`とし、
+部分実行済みかもしれない口座を「未実行」と誤報しない。再開前に台帳を確認する。
 
 ## 回帰検証・残る制限
 
@@ -222,7 +226,7 @@ golden結果（Cash/Equity 202590.45、実現損益2590.45、BUY/SELL各500株�
 価格・手数料）と、連続/分割再開一致を確認する。実市場データの再清算ではない。
 既存5月モジュールとProxy算術ソースは変更していない。
 
-6月は追加25テストで入力改変、許可分離、月初の空口座、21sessionの10+11分割、
+6月は追加27テストで入力改変、許可分離、月初の空口座、21sessionの10+11分割、
 非空Fill/拒否/期末保有、予約を保持した再開、7月/欠測/重複拒否を検証する。
 基準人工fixtureはBUY/SELL各2件、Cash/Equity 206565.83。人工gap fixtureは500株を
 減らさず固定予約超過で拒否する。別人工fixtureは500株を期末まで保持する。
