@@ -1,0 +1,23 @@
+{
+  "documents": [
+    {
+      "article": "Article 7, page 6: 100 shares",
+      "effective_from": "2023-10-01",
+      "sha256": "d3e0fd3ba14788680e015ef09f7f014502a46927266a5a0b2b4ded8c39eaca12",
+      "source_page": "https://www.lycorp.co.jp/ja/company/overview",
+      "url": "https://www.lycorp.co.jp/ja/company/overview/pdf/cg00_%E5%AE%9A%E6%AC%BE_231001.pdf"
+    }
+  ],
+  "end": "2026-07-01",
+  "instrument": "46890",
+  "limitation": "issuer_charter_and_published_page_not_contemporaneous_or_signed_evidence",
+  "lot_size": 100,
+  "parent_review_hash": "22f88c2691b76c6965867703d9e0d8285aa9952e60675610390bab7139f1313f",
+  "review_reference": "2026-09-14 retrospective June review: saved issuer charter Article 7; https://www.lycorp.co.jp/ja/company/overview lists 100 shares and the 2023-10-01 charter; no contemporaneous publication attestation",
+  "reviewed_at": "2026-09-14T00:57:49.300226+00:00",
+  "schema": "june-lot-review-v1",
+  "source": "https://www.lycorp.co.jp/ja/company/overview/pdf/cg00_%E5%AE%9A%E6%AC%BE_231001.pdf",
+  "start": "2026-06-01",
+  "status": "retrospective_document_review_not_execution_approval",
+  "subject_hash": "d9fd20c88bb230f022782f4e3d5cd36477e34e672aa0eabe5a1309fe688b6d3c"
+}

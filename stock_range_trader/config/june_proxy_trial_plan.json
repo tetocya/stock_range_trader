@@ -1,0 +1,150 @@
+{
+  "acquisition_permission": "not_granted",
+  "execution_permission": "not_granted",
+  "history_comparison": "all_fields_exact_normalized_no_overwrite",
+  "implementation_hash": "900cc045f14499ec99fb72a6a5ae2b1f85bcb19235b866748bf1a0c8c4937239",
+  "interval_seconds": 13,
+  "lot_review_hash": "7e85f6b7034b260f0b01c0030ed59d3d5345ee5aaa1b5aeba0a150ef5683f4c2",
+  "max_attempts": 20,
+  "max_seconds": 1200,
+  "not_before": "2026-09-24T09:00:00.000000+00:00",
+  "parent": {
+    "history_hash": "ab6b937ab8139d75c28dfa64c1b09024630221ab3b5d14cc99c5f7f8ca7344b2",
+    "model_hash": "68bd43e72b3937f4bf241294f2f25aa6a7161f380a4c621247b1298eacefc79f",
+    "packets": [
+      "2bcc3266ea457ed7ad4cbe5ea59d8a321f4b05b8a2f59daf62f73445536f0d80",
+      "bf47b4b94d33001fa626a10825fd64433fc6675bd3b0f6cb612b1e1b4e8077dc",
+      "d540edb8d54eef61f5a396b4bfeb51cdd6fed00aa2ae4c710cd9aad17db6b00d",
+      "a817d99a1dcf5bd77a52adbffd38f00201cd2790573f974ba4fc6185ff09f1d4"
+    ],
+    "plan_hash": "e6edf4316a2bb7eb173da0b1761bae89519243420bc536b5f7ae03f252c2fed5",
+    "provenance": "saved_jquants"
+  },
+  "queries": [
+    {
+      "params": {
+        "from": "2026-05-29",
+        "to": "2026-06-30"
+      },
+      "path": "/markets/calendar"
+    },
+    {
+      "params": {
+        "code": "46890",
+        "date": "2026-06-01"
+      },
+      "path": "/equities/master"
+    },
+    {
+      "params": {
+        "code": "46890",
+        "from": "2026-01-01",
+        "to": "2026-05-31"
+      },
+      "path": "/equities/bars/daily"
+    },
+    {
+      "params": {
+        "code": "46890",
+        "from": "2026-06-01",
+        "to": "2026-06-30"
+      },
+      "path": "/equities/bars/daily"
+    }
+  ],
+  "schema": "june-acquisition-plan-v1",
+  "scope": {
+    "account": "independent_200000_no_may_state_import",
+    "actual_trade_at": null,
+    "end": "2026-07-01",
+    "mode": "research_only",
+    "model_id": "daily_open_proxy_v1",
+    "registration_status": "draft_not_registered",
+    "start": "2026-06-01",
+    "symbol": "46890"
+  },
+  "settings": {
+    "rules": {
+      "availability": "session_phase_not_actual_publication_v1",
+      "corporate_action": "stop_preserve",
+      "end": "mark_without_forced_exit",
+      "expiry": "explicit_finalization_not_implemented",
+      "missing": "wait_without_expiry",
+      "no_trade": "terminal_no_fill",
+      "provider_price_basis": "jquants_reported_ohlcv_with_separate_official_adjusted_ohlcv",
+      "risk": "no_new_dd_stop",
+      "temporary_halt": "allow_daily_proxy_without_time_condition",
+      "time_condition": "none",
+      "volume_excess": "reject_instrument_batch",
+      "volume_unit": "execution_shares"
+    },
+    "strategy": {
+      "adx_entry_max": "25.0",
+      "adx_exit_min": "30.0",
+      "adx_period": 14,
+      "adx_score_limit": "50.0",
+      "annual_trading_days": 252,
+      "atr_method": "wilder",
+      "atr_period": 20,
+      "buy_atr_multiplier": "1.5",
+      "commission_rate": "0.001",
+      "crossing_target": 6,
+      "initial_capital": 200000,
+      "liquidity_window": 60,
+      "lot_size": 100,
+      "max_drawdown_stop": "0.2",
+      "max_holding_days": 40,
+      "max_position_pct": "0.25",
+      "max_positions": 1,
+      "median_trading_value_target": 100000000,
+      "normalized_slope_limit": "0.001",
+      "range_breakdown_days": 3,
+      "range_exit_threshold": "50.0",
+      "range_score_threshold": "70.0",
+      "range_score_weights": {
+        "liquidity": "0.2",
+        "mean_reversion": "0.3",
+        "stability": "0.2",
+        "trend": "0.3"
+      },
+      "range_window": 60,
+      "risk_free_rate": "0.0",
+      "sell_atr_multiplier": "1.5",
+      "slippage_pct": "0.001",
+      "slope_lookback": 20,
+      "sma_period": 20,
+      "stability_cv_limit": "0.5",
+      "stability_window": 20,
+      "stop_loss_pct": "0.05",
+      "trend_adx_weight": "0.5",
+      "trend_slope_weight": "0.5"
+    },
+    "terms": {
+      "amount_rounding": "half_even",
+      "basis_evidence_hash": "88422e14924246f0a862d6cd3ce1d079644aeffaf812ca6aa4d86b53ff2ceca9",
+      "budget_rounding": "floor",
+      "buy_price_rounding": "ceiling",
+      "commission_rate": "0.001",
+      "cost_model": "proportional",
+      "dividend_policy": "excluded",
+      "expiry_mode": "explicit_target_session_only",
+      "fee_rounding": "ceiling",
+      "fill_mode": "all_or_reject",
+      "initial_capital": "200000",
+      "lot_size": 100,
+      "max_position_pct": "0.25",
+      "max_positions": 1,
+      "money_quantum": "0.01",
+      "position_mode": "single_position_full_exit",
+      "price_quantum": "0.01",
+      "priority_mode": "sell_then_score_desc_instrument",
+      "proceeds_mode": "hold_until_later_decision_session",
+      "reservation_buffer_pct": "0.01",
+      "reservation_rounding": "ceiling",
+      "sell_price_rounding": "floor",
+      "slippage_pct": "0.001"
+    }
+  },
+  "settings_hash": "69cd67379ea44b39c1084a7c19042e3277180a5815b8d055c0040f111c538b38",
+  "split_rule": "ordered_calendar_floor_half_no_prices"
+}
