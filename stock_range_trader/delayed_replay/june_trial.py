@@ -578,9 +578,18 @@ def inspect(root, may_root):
         receipt.close()
 
 
-def build(root, may_root):
+def build(root, may_root, *, verify_only=False):
     """Publish input-only artifacts. Does not instantiate any account/reducer/runner."""
     root = Path(root)
+
+    def artifact(value):
+        if verify_only:
+            sha = digest(value)
+            if read(root, sha) != value:
+                raise ReplayContractError("june_input_artifact_changed")
+            return sha
+        return save(root, value)
+
     plan, bundle, old_calendar = load_context(root, may_root)
     receipt = existing_receipt(root, plan)
     try:
@@ -642,7 +651,7 @@ def build(root, may_root):
             )
         ).all():
             raise ReplayContractError("june_nonfinite_prefix_features")
-    source_hash = save(root, run)
+    source_hash = artifact(run)
     wall = parse_time(run["fetched_at"])
     store, hashes = InputArtifactStore(root / "inputs"), []
     for days in parts:
@@ -671,7 +680,14 @@ def build(root, may_root):
             price_basis_evidence_id="jquants_reported_separate_adjusted",
             observations=observations,
         )
-        hashes.append(store.publish(InputPacket(MarketView((snapshot,), ()))))
+        packet = InputPacket(MarketView((snapshot,), ()))
+        if verify_only:
+            sha = packet.payload.sha256
+            if store.load(sha).payload != packet.payload:
+                raise ReplayContractError("june_input_packet_changed")
+            hashes.append(sha)
+        else:
+            hashes.append(store.publish(packet))
     result = dict(
         schema="june-input-manifest-v1",
         plan_hash=plan.sha256,
@@ -682,15 +698,19 @@ def build(root, may_root):
         run_packets=hashes,
         parts=[list(p) for p in parts],
         history_comparison=compare_history(bundle, history),
-        captures=[save(root, c) for c in captured],
+        captures=[artifact(c) for c in captured],
         lot_review_hash=plan.payload.to_dict()["lot_review_hash"],
         provenance=plan.payload.to_dict()["parent"]["provenance"],
         causal_features="finite_session_prefixes_only",
         input_ready=True,
         executable=False,
-        reason="input_preparation_only_no_june_clearing_adapter_or_permission",
+        reason="input_preparation_only_separate_clearing_permission_required",
         clearing="not_executed",
         formal_oos=False,
     )
-    write_once(root / "input_manifest.json", result)
+    if verify_only:
+        if load_json(root / "input_manifest.json") != result:
+            raise ReplayContractError("june_input_manifest_changed")
+    else:
+        write_once(root / "input_manifest.json", result)
     return result

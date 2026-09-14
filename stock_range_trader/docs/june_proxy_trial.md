@@ -1,16 +1,17 @@
-# 46890・2026年6月限定Proxy試験の入力準備
+# 46890・2026年6月限定Proxy試験
 
-この変更は6月専用scope、保存履歴の照合、新単元レビュー、calendar分割、
-取得・取得再開・入力成果物の準備まで。市場API取得・実データ清算は実行していない。
-6月清算用Service/Reducer接続と清算コマンドは含めず、入力manifestも
-`executable=false`とする。正式登録、OOS、月次Validation、Checkpoint、
+6月専用scope、保存履歴の照合、新単元レビュー、calendar分割、
+取得・取得再開・入力成果物に加え、専用清算Serviceと口座再開を人工入力で検証した。
+市場API取得・実データ清算は実行していない。入力manifestは引き続き
+`executable=false`であり、生成だけでは清算を許可しない。正式登録、OOS、月次Validation、Checkpoint、
 既存Executable Gateの変更はない。前回5月の取得・清算許可を転用しない。
 
 ## 固定契約
 
 - 対象46890のみ、半開区間 `[2026-06-01, 2026-07-01)`。銘柄・期間の再選定なし。
-- 独立した6月研究口座を想定し、5月口座のCash/Position/Order状態は移植しない。
-  この段階では口座を作らない。5月は履歴価格と出典だけを再利用する。
+- 独立した6月研究口座を初期Cash/Equity 200000・保有/注文なしで作成する。
+  5月口座のCash/Position/Order状態は移植せず、履歴価格と出典だけを再利用する。
+  今回作成した口座は人工fixtureのみ。実データ口座は未作成。
 - 20万円、100株単位、1銘柄25%、最大1銘柄、Commission 0.1%、最低手数料なし、
   Slippage BUY +0.1%/SELL -0.1%、buffer 1%、quantum 0.01円と従来丸めを維持。
 - 固定baseline、ATR倍率BUY/SELL 1.5、Range Score 70、ADX ENTRY上限25。
@@ -22,8 +23,8 @@
 
 | 対象 | SHA-256 |
 | --- | --- |
-| 6月plan | `83d31b3de263b8672458365415215955ab41e5f3fb0810b5b3609b62c3231d7a` |
-| 6月実装 | `900cc045f14499ec99fb72a6a5ae2b1f85bcb19235b866748bf1a0c8c4937239` |
+| 6月取得準備plan（清算planとは別） | `b3b6c6777741cae1e5dd56b7c655b37adab6c743198c588dcf92bce590528553` |
+| 6月実装 | `ad76a2363817504bf4203a0230bd6c6b2edc18201f711b6262e3f4a7545c0540` |
 | 維持した設定 | `69cd67379ea44b39c1084a7c19042e3277180a5815b8d055c0040f111c538b38` |
 | 新単元レビュー | `7e85f6b7034b260f0b01c0030ed59d3d5345ee5aaa1b5aeba0a150ef5683f4c2` |
 | 参照元5月plan | `e6edf4316a2bb7eb173da0b1761bae89519243420bc536b5f7ae03f252c2fed5` |
@@ -32,6 +33,10 @@
 plan/reviewのhashは正規化JSONのSHA-256。整形済み公開JSONのファイルbytes hashとは区別する。
 公開スナップショットは `config/june_proxy_trial_plan.json` と
 `config/june_proxy_lot_review.json`。価格やDBは含まない。
+旧準備plan `83d31b3de263b8672458365415215955ab41e5f3fb0810b5b3609b62c3231d7a`
+は元のv1フォルダに保持した。旧receiptがplan記録1件・HTTP試行0件であることを確認した上で、
+新実装を指すv2を別フォルダに作成した。既存通信予算・取得済みデータのリセットではない。
+単元レビュー内容・日時・hashも維持する。新旧とも実取得・実清算は未承認。
 
 ## 履歴・単元・価格・calendar
 
@@ -88,7 +93,7 @@ planに絶対パスを含めない。
 ```bash
 cd /Users/harimatakeuchi/stock_range_trader/stock_range_trader
 june_saved_may=.delayed_replay/selected_trial/owner-approved-fixed-baseline-v1
-june_preparation_root=.delayed_replay/june_trial/46890-202606-preparation-v1
+june_preparation_root=.delayed_replay/june_trial/46890-202606-clearing-preparation-v2
 
 # 現在実行可能な読み取り検査。取得・清算を開始しない。
 .venv/bin/python -m examples.june_proxy_trial inspect \
@@ -133,6 +138,83 @@ build-inputsはsource hash・取得時刻付き2packetとinput_manifestを作る
 同一入力の再実行は同一結果、不一致成果物の上書きは禁止。
 元履歴packetは元保存先のまま参照する。成果物だけ移して元証拠を失えば検証できない。
 
+## 清算Service・情報境界・口座再開
+
+`delayed_replay/june_clearing.py`の`JuneClearingPlan`、
+`JuneClearingAuthorization`、`JuneClearingService`は6月専用。
+`prepare-clearing`は既存`build-inputs`成果物を**書き換えず**再検証する。
+receipt元応答→capture→履歴照合→calendar→packet/source/timestamp→manifestの
+完全一致と、各prefixの指標有限性を要求する。未取得・不完全・改変は停止する。
+新口座作成/再開でもこの検査を行い、稼働中は検証済み不変bundleを使い、各イベント前に
+証拠ファイルのbytes hashを照合する。単なる`input_ready=true`を信用しない。
+
+専用Reducerは既存`_LimitedReducer`と`_resolve_batch`を再利用し、数量・予約・
+丸め・費用・Cash・Positionの算術を複製しない。公開Phase 3 Interfaceや既定値は変更しない。
+6月初日は新しい選択epochだけを作る。初日のBUYは初日終値確定後の新規判断に限り、
+翌calendar sessionへ送る。5月末Signal/注文は持ち込まない。
+SignalAdapterへ渡る調整済み価格は判断日まで。次sessionのraw Openはその約定フェーズで
+だけ使い、決定済み株数・予約額を増やさない。6月最終sessionでは新たな翌日注文を出さず、
+7月価格・強制EXITを使わない。保有があれば6月末Closeで評価して残す。
+
+分割はcalendar順のfloor(N/2)。初期入力は全履歴と第1packetのみで、後半は台帳に未公開。
+前半完了後に`waiting_for_input`となり、第2packetを追加受理してからDBを閉じる。
+再開は元genesis・plan・許可・入力を照合し、追記型イベント列を再生して口座状態を復元する。
+同じ追加イベントの再送は冪等。別packet/parent/過去訂正は契約で拒否する。
+比較は注文（凍結数量・予算・予約を含む）、予約、Fill、Cash/Equity、Position、cursor、
+判断・評価・epoch・完了取引を照合する。入力受理時刻・配送方式によるログの差は除外するが、
+既存イベントprefix不変と追加受理直後の完全な状態復元も別途要求する。
+
+### 取得許可と清算許可
+
+`acquisition_authorization.template.json`は取得専用で清算不可。
+`clearing_authorization.template.json`は`prepare-clearing`で作成する別の未承認提案で、
+取得plan hash・入力manifest hash・清算plan hashを結ぶ。`permission=clear_only`、
+`acquisition_permission=false`を要求し、許可の完全な内容も口座identityへ記録する。
+実行には別途、対象hashへの明示承認と`status=approved_for_limited_trial`、
+実際の`approval_reference`、`recorded_at`が必要。今回の人工検証依頼をこの承認に転用しない。
+人工テストは`artificial_test_authorization`を明示し、実CLIは人工provenanceを拒否する。
+モデル全体は`unapproved`、Formal Checkpointは`unsupported`を維持する。
+
+### 取得完了後の将来用コマンド（今回は未実行）
+
+前節のacquire/resume/build-inputsに続ける。`prepare-clearing`も現在は実入力がないため停止する。
+清算plan hashは取得後のcapture・packet・manifestに依存するため、取得前には確定できない。
+最終取得準備plan/実装hashと混同せず、実入力完成後に出力された清算planへ承認を結び付ける。
+
+```bash
+.venv/bin/python -m examples.june_proxy_trial prepare-clearing \
+  --root "$june_preparation_root" --may-root "$june_saved_may"
+
+# 以下は別途清算の明示承認後のみ。承認ファイルは現在存在しない。
+june_clearing_permission="$june_preparation_root/owner_approved_clearing.json"
+june_account="$june_preparation_root/research_split.sqlite"
+.venv/bin/python -m examples.june_proxy_trial start-clearing \
+  --root "$june_preparation_root" --may-root "$june_saved_may" \
+  --clearing-authorization "$june_clearing_permission" --execute-saved-data \
+  --account "$june_account" --style split_resume
+
+# 入力待機から第2packetを受理するだけ。受理後にプロセス/DBを閉じる。
+.venv/bin/python -m examples.june_proxy_trial accept-inputs \
+  --root "$june_preparation_root" --may-root "$june_saved_may" \
+  --clearing-authorization "$june_clearing_permission" --execute-saved-data \
+  --account "$june_account" --style split_resume
+
+.venv/bin/python -m examples.june_proxy_trial resume-clearing \
+  --root "$june_preparation_root" --may-root "$june_saved_may" \
+  --clearing-authorization "$june_clearing_permission" --execute-saved-data \
+  --account "$june_account" --style split_resume
+
+# 同じ許可・同じ入力による別研究口座の連続/分割比較。既存出力の上書き禁止。
+.venv/bin/python -m examples.june_proxy_trial compare-clearing \
+  --root "$june_preparation_root" --may-root "$june_saved_may" \
+  --clearing-authorization "$june_clearing_permission" --execute-saved-data \
+  --output "$june_preparation_root/comparison-v1"
+```
+
+`start-clearing --style continuous`は全packetを持つ新口座を作る。
+`resume`はHTTP取得再開、`resume-clearing`は保存済み口座の再開であり、用途を混同しない。
+口座再開にHTTP予算のリセットや追加取得は含まれない。
+
 ## 回帰検証・残る制限
 
 新規39テストはネットワーク禁止の人工データ。変更前に取得した5月人工データの
@@ -140,8 +222,15 @@ golden結果（Cash/Equity 202590.45、実現損益2590.45、BUY/SELL各500株�
 価格・手数料）と、連続/分割再開一致を確認する。実市場データの再清算ではない。
 既存5月モジュールとProxy算術ソースは変更していない。
 
+6月は追加25テストで入力改変、許可分離、月初の空口座、21sessionの10+11分割、
+非空Fill/拒否/期末保有、予約を保持した再開、7月/欠測/重複拒否を検証する。
+基準人工fixtureはBUY/SELL各2件、Cash/Equity 206565.83。人工gap fixtureは500株を
+減らさず固定予約超過で拒否する。別人工fixtureは500株を期末まで保持する。
+これらは固定設定の接続試験であり、実市場の収益や約定可能性を示さない。
+
 6月市場データは未取得、実際のsession集合と指標有限性は未検証。
 市場の実約定時刻、停止情報の網羅性、外部価格との独立照合も未検証のまま。
-6月の清算接続・口座再開・非空Fill会計は今回の入力準備には含まれない。
-将来実装時は月初/翌session/期末の情報境界を維持し、5月末Signalの注文移植や
-7月価格取得・強制EXIT・正式OOS許可の転用を行わない。
+6月の清算接続・口座再開・非空Fill・拒否・期末保有は人工fixtureでのみ検証した。
+実際のJuneデータでのこれらの挙動は**unverified**。人工利益は実成績の証拠ではない。
+停止情報はunknownで、日足Openは当時の実約定時刻の証拠ではない。株式分割などの
+企業行動や欠測を補間して清算を強行しない。モデル全体のExecutable Gateは解除しない。
