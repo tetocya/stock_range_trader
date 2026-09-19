@@ -210,34 +210,42 @@ class OrderAuditReportWriter:
         artifacts["report_manifest.json"] = JsonObject.from_value(
             manifest
         ).encoded.encode()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        lock = output.parent / ("." + output.name + ".publish-lock")
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        return publish_artifacts(bundle, output, artifacts, fault=fault)
+
+
+def publish_artifacts(bundle, output, artifacts, *, fault=None):
+    """Shared private, atomic, non-overwriting report publication."""
+    output = Path(output).absolute()
+    _output_contract(output, bundle.input_root)
+    bundle.files.verify()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock = output.parent / ("." + output.name + ".publish-lock")
+    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    temporary = None
+    try:
+        os.close(fd)
+        _output_contract(output, bundle.input_root)
+        temporary = Path(tempfile.mkdtemp(prefix=".order-audit-", dir=output.parent))
+        for name, body in artifacts.items():
+            if Path(name).name != name or name in (".", ".."):
+                raise ObservationError("invalid_artifact_name")
+            path = temporary / name
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path.read_bytes() != body:
+                raise ObservationError("published_artifact_mismatch")
+            if fault is not None:
+                fault(name)
+        bundle.files.verify()
+        if output.exists() or output.is_symlink():
+            raise ObservationError("output_exists_no_overwrite")
+        temporary.rename(output)
         temporary = None
-        try:
-            os.close(fd)
-            _output_contract(output, bundle.input_root)
-            temporary = Path(
-                tempfile.mkdtemp(prefix=".order-audit-", dir=output.parent)
-            )
-            for name, body in artifacts.items():
-                path = temporary / name
-                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(body)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                if path.read_bytes() != body:
-                    raise ObservationError("published_artifact_mismatch")
-                if fault is not None:
-                    fault(name)
-            bundle.files.verify()
-            if output.exists() or output.is_symlink():
-                raise ObservationError("output_exists_no_overwrite")
-            temporary.rename(output)
-            temporary = None
-        finally:
-            if temporary is not None:
-                shutil.rmtree(temporary)
-            lock.unlink(missing_ok=True)
-        return output
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary)
+        lock.unlink(missing_ok=True)
+    return output

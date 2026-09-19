@@ -116,7 +116,7 @@ def _price_evidence(root, state, symbol, day, files, cache):
 
 
 class OrderAuditReader:
-    def read(self, trial_root, account=None):
+    def read(self, trial_root, account=None, *, _observer=None):
         root = Path(trial_root).absolute()
         files = EvidenceFiles()
         names = [
@@ -379,6 +379,10 @@ class OrderAuditReader:
                     grants_created=False,
                 )
             )
+            # Internal projection hook: the viewer shares this exact DB transaction
+            # and evidence set; never opens a second, potentially newer snapshot.
+            if _observer is not None:
+                _observer(state, stored, root, files, cache)
         return OrderAuditBundle(tuple(orders), metadata, files, root)
 
 
