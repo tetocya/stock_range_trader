@@ -34,11 +34,13 @@ class AccountReadModel:
     audit: OrderAuditBundle
 
     @classmethod
-    def read(cls, trial_root, account=None):
+    def read(cls, trial_root, account=None, *, _observer=None):
         projections = []
 
         def observe(state, stored, root, files, cache):
             projections.append(_project(state, root, files, cache))
+            if _observer is not None:
+                _observer(state, stored, root, files, cache)
 
         audit = OrderAuditReader().read(trial_root, account, _observer=observe)
         return cls(JsonObject.from_value(projections[0]), audit)
