@@ -92,13 +92,8 @@ def _authorize(action, arg1, arg2, *_):
 
 
 @contextmanager
-def read_account(path, files):
-    """No recover/resume/reducer. One transaction covers DB and external reads.
-
-    Reuse EventStore._load (a private interface, covered by compatibility tests).
-    WAL and rollback-journal sidecars require a stopped, consistent source first.
-    Do not copy a running DB, set immutable=1, or checkpoint it here.
-    """
+def read_database(path, files):
+    """Shared readonly transaction; reject active journals before connecting."""
     path = Path(path).absolute()
     body = files.read(path)
     if len(body) < 100 or body[:16] != b"SQLite format 3\x00":
@@ -116,12 +111,7 @@ def read_account(path, files):
         connection.execute("BEGIN")
         if connection.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
             raise ObservationError("unsupported_journal_mode")
-        identities = connection.execute("SELECT identity_json FROM streams").fetchall()
-        if len(identities) != 1:
-            raise ObservationError("exactly_one_stream_required")
-        identity = StreamIdentity.from_dict(parse_json(identities[0][0]))
-        records = EventStore(connection, identity)._load()
-        yield records
+        yield connection
         files.verify()
         connection.execute("COMMIT")
         files.verify()
@@ -132,3 +122,14 @@ def read_account(path, files):
     finally:
         if connection is not None:
             connection.close()
+
+
+@contextmanager
+def read_account(path, files):
+    """Reuse EventStore._load, never recovery/reducer/migration/checkpoint."""
+    with read_database(path, files) as connection:
+        identities = connection.execute("SELECT identity_json FROM streams").fetchall()
+        if len(identities) != 1:
+            raise ObservationError("exactly_one_stream_required")
+        identity = StreamIdentity.from_dict(parse_json(identities[0][0]))
+        yield EventStore(connection, identity)._load()
