@@ -60,6 +60,7 @@ include = [
     "indicators*",
     "metrics*",
     "reports*",
+    "research_tools*",
     "risk*",
     "screening*",
     "strategy*",
