@@ -86,7 +86,8 @@ def _table(rows, columns):
 class TrialComparisonReportWriter:
     def write(self, bundle, output, *, fault=None):
         for item in bundle.inputs:
-            _output_contract(Path(output).absolute(), item.input_root)
+            for root in item.evidence_roots:
+                _output_contract(Path(output).absolute(), root)
         bundle.files.verify()
         data = bundle.payload.to_dict()
         rows = _rows(data)
@@ -195,16 +196,28 @@ def main(argv=None):
         action="append",
         help="Relative DB per trial, in the same order; omit all for comparison/continuous.sqlite",
     )
+    parser.add_argument(
+        "--history-root",
+        action="append",
+        help="History evidence root per trial, in the same order; '-' or omission uses that trial root. Only plan.history_packets are routed here.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.account is not None and len(args.account) != len(args.trial_root):
         parser.error("provide one --account per --trial-root or omit all")
+    if args.history_root is not None and len(args.history_root) != len(args.trial_root):
+        parser.error(
+            "provide one --history-root per --trial-root or omit all; use '-' for a local history root"
+        )
     try:
         inputs = [
-            TrialComparisonInput.read(root, account)
-            for root, account in zip(
+            TrialComparisonInput.read(
+                root, account, history_root=None if history in (None, "-") else history
+            )
+            for root, account, history in zip(
                 args.trial_root,
                 args.account or [None] * len(args.trial_root),
+                args.history_root or [None] * len(args.trial_root),
                 strict=True,
             )
         ]

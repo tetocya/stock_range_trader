@@ -6,6 +6,7 @@ from decimal import localcontext
 from itertools import combinations
 from pathlib import Path
 
+from delayed_replay.input_artifacts import InputPacket
 from delayed_replay.june_trial import JunePlan
 from delayed_replay.serialization import JsonObject, digest, require_hash
 
@@ -88,22 +89,49 @@ def _saved_comparison(root, plan_hash, files):
     )
 
 
-def _inventory(state, stored, root, files, cache):
+def _inventory(state, stored, root, files, cache, *, history_root=None):
     plan = state["identity"]["plan"]
     inputs = state["inputs"]
-    declared = plan["history_packets"] + plan["packets"]
-    for sha in declared:
-        require_hash(sha)
+    for name in ("history_packets", "packets"):
+        if type(plan[name]) is not list:
+            raise ObservationError("invalid_declared_packet_list")
+        for sha in plan[name]:
+            require_hash(sha)
+        if len(plan[name]) != len(set(plan[name])):
+            raise ObservationError("duplicate_declared_packet")
+    history = set(plan["history_packets"])
+    run = set(plan["packets"])
+    if history & run:
+        raise ObservationError("ambiguous_history_run_packet")
+    source = root if history_root is None else history_root
+    # Separate caches prevent a trial-local read from satisfying a history-root
+    # reference. Read ALL declared history packets, even before they are used.
+    history_cache = {
+        sha: InputPacket.from_payload(
+            files.json(source / "inputs" / (sha + ".json"), sha)
+        )
+        for sha in sorted(history)
+    }
     missing = []
     days = []
     for key, item in sorted(inputs.items()):
-        if item["packet"] not in declared:
+        if item["packet"] not in history | run:
             raise ObservationError("saved_input_outside_declared_plan")
         row = item["row"]
         symbol, day = row["symbol"], row["session"]
         if key != symbol + "|" + day:
             raise ObservationError("comparison_input_key_mismatch")
-        _, _, absent = _price_evidence(root, state, symbol, day, files, cache)
+        historical = item["packet"] in history
+        _, _, absent = _price_evidence(
+            source if historical else root,
+            state,
+            symbol,
+            day,
+            files,
+            history_cache if historical else cache,
+        )
+        if historical and absent:
+            raise ObservationError("missing_declared_history_price_evidence")
         missing.extend(absent)
         days.append(day)
     start, end = plan["scope"]["start"], plan["scope"]["end"]
@@ -156,10 +184,20 @@ class TrialComparisonInput:
     payload: JsonObject
     files: EvidenceFiles
     input_root: Path
+    history_root: Path | None = None
+
+    @property
+    def evidence_roots(self):
+        return (
+            (self.input_root,)
+            if self.history_root is None
+            else (self.input_root, self.history_root)
+        )
 
     @classmethod
-    def read(cls, trial_root, account=None):
+    def read(cls, trial_root, account=None, *, history_root=None):
         root = Path(trial_root).absolute()
+        history_root = None if history_root is None else Path(history_root).absolute()
         # Only an explicit acquisition-only plan supports the unacquired lane.
         # A missing ledger in a clearing trial is an error, never an empty account.
         files = EvidenceFiles()
@@ -205,11 +243,11 @@ class TrialComparisonInput:
                 limitations=LIMITATIONS,
             )
             files.verify()
-            return cls(JsonObject.from_value(data), files, root)
+            return cls(JsonObject.from_value(data), files, root, history_root)
         projections = []
 
         def observe(*args):
-            projections.append(_inventory(*args))
+            projections.append(_inventory(*args, history_root=history_root))
 
         model = AccountReadModel.read(root, account, _observer=observe)
         view = AccountViewBuilder().build(model).to_dict()
@@ -274,6 +312,7 @@ class TrialComparisonInput:
             JsonObject.from_value(data),
             _EvidenceGroup((files, model.audit.files)),
             root,
+            history_root,
         )
 
 

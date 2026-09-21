@@ -24,6 +24,21 @@ python -m research_tools.compare_trials \
 
 単一試験の読取レポートも可能。出力は入力と別のGit除外領域へ新規作成する。既存出力・symlink・WAL稼働中DBを拒否する。全入力rootの証拠を公開直前まで再検証し、途中変更は中断する。CLI異常時は固定メッセージとexit 2を返し、パスや機密値を表示しない。
 
+### 別rootに保存された事前履歴
+
+6月の清算口座は事前履歴を5月rootに保持する。保存済み口座の比較時は、Pythonでは `TrialComparisonInput.read(june_root, history_root=may_root)`、CLIでは `--history-root` で明示する。
+
+```bash
+python -m research_tools.compare_trials \
+  --trial-root /path/to/saved-may --history-root - \
+  --trial-root /path/to/saved-june --history-root /path/to/saved-may \
+  --output outputs/trial-comparison-v2
+```
+
+`--history-root`を使う場合は試験rootと同じ順序で同数指定する。`-`または全省略は当該試験root。参照先は日付やファイルの存在ではなく、監査済みplanの `history_packets` / `packets` に宣言されたhashで決定する。両集合の重複・未宣言packetは拒否する。history packet本体・snapshot・raw価格証拠を指定rootで検証し、欠落・改変ならレポートを発行しない。試験root等への探索・フォールバック、原本のコピー・修復は行わない。run packetは常に試験rootで読み、履歴rootへ迂回させない。
+
+履歴rootの読取証拠も同一EvidenceFilesで公開直前まで再検証し、出力先が履歴root内／親である場合も拒否する。Manifestの既存 `input_file_hashes` に外部履歴の読取hashを含め、絶対パスは成果物へ追加しない。参照rootは保存場所の指定であり、試験ID・複製グループを変更しない。未取得laneでは履歴の検証成功を主張せず、従来どおり結果はnull。
+
 ## Schemaと比較契約
 
 - `TrialComparisonInput.read()`：既存 `AccountReadModel.read()` の内部observerから、同一SQLite読取transaction内で入力・口座・注文を採取する。追加hookは省略時の既存挙動・Schemaを変えない。
