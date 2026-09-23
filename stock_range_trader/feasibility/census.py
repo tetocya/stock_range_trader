@@ -15,10 +15,11 @@ only speaks about instruments.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
-import tempfile
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
@@ -49,7 +50,12 @@ from universe.japanese_equities import (
 )
 
 from .acquisition import canonical_json, sha256_text
-from .paths import require_new_output_dir
+from .paths import (
+    UnsafeOutputPath,
+    create_exclusive_dir,
+    require_new_output_dir,
+    write_new_file,
+)
 
 CENSUS_SCHEMA = "feasibility-static-census-v1"
 ROUNDINGS = {
@@ -89,6 +95,7 @@ CSV_COLUMNS = (
     "b_price_and_lot_known",
     "one_lot_required_amount",
     "position_cap_amount",
+    "c_lot_basis",
     "c_purchasable",
     "c_reason",
     "complete_sessions_ending_at_r",
@@ -192,7 +199,8 @@ def one_lot_requirement(
     3. gross = round(unit x lot_size, money_quantum, amount_rounding)
     4. fee = round(gross x commission_rate, money_quantum, fee_rounding)
     5. required = round(gross + fee, money_quantum, reservation_rounding)
-    6. purchasable iff required <= cap
+    6. purchasable iff 0 < unit, 0 < required and required <= cap
+       (``size_buy`` returns zero shares for a non-positive unit or amount)
     """
 
     money_q = dec(terms.money_quantum, "money_quantum")
@@ -217,6 +225,7 @@ def one_lot_requirement(
         terms.fee_rounding,
     )
     required = rounded(gross + fee, money_q, terms.reservation_rounding)
+    positive = unit > 0 and gross > 0 and required > 0
     return {
         "reference_close": format(reference_close, "f"),
         "unit_price": format(unit, "f"),
@@ -224,7 +233,8 @@ def one_lot_requirement(
         "fee": format(fee, "f"),
         "required": format(required, "f"),
         "cap": format(cap, "f"),
-        "purchasable": required <= cap,
+        "nonpositive_amount": not positive,
+        "purchasable": positive and required <= cap,
     }
 
 
@@ -317,18 +327,35 @@ def run_census(request: CensusRequest, data: CensusData) -> CensusResult:
     master = pd.DataFrame.from_records([_strip(row) for row in data.master_rows])
     universe = build_japanese_equity_universe(master, as_of_date=r)
 
+    acquired = set(data.acquired_daily_dates)
     used: dict[tuple[str, date], dict] = {}
     ignored_future_rows = 0
+    undeclared: Counter = Counter()
     for row in data.daily_rows:
         day = date.fromisoformat(str(row["Date"]))
         if day > r:
             ignored_future_rows += 1
             continue
+        if day not in acquired:
+            # A row whose date is not declared as acquired has no provenance: unused.
+            undeclared[day.isoformat()] += 1
+            continue
         key = (str(row["Code"]).strip().upper(), day)
         if key in used:
             raise CensusError("duplicate_daily_row")
         used[key] = row
-    acquired = set(data.acquired_daily_dates)
+    consistency = {
+        "reference_date_acquired": r in acquired,
+        "rows_outside_declared_acquisition": dict(sorted(undeclared.items())),
+        "acquired_dates_not_sessions": sorted(
+            d.isoformat() for d in acquired if d not in set(sessions)
+        ),
+        "acquired_dates_without_rows": sorted(
+            d.isoformat()
+            for d in acquired
+            if d <= r and not any(day == d for _, day in used)
+        ),
+    }
     upto_r = [s for s in sessions if s <= r]
     window = upto_r[-request.minimum_history_sessions :]
     window_short = len(window) < request.minimum_history_sessions
@@ -349,6 +376,7 @@ def run_census(request: CensusRequest, data: CensusData) -> CensusResult:
             )
         )
     summary = _summarize(request, data, symbols, used, ignored_future_rows, window)
+    summary["acquisition_consistency"] = consistency
     return CensusResult(symbols=tuple(symbols), summary=summary)
 
 
@@ -382,7 +410,10 @@ def _evaluate_symbol(request, member, code, used, acquired, upto_r, window, shor
     lot_usable = lot_status in ("verified", "assumed_100_unverified")
     record["b_price_and_lot_known"] = price_observed and lot_usable
 
-    if not price_observed:
+    lot_basis = ""
+    if r not in acquired:
+        c_ok, c_reason, required, cap = False, "reference_date_not_acquired", "", ""
+    elif not price_observed:
         c_ok, c_reason, required, cap = False, "price_not_observed_at_r", "", ""
     elif lot_status == "unknown":
         c_ok, c_reason, required, cap = False, "lot_size_unknown", "", ""
@@ -391,9 +422,18 @@ def _evaluate_symbol(request, member, code, used, acquired, upto_r, window, shor
     else:
         cost = one_lot_requirement(close, terms, lot_size=terms.lot_size)
         c_ok = bool(cost["purchasable"])
-        c_reason = "" if c_ok else "one_lot_exceeds_position_cap"
+        if c_ok:
+            c_reason = ""
+        elif cost["nonpositive_amount"]:
+            c_reason = "nonpositive_rounded_unit_or_amount"
+        else:
+            c_reason = "one_lot_exceeds_position_cap"
         required, cap = cost["required"], cost["cap"]
+        lot_basis = (
+            "verified_lot" if lot_status == "verified" else "assumed_lot_unverified"
+        )
     record.update(
+        c_lot_basis=lot_basis,
         one_lot_required_amount=required,
         position_cap_amount=cap,
         c_purchasable=c_ok,
@@ -411,14 +451,17 @@ def _evaluate_symbol(request, member, code, used, acquired, upto_r, window, shor
             continue
         if any(row.get(f) is None for f in ("O", "H", "L", "C")):
             issues.append(("null_ohlc_no_trade_or_halt_cause_unknown", day))
-            continue
         if any(row.get(f) is None for f in ADJUSTED_FIELDS):
             issues.append(("adjusted_values_missing", day))
         volume = _numeric(row, "Vo")
-        if volume is not None and volume == 0:
-            issues.append(("zero_volume_with_prices", day))
+        if volume is None:
+            issues.append(("volume_missing", day))
+        elif volume == 0:
+            issues.append(("zero_volume", day))
         factor = _numeric(row, "AdjFactor")
-        if factor is None or factor != 1:
+        if factor is None:
+            issues.append(("adjustment_factor_missing", day))
+        elif factor != 1:
             issues.append(("adjustment_factor_not_one", day))
         if row.get("ExRT") not in (None, "", "0"):
             issues.append(("ex_rights_flag", day))
@@ -531,10 +574,17 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
 
     issue_symbols: Counter = Counter()
     issue_events: Counter = Counter()
+    combinations: Counter = Counter()
+    multi_issue_rows = 0
     for s in symbols:
-        kinds = [item.split("@")[0] for item in s["e_issues"].split(";") if item]
+        items = [item.split("@") for item in s["e_issues"].split(";") if item]
+        kinds = [kind for kind, _ in items]
         issue_events.update(kinds)
         issue_symbols.update(set(kinds))
+        if kinds:
+            combinations["+".join(sorted(set(kinds)))] += 1
+        per_day = Counter(day for _, day in items)
+        multi_issue_rows += sum(1 for count in per_day.values() if count > 1)
     used_dates = sorted({day for _, day in used})
     period_start = window[0] if window else None
     overlaps = []
@@ -553,9 +603,12 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
             )
     lot_sources = sorted({s["lot_source"] for s in symbols if s["lot_source"]})
     terms = asdict(request.terms)
-    provisional = request.terms.status != "owner_approved" or any(
-        s["lot_status"] == "assumed_100_unverified" for s in symbols
-    )
+    if request.terms.status != "owner_approved":
+        result_kind = "reference_only_provisional_terms"
+    elif any(s["lot_status"] != "verified" for s in symbols):
+        result_kind = "reference_only_unverified_or_unknown_lots"
+    else:
+        result_kind = "census_recorded_owner_terms_and_lot_evidence"
     pairwise = {
         "c_and_d": n(lambda s: s["c_purchasable"] and s["d_history_sufficient"]),
         "c_and_not_d": n(
@@ -586,10 +639,16 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
     }
     return {
         "schema": CENSUS_SCHEMA,
-        "result_kind": (
-            "reference_only_provisional_terms_or_unverified_lot"
-            if provisional
-            else "census_under_owner_approved_terms"
+        "result_kind": result_kind,
+        "terms_approval": {
+            "status": request.terms.status,
+            "approval_reference_recorded": request.terms.approval_reference is not None,
+            "authenticity_verified_by_code": False,
+        },
+        "lot_evidence_status": (
+            "all_instruments_lot_verified"
+            if all(s["lot_status"] == "verified" for s in symbols)
+            else "includes_assumed_unknown_or_unsupported_lots"
         ),
         "claims": {
             "estimates_future_executions_or_trades": False,
@@ -598,6 +657,8 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
             "adjusted_series_basis": "provider_adjusted_as_of_retrieval",
             "instrument_universe_exclusion_rule_added": False,
             "candidate_means": "strategy_parameter_candidate_not_instrument",
+            "owner_approval_authenticity_verified": False,
+            "lot_evidence_source_authenticity_verified": False,
         },
         "reference_date": request.reference_date.isoformat(),
         "history_window": {
@@ -652,7 +713,17 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
         "counts": {
             "a_domestic_common_stock": count,
             "b_price_and_lot_known": n(lambda s: s["b_price_and_lot_known"]),
-            "c_purchasable": n(lambda s: s["c_purchasable"]),
+            "c_purchasable_verified_lot": n(
+                lambda s: s["c_purchasable"] and s["c_lot_basis"] == "verified_lot"
+            ),
+            "c_purchasable_assumed_lot_reference_only": n(
+                lambda s: (
+                    s["c_purchasable"] and s["c_lot_basis"] == "assumed_lot_unverified"
+                )
+            ),
+            "c_not_evaluable_lot_unknown_or_unsupported": n(
+                lambda s: s["lot_status"] in ("unknown", "unsupported_lot_size")
+            ),
             "d_history_sufficient": n(lambda s: s["d_history_sufficient"]),
             "e_data_issue_affected": n(lambda s: s["e_data_issue_affected"]),
             "f_current_processing_acceptable": n(
@@ -667,7 +738,10 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
         },
         "e_issue_symbol_counts": dict(issue_symbols),
         "e_issue_event_counts": dict(issue_events),
+        "e_issue_combination_symbol_counts": dict(combinations),
+        "e_rows_with_multiple_issues": multi_issue_rows,
         "overlaps": {
+            "basis": "c_purchasable on each instrument's c_lot_basis",
             "pairwise": pairwise,
             "cdef_pattern_counts": dict(Counter(_flag_pattern(s) for s in symbols)),
         },
@@ -675,25 +749,40 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
 
 
 def write_census_bundle(
-    result: CensusResult, output_dir: str | Path, *, forbidden_roots=()
+    result: CensusResult,
+    output_dir: str | Path,
+    *,
+    allowed_roots=None,
+    protected_roots=(),
 ) -> Path:
-    """Publish ``census_symbols.csv`` and ``census_summary.json`` into a new dir."""
+    """Publish ``census_symbols.csv`` and ``census_summary.json`` into a new dir.
 
-    target = require_new_output_dir(output_dir, forbidden_roots=forbidden_roots)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".census-", dir=target.parent))
+    The target and a sibling staging directory must pass the allowlist checks in
+    ``feasibility.paths``; the staging directory is renamed only if the target
+    still does not exist (a residual race with a concurrent writer is possible).
+    """
+
+    location = {"allowed_roots": allowed_roots, "protected_roots": protected_roots}
+    target = require_new_output_dir(output_dir, **location)
+    staging = create_exclusive_dir(
+        target.parent / f"{target.name}.staging-{uuid.uuid4().hex}", **location
+    )
     try:
-        with open(
-            staging / "census_symbols.csv", "w", newline="", encoding="utf-8"
-        ) as h:
-            writer = csv.DictWriter(h, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerows(result.symbols)
-        (staging / "census_summary.json").write_text(
-            json.dumps(result.summary, ensure_ascii=False, indent=2, sort_keys=True)
-            + "\n",
-            encoding="utf-8",
+        buffer = io.StringIO(newline="")
+        writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(result.symbols)
+        write_new_file(
+            staging / "census_symbols.csv", buffer.getvalue().encode("utf-8")
         )
+        summary = json.dumps(
+            result.summary, ensure_ascii=False, indent=2, sort_keys=True
+        )
+        write_new_file(
+            staging / "census_summary.json", (summary + "\n").encode("utf-8")
+        )
+        if os.path.lexists(target):
+            raise UnsafeOutputPath("output_already_exists")
         os.rename(staging, target)
     except BaseException:
         for child in staging.glob("*"):

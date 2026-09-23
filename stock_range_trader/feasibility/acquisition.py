@@ -1,48 +1,78 @@
-"""Date-scoped J-Quants V2 acquisition ledger for the feasibility census.
+"""Date-scoped J-Quants V2 acquisition ledger for the feasibility census (offline).
 
-This module contains no network client. ``AcquisitionRunner`` accepts only
-transports whose ``kind`` is ``offline_fixture``; enabling a real transport is a
-separate change that needs its own owner approval, an up-to-date check of the
-official specification, the Free-plan window, the rate limit and a request
-estimate. Market dates (what a row describes) and ``received_at`` (when this
-tool stored the response) are recorded separately. A response for a past date
-is the provider's value at retrieval time, never proof of the original
-contemporaneous snapshot.
+This module contains no network client and offers exactly one entry point,
+``run_offline_fixture_acquisition``, which accepts only an instance of the
+concrete ``OfflineFixtureTransport`` class (checked by exact type, before any
+store is created or opened). That transport replays immutable response values
+supplied by the caller; it cannot run caller code. A future real-data entry
+point must be a separate function with its own owner approval, execution
+contract and transport (see ``docs/feasibility_census.md``), not a new
+transport kind accepted here. Code already running in this process can still
+monkeypatch anything; the runner does not claim to defend against that.
+
+Market dates (what a row describes) and ``received_at`` (when this tool stored
+the response) are recorded separately. A response for a past date is the
+provider's value at retrieval time, never proof of the original snapshot.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Protocol
 
-from .paths import require_new_output_dir
+from .paths import (
+    create_exclusive_dir,
+    require_existing_store_dir,
+    write_new_file,
+)
 
 PLAN_SCHEMA = "feasibility-acquisition-plan-v1"
 LEDGER_SCHEMA = "feasibility-acquisition-ledger-v1"
 MASTER = "/equities/master"
 DAILY = "/equities/bars/daily"
 CALENDAR = "/markets/calendar"
-ALLOWED_TRANSPORT_KINDS = frozenset({"offline_fixture"})
 TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 ROW_KEYS = {MASTER: ("Code", "Date"), DAILY: ("Code", "Date"), CALENDAR: ("Date",)}
+MASTER_TEXT_FIELDS = (
+    "CoName",
+    "Mkt",
+    "MktNm",
+    "S17",
+    "S17Nm",
+    "S33",
+    "S33Nm",
+    "ProdCat",
+)
+PRICE_FIELDS = ("O", "H", "L", "C")
+DAILY_POSITIVE_FIELDS = (
+    "O",
+    "H",
+    "L",
+    "C",
+    "AdjO",
+    "AdjH",
+    "AdjL",
+    "AdjC",
+    "AdjFactor",
+)
+DAILY_NON_NEGATIVE_FIELDS = ("Vo", "Va", "AdjVo")
 REQUIRED_FIELDS = {
-    MASTER: frozenset(
-        {"Date", "Code", "CoName", "Mkt", "MktNm", "S17", "S17Nm", "S33", "S33Nm"}
-        | {"ProdCat"}
-    ),
+    MASTER: frozenset({"Date", "Code", *MASTER_TEXT_FIELDS}),
     DAILY: frozenset(
-        {"Date", "Code", "O", "H", "L", "C", "Vo", "Va", "AdjFactor"}
-        | {"AdjO", "AdjH", "AdjL", "AdjC", "AdjVo"}
+        {"Date", "Code", *DAILY_POSITIVE_FIELDS, *DAILY_NON_NEGATIVE_FIELDS}
     ),
     CALENDAR: frozenset({"Date", "HolDiv"}),
 }
-PRICE_FIELDS = ("O", "H", "L", "C")
+HOLIDAY_DIVISIONS = frozenset({"0", "1", "2", "3"})
+CODE_PATTERN = re.compile(r"[0-9A-Z]{5}")
+BODY_NAME = re.compile(r"([0-9a-f]{64})\.json")
 
 
 class AcquisitionError(ValueError):
@@ -66,16 +96,19 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _iso_date(value: object, name: str) -> str:
+def _is_iso_date(value: object) -> bool:
     if type(value) is not str:
-        raise AcquisitionError(f"{name}_must_be_iso_date")
+        return False
     try:
-        parsed = date.fromisoformat(value)
-    except ValueError as error:
-        raise AcquisitionError(f"{name}_must_be_iso_date") from error
-    if parsed.isoformat() != value:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def _iso_date(value: object, name: str) -> str:
+    if not _is_iso_date(value):
         raise AcquisitionError(f"{name}_must_be_iso_date")
-    return value
+    return str(value)
 
 
 def _utc_text(value: datetime) -> str:
@@ -185,12 +218,62 @@ class TransportResponse:
     status: int
     body: bytes
 
+    def __post_init__(self) -> None:
+        if type(self.status) is not int or type(self.body) is not bytes:
+            raise AcquisitionError("fixture_response_must_be_int_status_and_bytes")
 
-class Transport(Protocol):
-    kind: str
+
+@dataclass(frozen=True)
+class FixtureFailure:
+    """A simulated transport failure; only its class label is ever recorded."""
+
+    error_class: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", str(self.error_class)):
+            raise AcquisitionError("fixture_failure_label_invalid")
+
+
+def fixture_key(endpoint: str, params: Mapping[str, str]) -> tuple:
+    return (endpoint, tuple(sorted(params.items())))
+
+
+class OfflineFixtureTransport:
+    """Replays immutable responses keyed by (endpoint, params). No I/O, no callables."""
+
+    __slots__ = ("_queues", "calls")
+
+    def __init__(
+        self,
+        responses: Mapping[tuple, Sequence[TransportResponse | FixtureFailure]],
+    ) -> None:
+        queues = {}
+        for key, items in responses.items():
+            items = tuple(items)
+            if not all(type(i) in (TransportResponse, FixtureFailure) for i in items):
+                raise AcquisitionError("fixture_items_must_be_response_values")
+            queues[key] = list(items)
+        self._queues = queues
+        self.calls: list[tuple] = []
 
     def fetch(self, endpoint: str, params: Mapping[str, str]) -> TransportResponse:
-        """Return one HTTP-like response. Credentials never pass through here."""
+        key = fixture_key(endpoint, params)
+        self.calls.append(key)
+        queue = self._queues.get(key)
+        if not queue:
+            raise LookupError("fixture_has_no_response")
+        item = queue.pop(0)
+        if type(item) is FixtureFailure:
+            raise OSError(item.error_class)
+        return item
+
+
+def _require_offline_fixture(transport: object) -> OfflineFixtureTransport:
+    if type(transport) is not OfflineFixtureTransport:
+        raise AcquisitionStopped(
+            "only_offline_fixture_transport_allowed", terminal=True
+        )
+    return transport
 
 
 class AcquisitionStore:
@@ -203,26 +286,33 @@ class AcquisitionStore:
 
     @classmethod
     def create(
-        cls, root: str | Path, plan: AcquisitionPlan, *, forbidden_roots=()
+        cls, root: str | Path, plan: AcquisitionPlan, **location
     ) -> AcquisitionStore:
-        target = require_new_output_dir(root, forbidden_roots=forbidden_roots)
-        target.mkdir(parents=True)
-        (target / "responses").mkdir()
-        _write_exclusive(target / "plan.json", canonical_json(plan.to_dict()) + "\n")
-        (target / "ledger.jsonl").touch(exist_ok=False)
+        target = create_exclusive_dir(root, **location)
+        os.mkdir(target / "responses")
+        write_new_file(
+            target / "plan.json", (canonical_json(plan.to_dict()) + "\n").encode()
+        )
+        write_new_file(target / "ledger.jsonl", b"")
         return cls(target, plan)
 
     @classmethod
-    def open(cls, root: str | Path, plan: AcquisitionPlan) -> AcquisitionStore:
-        target = Path(root).expanduser().resolve()
-        plan_path = target / "plan.json"
-        if not plan_path.is_file():
-            raise AcquisitionError("plan_missing_no_implicit_recreation")
-        saved = json.loads(plan_path.read_text(encoding="utf-8"))
+    def open(
+        cls, root: str | Path, plan: AcquisitionPlan, **location
+    ) -> AcquisitionStore:
+        target = require_existing_store_dir(root, **location)
+        for name in ("plan.json", "ledger.jsonl"):
+            path = target / name
+            if path.is_symlink() or not path.is_file():
+                raise AcquisitionError("store_file_missing_or_not_regular")
+        responses = target / "responses"
+        if responses.is_symlink() or not responses.is_dir():
+            raise AcquisitionError("store_file_missing_or_not_regular")
+        saved = json.loads((target / "plan.json").read_text(encoding="utf-8"))
         if sha256_text(canonical_json(saved)) != plan.sha256:
             raise AcquisitionError("plan_mismatch_on_resume")
         store = cls(target, plan)
-        store.records()  # full chain and body verification before any resume
+        store.records()  # full chain, body and orphan verification before resume
         return store
 
     def records(self) -> list[dict]:
@@ -233,12 +323,15 @@ class AcquisitionStore:
         return list(self._records)
 
     def verify(self) -> list[dict]:
-        """Re-read and verify the whole ledger; any break in chain or body is fatal."""
+        """Re-read the ledger and every stored body; any inconsistency is fatal."""
 
         records, previous = [], None
         text = (self.root / "ledger.jsonl").read_text(encoding="utf-8")
         for seq, line in enumerate(text.splitlines()):
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise AcquisitionError("ledger_chain_broken") from error
             body = {k: v for k, v in record.items() if k != "record_hash"}
             if (
                 record.get("seq") != seq
@@ -247,18 +340,36 @@ class AcquisitionStore:
                 or sha256_text(canonical_json(body)) != record.get("record_hash")
             ):
                 raise AcquisitionError("ledger_chain_broken")
-            if record["type"] == "page":
-                path = self.root / "responses" / f"{record['body_sha256']}.json"
-                if not path.is_file() or path.is_symlink():
-                    raise AcquisitionError("response_file_missing")
-                if (
-                    hashlib.sha256(path.read_bytes()).hexdigest()
-                    != record["body_sha256"]
-                ):
-                    raise AcquisitionError("response_file_changed")
             previous = record["record_hash"]
             records.append(record)
+        on_disk = self.body_files()
+        for record in records:
+            if record["type"] == "page" and record["body_sha256"] not in on_disk:
+                raise AcquisitionError("response_file_missing")
         return records
+
+    def body_files(self) -> dict[str, int]:
+        """Validate every file under responses/ and return {sha256: size}."""
+
+        files = {}
+        for path in (self.root / "responses").iterdir():
+            match = BODY_NAME.fullmatch(path.name)
+            if path.is_symlink() or not path.is_file() or match is None:
+                raise AcquisitionError("response_store_contains_invalid_file")
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != match.group(1):
+                raise AcquisitionError("response_file_changed")
+            files[match.group(1)] = len(data)
+        return files
+
+    def orphans(self) -> dict[str, int]:
+        """Stored bodies no page record references (e.g. crash before the append)."""
+
+        referenced = {r["body_sha256"] for r in self.records() if r["type"] == "page"}
+        return {k: v for k, v in self.body_files().items() if k not in referenced}
+
+    def disk_bytes(self) -> int:
+        return sum(self.body_files().values())
 
     def append(self, record: dict) -> dict:
         existing = self.records()
@@ -270,7 +381,10 @@ class AcquisitionStore:
             "plan_sha256": self.plan.sha256,
         }
         body["record_hash"] = sha256_text(canonical_json(body))
-        with (self.root / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+        ledger = self.root / "ledger.jsonl"
+        if ledger.is_symlink():
+            raise AcquisitionError("store_file_missing_or_not_regular")
+        with ledger.open("a", encoding="utf-8") as handle:
             handle.write(canonical_json(body) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -278,27 +392,19 @@ class AcquisitionStore:
         return body
 
     def save_body(self, body: bytes) -> str:
+        """Store a body once; an existing identical file is reused, never replaced."""
+
         digest = hashlib.sha256(body).hexdigest()
         path = self.root / "responses" / f"{digest}.json"
-        if path.exists():
-            if path.read_bytes() != body:
-                raise AcquisitionError("response_hash_collision")
+        if os.path.lexists(path):
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != body:
+                raise AcquisitionError("response_file_conflict")
             return digest
-        with open(path, "xb") as handle:
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
+        write_new_file(path, body)
         return digest
 
     def load_body(self, digest: str) -> dict:
         return json.loads((self.root / "responses" / f"{digest}.json").read_bytes())
-
-
-def _write_exclusive(path: Path, text: str) -> None:
-    with open(path, "x", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
 
 
 @dataclass(frozen=True)
@@ -309,29 +415,56 @@ class AcquisitionSummary:
     rows: int
     bytes: int
     completed_queries: int
+    orphan_bodies: int
+
+
+def run_offline_fixture_acquisition(
+    root: str | Path,
+    plan: AcquisitionPlan,
+    transport: OfflineFixtureTransport,
+    *,
+    clock: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    resume: bool = False,
+    **location,
+) -> AcquisitionSummary:
+    """The only acquisition entry point: offline fixture, checked before any I/O."""
+
+    fixture = _require_offline_fixture(transport)
+    store = (
+        AcquisitionStore.open(root, plan, **location)
+        if resume
+        else AcquisitionStore.create(root, plan, **location)
+    )
+    return AcquisitionRunner(store, fixture, clock=clock, sleep=sleep).run()
 
 
 class AcquisitionRunner:
     def __init__(
         self,
         store: AcquisitionStore,
-        transport: Transport,
+        transport: OfflineFixtureTransport,
         *,
         clock: Callable[[], datetime],
         sleep: Callable[[float], None],
     ) -> None:
-        self.store, self.transport = store, transport
-        self.clock, self.sleep = clock, sleep
+        self.transport = _require_offline_fixture(transport)
+        self.store, self.clock, self.sleep = store, clock, sleep
 
     def run(self) -> AcquisitionSummary:
-        # Refuse before any ledger write: no real network transport is enabled.
-        if getattr(self.transport, "kind", None) not in ALLOWED_TRANSPORT_KINDS:
-            raise AcquisitionStopped("network_transport_not_enabled", terminal=True)
         records = self.store.records()
         for record in records:
             if record["type"] == "stop" and record["terminal"]:
                 raise AcquisitionStopped(
                     "terminal_stop_recorded:" + record["reason"], terminal=True
+                )
+        if any(r["type"] == "completed" for r in records):
+            return summarize(self.store)  # idempotent: never a second completion
+        recorded = {r["body_sha256"] for r in records if r["type"] == "orphan_detected"}
+        for digest, size in sorted(self.store.orphans().items()):
+            if digest not in recorded:
+                self.store.append(
+                    {"type": "orphan_detected", "body_sha256": digest, "bytes": size}
                 )
         try:
             for query in self.store.plan.queries:
@@ -345,13 +478,9 @@ class AcquisitionRunner:
         return summarize(self.store)
 
     def _state(self) -> dict:
-        records = self.store.records()
-        attempts = [r for r in records if r["type"] == "attempt"]
-        pages = [r for r in records if r["type"] == "page"]
+        attempts = [r for r in self.store.records() if r["type"] == "attempt"]
         return {
-            "records": records,
             "requests": len(attempts),
-            "bytes": sum(r["bytes"] for r in pages),
             "started_at": attempts[0]["requested_at"] if attempts else None,
             "last_request_at": attempts[-1]["requested_at"] if attempts else None,
         }
@@ -362,9 +491,13 @@ class AcquisitionRunner:
         if any(r["type"] == "query_complete" and r["query_id"] == qid for r in records):
             return
         pages = [r for r in records if r["type"] == "page" and r["query_id"] == qid]
+        if pages and pages[-1]["next_key"] is None:
+            # Crash after the final page but before query_complete: finish, don't refetch.
+            self.store.append({"type": "query_complete", "query_id": qid})
+            return
         seen_keys = {r["next_key"] for r in pages if r["next_key"]}
         seen_bodies = {r["body_sha256"] for r in pages}
-        seen_rows = set()
+        seen_rows: set = set()
         for page in pages:
             for row in self.store.load_body(page["body_sha256"])["data"]:
                 seen_rows.add(tuple(row[k] for k in ROW_KEYS[query.endpoint]))
@@ -386,6 +519,9 @@ class AcquisitionRunner:
                 raise AcquisitionStopped("pagination_key_loop", terminal=True)
             if not payload["data"] and key is not None:
                 raise AcquisitionStopped("empty_page_with_continuation", terminal=True)
+            new_bytes = 0 if digest in self.store.body_files() else len(response.body)
+            if self.store.disk_bytes() + new_bytes > self.store.plan.limits.max_bytes:
+                raise AcquisitionStopped("storage_budget_exceeded", terminal=True)
             self.store.save_body(response.body)
             null_rows = sum(
                 1
@@ -416,6 +552,13 @@ class AcquisitionRunner:
             seen_keys.add(key)
             next_key, page_index = key, page_index + 1
 
+    def _check_deadline(self, now: datetime, started_at: str | None) -> None:
+        if started_at is None:
+            return
+        elapsed = (now - datetime.fromisoformat(started_at)).total_seconds()
+        if elapsed >= self.store.plan.limits.max_seconds:
+            raise AcquisitionStopped("time_budget_exhausted", terminal=True)
+
     def _fetch_with_retry(
         self, query: DateQuery, page_index: int, params: dict[str, str]
     ) -> TransportResponse:
@@ -424,21 +567,22 @@ class AcquisitionRunner:
             state = self._state()
             if state["requests"] >= limits.max_requests:
                 raise AcquisitionStopped("request_budget_exhausted", terminal=True)
-            now = self.clock()
-            if state["started_at"] is not None:
-                started = datetime.fromisoformat(state["started_at"])
-                if (now - started).total_seconds() >= limits.max_seconds:
-                    raise AcquisitionStopped("time_budget_exhausted", terminal=True)
+            self._check_deadline(self.clock(), state["started_at"])
             if state["last_request_at"] is not None:
                 elapsed = (
-                    now - datetime.fromisoformat(state["last_request_at"])
+                    self.clock() - datetime.fromisoformat(state["last_request_at"])
                 ).total_seconds()
                 wait = limits.min_interval_seconds - elapsed
                 if wait > 0:
                     started = datetime.fromisoformat(state["started_at"])
-                    if (now - started).total_seconds() + wait >= limits.max_seconds:
+                    if (
+                        self.clock() - started
+                    ).total_seconds() + wait >= limits.max_seconds:
                         raise AcquisitionStopped("time_budget_exhausted", terminal=True)
                     self.sleep(wait)
+            # Re-check immediately before sending: the sleep may have overrun.
+            now = self.clock()
+            self._check_deadline(now, state["started_at"])
             # Reserve the attempt before sending so a crash still consumes budget.
             self.store.append(
                 {
@@ -446,20 +590,19 @@ class AcquisitionRunner:
                     "query_id": query.query_id,
                     "page_index": page_index,
                     "attempt": attempt,
-                    "requested_at": _utc_text(self.clock()),
+                    "requested_at": _utc_text(now),
                 }
             )
             try:
-                response = self.transport.fetch(query.endpoint, dict(params))
+                response = OfflineFixtureTransport.fetch(
+                    self.transport, query.endpoint, dict(params)
+                )
             except Exception as error:  # noqa: BLE001 - class name only, no message
                 self.store.append(
                     {"type": "attempt_failed", "error_class": type(error).__name__}
                 )
                 continue
             if response.status == 200:
-                state = self._state()
-                if state["bytes"] + len(response.body) > limits.max_bytes:
-                    raise AcquisitionStopped("storage_budget_exceeded", terminal=True)
                 return response
             self.store.append(
                 {"type": "attempt_failed", "error_class": f"http_{response.status}"}
@@ -487,13 +630,7 @@ class AcquisitionRunner:
         for row in data:
             if not REQUIRED_FIELDS[query.endpoint] <= set(row):
                 raise AcquisitionStopped("unsupported_response_schema", terminal=True)
-            if query.endpoint == CALENDAR:
-                if not str(query.start) <= str(row["Date"]) <= str(query.end):
-                    raise AcquisitionStopped(
-                        "row_outside_requested_range", terminal=True
-                    )
-            elif row["Date"] != query.market_date:
-                raise AcquisitionStopped("row_market_date_mismatch", terminal=True)
+            _validate_row(query, row)
             row_key = tuple(row[k] for k in ROW_KEYS[query.endpoint])
             if row_key in page_rows or row_key in seen_rows:
                 raise AcquisitionStopped("duplicate_row", terminal=True)
@@ -502,18 +639,66 @@ class AcquisitionRunner:
         return payload
 
 
+def _invalid(field: str) -> AcquisitionStopped:
+    return AcquisitionStopped(f"invalid_response_value:{field}", terminal=True)
+
+
+def _number(value: object) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError("not_a_finite_number")
+    return float(value)
+
+
+def _validate_row(query: DateQuery, row: Mapping[str, object]) -> None:
+    """Type/value checks; every failure becomes a recorded, terminal safe stop."""
+
+    if not _is_iso_date(row["Date"]):
+        raise _invalid("Date")
+    if query.endpoint == CALENDAR:
+        if not str(query.start) <= row["Date"] <= str(query.end):
+            raise AcquisitionStopped("row_outside_requested_range", terminal=True)
+        if type(row["HolDiv"]) is not str or row["HolDiv"] not in HOLIDAY_DIVISIONS:
+            raise _invalid("HolDiv")
+        return
+    if row["Date"] != query.market_date:
+        raise AcquisitionStopped("row_market_date_mismatch", terminal=True)
+    if type(row["Code"]) is not str or not CODE_PATTERN.fullmatch(row["Code"]):
+        raise _invalid("Code")
+    if query.endpoint == MASTER:
+        for name in MASTER_TEXT_FIELDS:
+            if type(row[name]) is not str:
+                raise _invalid(name)
+        return
+    for name in DAILY_POSITIVE_FIELDS + DAILY_NON_NEGATIVE_FIELDS:
+        try:
+            value = _number(row[name])
+        except ValueError:
+            raise _invalid(name) from None
+        if value is None:
+            continue
+        if name in DAILY_POSITIVE_FIELDS and value <= 0:
+            raise _invalid(name)
+        if value < 0:
+            raise _invalid(name)
+    if row.get("ExRT") is not None and type(row["ExRT"]) is not str:
+        raise _invalid("ExRT")
+
+
 def summarize(store: AcquisitionStore) -> AcquisitionSummary:
     records = store.records()
     pages = [r for r in records if r["type"] == "page"]
     done = {r["query_id"] for r in records if r["type"] == "query_complete"}
-    status = "completed" if records and records[-1]["type"] == "completed" else "open"
+    status = "completed" if any(r["type"] == "completed" for r in records) else "open"
     return AcquisitionSummary(
         status=status,
         requests=sum(1 for r in records if r["type"] == "attempt"),
         pages=len(pages),
         rows=sum(r["row_count"] for r in pages),
-        bytes=sum(r["bytes"] for r in pages),
+        bytes=store.disk_bytes(),
         completed_queries=len(done),
+        orphan_bodies=len(store.orphans()),
     )
 
 
@@ -530,7 +715,7 @@ class AcquiredRows:
 
 def load_completed_rows(store: AcquisitionStore) -> AcquiredRows:
     records = store.verify()
-    if not records or records[-1]["type"] != "completed":
+    if not any(r["type"] == "completed" for r in records):
         raise AcquisitionError("acquisition_incomplete")
     rows: dict[str, list] = {MASTER: [], DAILY: [], CALENDAR: []}
     received = []

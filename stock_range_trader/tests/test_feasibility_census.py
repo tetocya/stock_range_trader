@@ -22,11 +22,13 @@ from feasibility.acquisition import (
     MASTER,
     AcquisitionLimits,
     AcquisitionPlan,
-    AcquisitionRunner,
     AcquisitionStore,
     DateQuery,
+    OfflineFixtureTransport,
     TransportResponse,
+    fixture_key,
     load_completed_rows,
+    run_offline_fixture_acquisition,
 )
 from feasibility.census import (
     CensusData,
@@ -280,11 +282,9 @@ def test_terms_separate_provisional_from_owner_approved():
     summary = run_census(
         request(terms=approved, lot_policy="require_evidence", lot_evidence={}), data()
     ).summary
-    assert summary["result_kind"] == "census_under_owner_approved_terms"
+    assert summary["result_kind"] == "reference_only_unverified_or_unknown_lots"
     summary = run_census(request(), data()).summary
-    assert (
-        summary["result_kind"] == "reference_only_provisional_terms_or_unverified_lot"
-    )
+    assert summary["result_kind"] == "reference_only_provisional_terms"
 
 
 # ---------------------------------------------------------------- census
@@ -315,7 +315,8 @@ def test_categories_are_counted_individually_with_overlaps():
 
     counts = result.summary["counts"]
     assert counts["a_domestic_common_stock"] == 8  # ProdCat 012 / market 0105 excluded
-    assert counts["c_purchasable"] == 5
+    assert counts["c_purchasable_assumed_lot_reference_only"] == 5
+    assert counts["c_purchasable_verified_lot"] == 0
     overlaps = result.summary["overlaps"]
     assert overlaps["pairwise"]["cost_cap_exceeded_and_not_d"] == 1
     assert sum(overlaps["cdef_pattern_counts"].values()) == 8
@@ -335,7 +336,7 @@ def test_null_no_trade_zero_volume_and_corporate_action_are_classified():
     assert s["10070"]["b_price_and_lot_known"] is False
     assert s["10070"]["c_reason"] == "price_not_observed_at_r"
 
-    assert "zero_volume_with_prices@" in s["10080"]["e_issues"]
+    assert "zero_volume@" in s["10080"]["e_issues"]
 
     # New listing: rows missing on acquired sessions; current processing does not notice.
     assert "no_row_on_acquired_session@" in s["10030"]["e_issues"]
@@ -452,13 +453,17 @@ def test_bundle_is_written_once_and_never_into_trial_paths(tmp_path):
     with pytest.raises(UnsafeOutputPath, match="already_exists"):
         write_census_bundle(result, tmp_path / "census-v1")
     trial = tmp_path / "stock_range_trader" / ".delayed_replay" / "june_trial" / "x"
-    with pytest.raises(UnsafeOutputPath, match="protected_trial_area"):
+    with pytest.raises(UnsafeOutputPath, match="trial_evidence_tree"):
         write_census_bundle(result, trial)
-    with pytest.raises(UnsafeOutputPath, match="forbidden_root"):
+    with pytest.raises(UnsafeOutputPath, match="protected_root"):
         write_census_bundle(
-            result, tmp_path / "june" / "o", forbidden_roots=[tmp_path / "june"]
+            result, tmp_path / "june" / "o", protected_roots=[tmp_path / "june"]
         )
-    assert not list(tmp_path.glob(".census-*"))
+    other = tmp_path / "other_checkout"
+    (other / ".git").mkdir(parents=True)
+    with pytest.raises(UnsafeOutputPath, match="other_git_checkout"):
+        write_census_bundle(result, other / "census")
+    assert not list(tmp_path.glob("*.staging-*"))
 
 
 # ---------------------------------------------------------------- F1 -> F2
@@ -466,25 +471,19 @@ def test_bundle_is_written_once_and_never_into_trial_paths(tmp_path):
 
 def test_offline_acquisition_feeds_census_with_retrieval_provenance(tmp_path):
     days = SESSIONS[98:101]
+    calendar_params = {"from": days[0].isoformat(), "to": days[-1].isoformat()}
     responses = {
-        (CALENDAR, days[0].isoformat(), None): [TransportResponse(200, json.dumps(
+        fixture_key(CALENDAR, calendar_params): [TransportResponse(200, json.dumps(
             {"data": [{"Date": d.isoformat(), "HolDiv": "1"} for d in days]}).encode())],
-        (MASTER, R.isoformat(), None): [TransportResponse(200, json.dumps(
+        fixture_key(MASTER, {"date": R.isoformat()}): [TransportResponse(200, json.dumps(
             {"data": [master("10010")]}).encode())],
     }  # fmt: skip
     for d in days:
-        responses[(DAILY, d.isoformat(), None)] = [
+        responses[fixture_key(DAILY, {"date": d.isoformat()})] = [
             TransportResponse(
                 200, json.dumps({"data": [bar("10010", d, 150)]}).encode()
             )
         ]
-
-    class Transport:
-        kind = "offline_fixture"
-
-        def fetch(self, endpoint, params):
-            key = (endpoint, params.get("date") or params.get("from"), None)
-            return responses[key].pop(0)
 
     plan = AcquisitionPlan(
         "f1-to-f2",
@@ -498,9 +497,14 @@ def test_offline_acquisition_feeds_census_with_retrieval_provenance(tmp_path):
     def sleep(seconds):
         clock[0] += timedelta(seconds=seconds)
 
-    store = AcquisitionStore.create(tmp_path / "acq", plan)
-    AcquisitionRunner(store, Transport(), clock=lambda: clock[0], sleep=sleep).run()
-    rows = load_completed_rows(store)
+    run_offline_fixture_acquisition(
+        tmp_path / "acq",
+        plan,
+        OfflineFixtureTransport(responses),
+        clock=lambda: clock[0],
+        sleep=sleep,
+    )
+    rows = load_completed_rows(AcquisitionStore.open(tmp_path / "acq", plan))
     census = run_census(
         request(minimum_history_sessions=3),
         CensusData(
@@ -525,3 +529,115 @@ def test_offline_acquisition_feeds_census_with_retrieval_provenance(tmp_path):
 def test_census_request_rejects_unknown_policy():
     with pytest.raises(CensusError, match="unknown_lot_policy"):
         replace(request(), lot_policy="guess")
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_every_event_on_one_row_is_recorded_independently():
+    masters, rows = artificial_market()
+    for row in rows:
+        if row["Code"] == "10050" and row["C"] is None:
+            row.update(AdjFactor=0.5)
+    result = run_census(request(), data(masters, rows))
+    issues = by_code(result)["10050"]["e_issues"].split(";")
+    day = SESSIONS[95].isoformat()
+    for kind in (
+        "null_ohlc_no_trade_or_halt_cause_unknown",
+        "adjusted_values_missing",
+        "zero_volume",
+        "adjustment_factor_not_one",
+    ):
+        assert f"{kind}@{day}" in issues
+    summary = result.summary
+    assert summary["e_rows_with_multiple_issues"] >= 1
+    assert summary["e_issue_event_counts"]["adjustment_factor_not_one"] == 2
+    # 10050 and 10070 (Null bars also carry Vo=0) and 10080 (prices with Vo=0)
+    assert summary["e_issue_symbol_counts"]["zero_volume"] == 3
+    combo = (
+        "adjusted_values_missing+adjustment_factor_not_one+"
+        "null_ohlc_no_trade_or_halt_cause_unknown+zero_volume"
+    )
+    assert summary["e_issue_combination_symbol_counts"][combo] == 1
+
+
+def test_price_rows_outside_declared_acquisition_are_not_used():
+    acquired = tuple(d for d in SESSIONS if d != R)
+    result = run_census(request(), data(acquired=acquired))
+    s = by_code(result)
+    assert s["10010"]["c_purchasable"] is False
+    assert s["10010"]["c_reason"] == "reference_date_not_acquired"
+    assert s["10010"]["reference_close"] == ""
+    consistency = result.summary["acquisition_consistency"]
+    assert consistency["reference_date_acquired"] is False
+    assert consistency["rows_outside_declared_acquisition"][R.isoformat()] == 8
+    # declared-but-empty and non-session declarations are detected too
+    extra = (*SESSIONS, date(2025, 1, 4))  # a Saturday
+    masters, rows = artificial_market()
+    rows = [r for r in rows if r["Date"] != SESSIONS[10].isoformat()]
+    consistency = run_census(request(), data(masters, rows, acquired=extra)).summary[
+        "acquisition_consistency"
+    ]
+    assert consistency["acquired_dates_not_sessions"] == ["2025-01-04"]
+    assert SESSIONS[10].isoformat() in consistency["acquired_dates_without_rows"]
+
+
+def test_owner_approved_terms_and_lot_verification_are_separate_states():
+    approved = terms(status="owner_approved", approval_reference="owner-decision-1")
+    assumed = run_census(request(terms=approved), data()).summary
+    assert assumed["terms_approval"] == {
+        "status": "owner_approved",
+        "approval_reference_recorded": True,
+        "authenticity_verified_by_code": False,
+    }
+    assert (
+        assumed["lot_evidence_status"] == "includes_assumed_unknown_or_unsupported_lots"
+    )
+    assert assumed["result_kind"] == "reference_only_unverified_or_unknown_lots"
+    assert assumed["counts"]["c_purchasable_verified_lot"] == 0
+    assert assumed["counts"]["c_purchasable_assumed_lot_reference_only"] == 5
+    assert assumed["claims"]["lot_evidence_source_authenticity_verified"] is False
+
+    codes = ("10010", "10020", "10030", "10040", "10050", "10060", "10070", "10080")
+    evidence = {c: LotEvidence(100, "reviewed-doc", date(2020, 1, 1)) for c in codes}
+    verified = run_census(
+        request(terms=approved, lot_policy="require_evidence", lot_evidence=evidence),
+        data(),
+    ).summary
+    assert verified["result_kind"] == "census_recorded_owner_terms_and_lot_evidence"
+    assert verified["counts"]["c_purchasable_verified_lot"] == 5
+    assert verified["counts"]["c_purchasable_assumed_lot_reference_only"] == 0
+
+
+@pytest.mark.parametrize("price", ["0.001", "0.004", "0.009"])
+def test_nonpositive_rounded_unit_is_never_purchasable_and_matches_size_buy(price):
+    tiny = terms(buy_price_rounding="floor", **ZERO_COST)
+    result = one_lot_requirement(Decimal(price), tiny, lot_size=100)
+    assert result["unit_price"] == "0.00"
+    assert result["nonpositive_amount"] is True
+    assert result["purchasable"] is False
+    policy = AccountPolicy(
+        purpose="synthetic_test", initial_capital="200000", lot_size=100,
+        max_position_pct="0.1", max_positions=5, commission_rate="0",
+        slippage_pct="0", reservation_buffer_pct="0", price_quantum="0.01",
+        money_quantum="0.01", buy_price_rounding="floor", sell_price_rounding="floor",
+        fee_rounding="ceiling", reservation_rounding="ceiling", amount_rounding="half_even",
+        budget_rounding="floor", priority_mode="sell_then_score_desc_instrument",
+        proceeds_mode="hold_until_later_decision_session", fill_mode="all_or_reject",
+        position_mode="single_position_full_exit", expiry_mode="explicit_target_session_only",
+        cost_model="proportional", dividend_policy="excluded", basis_evidence_hash="0" * 64,
+    )  # fmt: skip
+    assert size_buy(price, "200000", "200000", policy).shares == 0
+
+
+def test_census_reason_for_nonpositive_rounded_unit():
+    masters, rows = artificial_market()
+    for row in rows:
+        if row["Code"] == "10010" and row["Date"] == R.isoformat():
+            row.update(C=0.004)
+    tiny = terms(buy_price_rounding="floor", **ZERO_COST)
+    s = by_code(run_census(request(terms=tiny), data(masters, rows)))["10010"]
+    assert (s["c_purchasable"], s["c_reason"]) == (
+        False,
+        "nonpositive_rounded_unit_or_amount",
+    )
