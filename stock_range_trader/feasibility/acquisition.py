@@ -79,6 +79,20 @@ class AcquisitionError(ValueError):
     """Invalid plan, store or recorded evidence."""
 
 
+class LedgerIntegrityError(AcquisitionError):
+    """The ledger bytes are not a complete, canonical, unbroken chain.
+
+    Raised before any append; the ledger is never repaired, truncated or
+    extended. ``evidence`` holds what is needed to reconstruct the finding from
+    the untouched file (size, sha256, complete-line count and offsets).
+    """
+
+    def __init__(self, reason: str, evidence: Mapping[str, object]) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.evidence = dict(evidence)
+
+
 class AcquisitionStopped(AcquisitionError):
     """A run stopped safely; ``terminal`` stops may not be resumed."""
 
@@ -283,6 +297,7 @@ class AcquisitionStore:
         self.root = root
         self.plan = plan
         self._records: list[dict] | None = None
+        self._ledger_size: int | None = None
 
     @classmethod
     def create(
@@ -325,13 +340,36 @@ class AcquisitionStore:
     def verify(self) -> list[dict]:
         """Re-read the ledger and every stored body; any inconsistency is fatal."""
 
+        data = (self.root / "ledger.jsonl").read_bytes()
+        evidence = {
+            "ledger_bytes": len(data),
+            "ledger_sha256": hashlib.sha256(data).hexdigest(),
+        }
+        complete = data.rfind(b"\n") + 1
+        if complete != len(data):
+            raise LedgerIntegrityError(
+                "ledger_incomplete_final_line",
+                {
+                    **evidence,
+                    "complete_lines": data[:complete].count(b"\n"),
+                    "complete_bytes": complete,
+                    "trailing_bytes": len(data) - complete,
+                },
+            )
         records, previous = [], None
-        text = (self.root / "ledger.jsonl").read_text(encoding="utf-8")
-        for seq, line in enumerate(text.splitlines()):
+        for seq, line in enumerate(data.split(b"\n")[:-1]):
+            broken = LedgerIntegrityError(
+                "ledger_chain_broken", {**evidence, "first_bad_line": seq}
+            )
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise AcquisitionError("ledger_chain_broken") from error
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                raise broken from None
+            if (
+                not isinstance(record, dict)
+                or canonical_json(record).encode("utf-8") != line
+            ):
+                raise broken
             body = {k: v for k, v in record.items() if k != "record_hash"}
             if (
                 record.get("seq") != seq
@@ -339,9 +377,10 @@ class AcquisitionStore:
                 or record.get("plan_sha256") != self.plan.sha256
                 or sha256_text(canonical_json(body)) != record.get("record_hash")
             ):
-                raise AcquisitionError("ledger_chain_broken")
+                raise broken
             previous = record["record_hash"]
             records.append(record)
+        self._ledger_size = len(data)
         on_disk = self.body_files()
         for record in records:
             if record["type"] == "page" and record["body_sha256"] not in on_disk:
@@ -381,13 +420,23 @@ class AcquisitionStore:
             "plan_sha256": self.plan.sha256,
         }
         body["record_hash"] = sha256_text(canonical_json(body))
+        line = (canonical_json(body) + "\n").encode("utf-8")
         ledger = self.root / "ledger.jsonl"
         if ledger.is_symlink():
             raise AcquisitionError("store_file_missing_or_not_regular")
-        with ledger.open("a", encoding="utf-8") as handle:
-            handle.write(canonical_json(body) + "\n")
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(ledger, flags), "ab") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size != self._ledger_size:
+                # Changed since verification (e.g. a partial line): never extend it.
+                raise LedgerIntegrityError(
+                    "ledger_changed_since_verification",
+                    {"verified_bytes": self._ledger_size, "current_bytes": size},
+                )
+            handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        self._ledger_size = size + len(line)
         self._records = [*existing, body]
         return body
 
@@ -567,6 +616,11 @@ class AcquisitionRunner:
             state = self._state()
             if state["requests"] >= limits.max_requests:
                 raise AcquisitionStopped("request_budget_exhausted", terminal=True)
+            # Stored bodies (orphans included) may already fill the budget on resume.
+            if self.store.disk_bytes() >= limits.max_bytes:
+                raise AcquisitionStopped(
+                    "storage_budget_exhausted_before_request", terminal=True
+                )
             self._check_deadline(self.clock(), state["started_at"])
             if state["last_request_at"] is not None:
                 elapsed = (
@@ -618,8 +672,9 @@ class AcquisitionRunner:
     def _validate(self, query: DateQuery, body: bytes, seen_rows: set) -> dict:
         try:
             payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise AcquisitionStopped("invalid_json_response", terminal=True) from error
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # ValueError also covers integers beyond the int-to-str digit limit.
+            raise AcquisitionStopped("invalid_json_response", terminal=True) from None
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
             raise AcquisitionStopped("unsupported_response_schema", terminal=True)
@@ -644,11 +699,19 @@ def _invalid(field: str) -> AcquisitionStopped:
 
 
 def _number(value: object) -> float | None:
+    """Return a finite float; any type, range or overflow problem is ValueError."""
+
     if value is None:
         return None
-    if type(value) not in (int, float) or not math.isfinite(value):
+    if type(value) not in (int, float):
+        raise ValueError("not_a_number")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError("number_out_of_range") from None
+    if not math.isfinite(number):
         raise ValueError("not_a_finite_number")
-    return float(value)
+    return number
 
 
 def _validate_row(query: DateQuery, row: Mapping[str, object]) -> None:

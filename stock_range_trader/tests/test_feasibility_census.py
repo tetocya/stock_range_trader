@@ -641,3 +641,60 @@ def test_census_reason_for_nonpositive_rounded_unit():
         False,
         "nonpositive_rounded_unit_or_amount",
     )
+
+
+# ---------------------------------------- re-review: lot evidence with A = 0
+
+APPROVED = dict(status="owner_approved", approval_reference="owner-decision-1")
+CODES = ("10010", "10020", "10030", "10040", "10050", "10060", "10070", "10080")
+
+
+def test_no_target_instruments_is_never_reported_as_lot_verified():
+    masters, rows = artificial_market()
+    non_targets = [m for m in masters if m["Code"].startswith("2")]  # ETF, PRO Market
+    summary = run_census(
+        request(
+            terms=terms(**APPROVED), lot_policy="require_evidence", lot_evidence={}
+        ),
+        data(non_targets, rows),
+    ).summary
+    assert summary["counts"]["a_domestic_common_stock"] == 0
+    assert summary["result_kind"] == "no_target_instruments_nothing_evaluated"
+    assert summary["lot_evidence_status"] == "no_target_instruments"
+    assert summary["terms_approval"]["status"] == "owner_approved"
+    assert summary["lot"]["verified_count"] == summary["lot"]["unverified_count"] == 0
+    assert summary["counts"]["c_purchasable_verified_lot"] == 0
+    assert "census_recorded" not in json.dumps(summary)
+    assert "all_instruments_lot_verified" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize(
+    ("evidence_codes", "status", "kind", "verified", "c_verified", "c_unknown"),
+    [
+        (CODES, "all_instruments_lot_verified",
+         "census_recorded_owner_terms_and_lot_evidence", 8, 5, 0),
+        (CODES[:4], "includes_assumed_unknown_or_unsupported_lots",
+         "reference_only_unverified_or_unknown_lots", 4, 2, 4),
+    ],
+)  # fmt: skip
+def test_lot_evidence_status_for_fully_and_partly_verified_targets(
+    evidence_codes, status, kind, verified, c_verified, c_unknown
+):
+    evidence = {
+        c: LotEvidence(100, "reviewed-doc", date(2020, 1, 1)) for c in evidence_codes
+    }
+    summary = run_census(
+        request(
+            terms=terms(**APPROVED),
+            lot_policy="require_evidence",
+            lot_evidence=evidence,
+        ),
+        data(),
+    ).summary
+    assert summary["counts"]["a_domestic_common_stock"] == 8
+    assert (summary["lot_evidence_status"], summary["result_kind"]) == (status, kind)
+    assert summary["lot"]["verified_count"] == verified
+    assert summary["lot"]["unverified_count"] == 8 - verified
+    assert summary["counts"]["c_purchasable_verified_lot"] == c_verified
+    assert summary["counts"]["c_not_evaluable_lot_unknown_or_unsupported"] == c_unknown
+    assert summary["counts"]["c_purchasable_assumed_lot_reference_only"] == 0

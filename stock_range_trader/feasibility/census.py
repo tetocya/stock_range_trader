@@ -566,6 +566,15 @@ def _rows_digest(rows: Iterable[Mapping[str, object]]) -> str:
     return sha256_text(canonical_json(ordered))
 
 
+def _lot_evidence_status(symbols) -> str:
+    verified = sum(1 for s in symbols if s["lot_status"] == "verified")
+    if not symbols:
+        return "no_target_instruments"
+    if verified == len(symbols):
+        return "all_instruments_lot_verified"
+    return "includes_assumed_unknown_or_unsupported_lots"
+
+
 def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dict:
     count = len(symbols)
 
@@ -603,7 +612,11 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
             )
     lot_sources = sorted({s["lot_source"] for s in symbols if s["lot_source"]})
     terms = asdict(request.terms)
-    if request.terms.status != "owner_approved":
+    # No target instruments means nothing was evaluated: never a positive verdict
+    # from an empty any()/all(); terms status is still reported separately.
+    if count == 0:
+        result_kind = "no_target_instruments_nothing_evaluated"
+    elif request.terms.status != "owner_approved":
         result_kind = "reference_only_provisional_terms"
     elif any(s["lot_status"] != "verified" for s in symbols):
         result_kind = "reference_only_unverified_or_unknown_lots"
@@ -645,11 +658,7 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
             "approval_reference_recorded": request.terms.approval_reference is not None,
             "authenticity_verified_by_code": False,
         },
-        "lot_evidence_status": (
-            "all_instruments_lot_verified"
-            if all(s["lot_status"] == "verified" for s in symbols)
-            else "includes_assumed_unknown_or_unsupported_lots"
-        ),
+        "lot_evidence_status": _lot_evidence_status(symbols),
         "claims": {
             "estimates_future_executions_or_trades": False,
             "real_oos_registration": False,
@@ -697,6 +706,7 @@ def _summarize(request, data, symbols, used, ignored_future_rows, window) -> dic
             "policy": request.lot_policy,
             "sources": lot_sources,
             "status_counts": dict(Counter(s["lot_status"] for s in symbols)),
+            "verified_count": n(lambda s: s["lot_status"] == "verified"),
             "unverified_count": n(lambda s: s["lot_status"] != "verified"),
         },
         "conditions": {

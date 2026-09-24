@@ -33,12 +33,16 @@
 
 - `terms_approval`: `provisional`／`owner_approved`。後者は承認参照（`approval_reference`）が記録されたことだけを示し、
   コードは承認の真正性を検証しない（`authenticity_verified_by_code=false`）。コードは承認を作らない。
-- `lot_evidence_status` と銘柄別の `c_lot_basis`（`verified_lot`／`assumed_lot_unverified`）。
+- `lot_evidence_status`（`all_instruments_lot_verified`／`includes_assumed_unknown_or_unsupported_lots`／
+  対象銘柄A＝0なら `no_target_instruments`）と、銘柄別の `c_lot_basis`（`verified_lot`／`assumed_lot_unverified`）。
+  検証済み・未検証の件数は `lot.verified_count`／`lot.unverified_count`。
 - Cの件数は `c_purchasable_verified_lot`、`c_purchasable_assumed_lot_reference_only`、
   `c_not_evaluable_lot_unknown_or_unsupported` に分ける。単一の確定的な購入可能件数は出さない。
-- `result_kind` は、暫定条件なら `reference_only_provisional_terms`、承認参照があっても単元株数が
-  未検証・不明を含めば `reference_only_unverified_or_unknown_lots`、両方そろった場合だけ
-  `census_recorded_owner_terms_and_lot_evidence`。LotEvidenceの出典も構造的な記録であり、原資料の真正性は検証しない。
+- `result_kind` は、対象銘柄A＝0なら条件の承認状態にかかわらず `no_target_instruments_nothing_evaluated`
+  （何も評価していない。購入可能Universeの検証完了ではない）。A＞0では、暫定条件なら
+  `reference_only_provisional_terms`、承認参照があっても単元株数が未検証・不明を含めば
+  `reference_only_unverified_or_unknown_lots`、両方そろった場合だけ `census_recorded_owner_terms_and_lot_evidence`。
+  空集合に対する全称判定から肯定的な結論を出さない。LotEvidenceの出典も構造的な記録であり、原資料の真正性は検証しない。
 
 **用語**: 本プロジェクトの「Candidate」は戦略パラメータ候補（baseline等）であり、銘柄ではない。
 出力の銘柄は `jquants_code`／「銘柄（instrument）」と表記する。
@@ -97,13 +101,21 @@ C〜Fは連続した除外段階ではない。各条件の件数、C〜Fの組�
 
 - 出力できるのは、このcheckoutのGit除外領域 `stock_range_trader/outputs/feasibility/` とシステムの一時ディレクトリの
   配下だけ（呼び出し側は範囲を狭めることだけができる）。
-- 相対パス、`..`、symlink・別名（正規化パスと実パスの不一致）、隠し名、既存パスを拒否する。
+- 各許可ルートは「実パス」と「その同じ場所として受け付ける表記」を持つ。一時ディレクトリは
+  `tempfile.gettempdir()` が返す表記とその実パスの2つだけを受け付ける（macOSの `/var/folders/...` と
+  `/private/var/folders/...`）。別名を信頼するのはこの基点そのものだけで、基点より下の要素はすべて実ディレクトリで
+  なければならない。基点以外のsymlink・別名を経由する表記は、到達先が許可範囲内でも拒否する。
+  プロジェクトの出力ルートは、それ自体がsymlink経由でない場合だけ信頼する。
+- 以降の場所の検査はすべて実パスに対して行うため、信頼した別名から保護対象に到達することはない。
+- 相対パス、`..`、基点より下のsymlink・別名、隠し名、既存パスを拒否する。
 - 祖先に `.delayed_replay` を持つ木、および最も近いGit checkoutがこのcheckoutと異なる場所（6月限定試験の
   worktree全体を含む）を拒否する。ディレクトリ名の部分一致を主要な仕組みにしない。
 - Storeの新規作成と再開の両方に同じ検査を適用する。ディレクトリは排他的に作成した直後に再検査し、
   ファイルは `O_EXCL | O_NOFOLLOW` で作成する。
-- 残る制約: 検査と作成の間に祖先ディレクトリを書き換えられる並行プロセスは完全には排除できない
-  （ディレクトリfd相対I/Oが必要で、今回は対象外）。
+- 残る制約: 検査と作成の間に祖先ディレクトリ（一時ディレクトリの基点の別名を含む）を書き換えられる並行プロセスは
+  完全には排除できない（ディレクトリfd相対I/Oが必要で、今回は対象外）。`TMPDIR` を書き換えられる利用者は基点自体を
+  変えられるが、その場合も実パスに対する別checkout・`.delayed_replay`・既存パスの拒否は働く。
+  これは誤操作に対する防護であり、完全なファイルシステム分離ではない。
 
 ## 取得（F1）の境界
 
@@ -111,6 +123,9 @@ C〜Fは連続した除外段階ではない。各条件の件数、C〜Fの組�
   `/markets/calendar`（`from`/`to`）だけを扱う。
 - plan（対象日・API・範囲・上限）を一度だけ書き、台帳は追記専用のhash鎖。送信前に試行を記録し、
   ページ数・件数・受信日時・応答hashを残す。request数・所要時間・保存容量・ページ数の上限を強制する。
+- 保存容量は各送信の前にも検査する。保存済みの応答（孤立ファイルを含む）がすでに上限に達していれば、
+  送信を始めずに `storage_budget_exhausted_before_request` で停止する（再開直後も同じ）。孤立ファイルは削除・上書きしない。
+  応答受信後の検査（`storage_budget_exceeded`）も従来どおり残す。
 - ページ送りの重複・ループ、行の重複、要求日と異なる行、未対応スキーマで安全に停止する。
   再開時はplan・台帳・応答ファイルの一致を検査する。終端の停止は自動再開しない。
 - 台帳に秘密情報、ヘッダ、例外メッセージを保存しない（例外はクラス名のみ）。
@@ -118,6 +133,14 @@ C〜Fは連続した除外段階ではない。各条件の件数、C〜Fの組�
 - 所要時間の上限は、待機前・待機後・送信直前に検査する。待機が予定より長くなって期限を超えた場合は送信しない。
 - 応答は項目ごとに型と値を検査する（日付、5桁の銘柄コード、文字列項目、数値の型・有限性・正負、`HolDiv`、`ExRT`）。
   不正値は例外で落ちずに `invalid_response_value:<項目>` として台帳に記録して停止する。
+  数値はfloatへの変換で桁あふれする巨大整数（例: `10**400`）、非有限値、型違いを不正値として扱い、0や欠測値に
+  置き換えない。Nullは欠測として保持する。Pythonの整数桁数上限を超える数字列を含む応答は `invalid_json_response`。
+- 台帳は、空であるか改行で終わること、各行が正規形のJSON（`canonical_json`）であることを、hash鎖の検査とあわせて
+  追記前に確認する。末尾の改行欠落・途中切断は `ledger_incomplete_final_line`、行の破損・非正規形・空行は
+  `ledger_chain_broken` として `LedgerIntegrityError` を送出し、台帳を補修・上書き・切り詰め・追記しない
+  （不完全な台帳には停止記録も書かない）。例外の `evidence` に台帳のバイト数・sha256・完全な行数と位置
+  （破損行の番号）を残し、未変更の台帳から同じ結論を再構成できる。検証後に台帳の長さが変わった場合も追記しない
+  （`ledger_changed_since_verification`）。
 - 完了済みplanの再実行では完了イベントを追加しない。
 
 クラッシュ地点と再開時の扱い:
@@ -125,9 +148,13 @@ C〜Fは連続した除外段階ではない。各条件の件数、C〜Fの組�
 | クラッシュ地点 | 再開時の扱い |
 | --- | --- |
 | 送信前の試行記録後 | 試行は予算消費として残る |
-| 応答ファイル保存後・page記録前 | 参照のない応答を孤立ファイルとして `orphan_detected` に記録。容量は保存容量の予算に算入し、同一内容の再取得時は既存ファイルを再利用（上書きしない） |
+| 台帳への1行の書き込み途中 | 末尾が不完全な台帳として再開を拒否（自動補修しない。所有者が状況を確認する） |
+| 応答ファイル保存後・page記録前 | 参照のない応答を孤立ファイルとして `orphan_detected` に記録。容量は保存容量の予算に算入し、上限に達していれば送信前に停止。同一内容の再取得時は既存ファイルを再利用（上書きしない） |
 | 最終page記録後・query完了記録前 | 再取得せずに完了を記録 |
 | 台帳・plan・応答の改変、非正規ファイル・symlink、別plan | 再開を拒否 |
+
+hash鎖は台帳の外に固定点を持たないため、完全な行単位で末尾の記録を削除した台帳は、それ自体からは検出できない。
+正式な取得では、台帳末尾のhashを別の記録（receipt等）に残す必要がある（F3以降の課題）。
 
 **実取得は本PRから開始できない。** 取得の入口は `run_offline_fixture_acquisition` だけで、
 具象クラス `OfflineFixtureTransport` の正確な型だけを、Storeの作成・再開より前に受け付ける。

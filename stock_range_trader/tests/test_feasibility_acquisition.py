@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from feasibility.acquisition import (
     AcquisitionStore,
     DateQuery,
     FixtureFailure,
+    LedgerIntegrityError,
     OfflineFixtureTransport,
     TransportResponse,
     fixture_key,
@@ -428,6 +431,13 @@ def test_overrunning_sleep_stops_before_the_next_fetch(tmp_path):
         (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), Vo=True)], "Vo"),
         (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), AdjFactor=0)], "AdjFactor"),
         (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), ExRT=1)], "ExRT"),
+        # re-review: huge integers and non-finite values are recorded stops, not crashes
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), C=10**400)], "C"),
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), Vo=10**400)], "Vo"),
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), AdjFactor=-(10**400))], "AdjFactor"),
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), H=float("inf"))], "H"),
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), Va=float("nan"))], "Va"),
+        (keyed(DAILY, "2025-03-04"), [dict(daily_row("10010", "2025-03-04"), AdjC=[100])], "AdjC"),
     ],
 )  # fmt: skip
 def test_malformed_values_become_recorded_safe_stops(tmp_path, key, rows, reason):
@@ -545,22 +555,6 @@ def test_crash_between_body_save_and_page_record_is_recovered(tmp_path):
     assert summary.status == "completed" and summary.orphan_bodies == 0
 
 
-def test_orphan_bytes_count_against_the_storage_budget(tmp_path):
-    store = AcquisitionStore.create(tmp_path / "acq", plan(max_bytes=700))
-    crash_on(store, "page", nth=2)
-    with pytest.raises(RuntimeError):
-        run(store, fixture(), FakeClock())
-    orphan = tmp_path / "acq" / "responses"
-    # A different, larger orphan (e.g. an abandoned page) must still consume budget.
-    extra = b'{"data": []' + b" " * 400 + b"}"
-    import hashlib
-
-    (orphan / f"{hashlib.sha256(extra).hexdigest()}.json").write_bytes(extra)
-    reopened = AcquisitionStore.open(tmp_path / "acq", plan(max_bytes=700))
-    with pytest.raises(AcquisitionStopped, match="storage_budget_exceeded"):
-        run(reopened, fixture(), FakeClock())
-
-
 def test_crash_after_final_page_completes_without_refetch(tmp_path):
     store = AcquisitionStore.create(tmp_path / "acq", plan())
     crash_on(store, "query_complete", nth=1)  # calendar page recorded, completion lost
@@ -603,8 +597,6 @@ def test_tampered_store_contents_are_refused_on_resume(tmp_path):
 
 
 def test_saved_bodies_are_never_overwritten_or_followed(tmp_path):
-    import hashlib
-
     store = AcquisitionStore.create(tmp_path / "acq", plan())
     payload = b'{"data": []}'
     target = (
@@ -679,3 +671,315 @@ def test_feasibility_package_has_no_network_client_or_order_code():
             assert not set(names) & forbidden, f"{path.name}: {names}"
             if isinstance(node, ast.FunctionDef):
                 assert node.name not in {"place_order", "send_order", "submit_order"}
+
+
+# ------------------------------- re-review 1: trusted temporary base and its alias
+
+
+@pytest.fixture
+def aliased_temp_base(tmp_path, monkeypatch):
+    """An artificial temp base spelled through an alias, like macOS /var -> /private/var."""
+
+    real = tmp_path / "private_var_T"
+    real.mkdir()
+    alias = tmp_path / "var_T"
+    alias.symlink_to(real)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    return alias, real
+
+
+def test_temporary_directory_through_the_base_alias_supports_create_and_resume(
+    aliased_temp_base,
+):
+    alias, real = aliased_temp_base
+    with tempfile.TemporaryDirectory() as spelled:
+        assert Path(spelled).parent == alias  # the aliased spelling, as on macOS
+        root = Path(spelled) / "acq"
+        responses = healthy()
+        responses[keyed(MASTER, "2025-03-04")].insert(0, TransportResponse(503, b"{}"))
+        responses[keyed(MASTER, "2025-03-04")].insert(0, TransportResponse(503, b"{}"))
+        responses[keyed(MASTER, "2025-03-04")].insert(0, TransportResponse(503, b"{}"))
+        clock = FakeClock()
+        with pytest.raises(AcquisitionStopped, match="transient_failures_exhausted"):
+            run_offline_fixture_acquisition(
+                root, plan(), fixture(responses), clock=clock, sleep=clock.sleep
+            )
+        store = AcquisitionStore.open(root, plan())
+        assert store.root == real / Path(spelled).name / "acq"
+        summary = run_offline_fixture_acquisition(
+            root, plan(), fixture(), clock=clock, sleep=clock.sleep, resume=True
+        )
+        assert summary.status == "completed"
+        # the resolved spelling and a narrowed root in the aliased spelling also work
+        assert AcquisitionStore.open(store.root, plan(), allowed_roots=[spelled])
+        assert require_new_output_dir(
+            Path(spelled) / "census", allowed_roots=[spelled]
+        ) == (real / Path(spelled).name / "census")
+
+
+def test_platform_temporary_directory_supports_create_and_resume():
+    with tempfile.TemporaryDirectory() as spelled:  # /var/folders/... on macOS
+        clock = FakeClock()
+        root = Path(spelled) / "acq"
+        store = AcquisitionStore.create(root, plan())
+        crash_on(store, "page", nth=2)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            run(store, fixture(), clock)
+        summary = run_offline_fixture_acquisition(
+            root, plan(), fixture(), clock=clock, sleep=clock.sleep, resume=True
+        )
+        assert summary.status == "completed"
+
+
+def test_temp_base_alias_does_not_open_other_symlinks_or_protected_trees(
+    tmp_path, aliased_temp_base
+):
+    alias, real = aliased_temp_base
+    other = real / "june_worktree"
+    (other / ".git").mkdir(parents=True)
+    (real / "link").symlink_to(other)
+    with pytest.raises(UnsafeOutputPath, match="symlink_or_alias"):
+        require_new_output_dir(alias / "link" / "acq")  # symlink below the base
+    with pytest.raises(UnsafeOutputPath, match="other_git_checkout"):
+        require_new_output_dir(alias / "june_worktree" / "acq")
+    (real / "trial" / ".delayed_replay").mkdir(parents=True)
+    with pytest.raises(UnsafeOutputPath, match="trial_evidence_tree"):
+        require_new_output_dir(alias / "trial" / "acq")
+    (real / "existing").mkdir()
+    with pytest.raises(UnsafeOutputPath, match="already_exists"):
+        AcquisitionStore.create(alias / "existing", plan())
+    second_alias = tmp_path / "untrusted_alias"
+    second_alias.symlink_to(real)
+    with pytest.raises(UnsafeOutputPath, match="symlink_or_alias"):
+        require_new_output_dir(
+            second_alias / "acq"
+        )  # only the base spelling is trusted
+    with pytest.raises(UnsafeOutputPath, match="must_narrow_default_roots"):
+        require_new_output_dir(real / "acq", allowed_roots=[tmp_path])
+    with pytest.raises(UnsafeOutputPath, match="outside_allowed_roots"):
+        require_new_output_dir(alias)  # the base itself is not an output
+
+
+# ------------------------------------------ re-review 2: numeric conversion limits
+
+
+def test_integer_beyond_the_digit_limit_is_a_recorded_safe_stop(tmp_path):
+    responses = healthy()
+    page = body([dict(daily_row("10010", "2025-03-04"), C=12345)])
+    responses[keyed(DAILY, "2025-03-04")] = [ok(page.replace(b"12345", b"9" * 5000))]
+    with pytest.raises(AcquisitionStopped, match="invalid_json_response"):
+        run_offline_fixture_acquisition(
+            tmp_path / "acq",
+            plan(),
+            fixture(responses),
+            clock=FakeClock(),
+            sleep=lambda s: None,
+        )
+    last = AcquisitionStore.open(tmp_path / "acq", plan()).verify()[-1]
+    assert (last["type"], last["reason"]) == ("stop", "invalid_json_response")
+
+
+def test_ordinary_numbers_and_nulls_are_still_accepted(tmp_path):
+    responses = healthy()
+    row = dict(
+        daily_row("10010", "2025-03-04", close=1e6),
+        Vo=10**12,
+        Va=1.5e18,
+        AdjVo=0,
+        AdjFactor=0.5,
+    )
+    responses[keyed(DAILY, "2025-03-04")] = [
+        ok(body([row, daily_row("10050", "2025-03-04", close=None)]))
+    ]
+    summary = run_offline_fixture_acquisition(
+        tmp_path / "acq",
+        plan(),
+        fixture(responses),
+        clock=FakeClock(),
+        sleep=lambda s: None,
+    )
+    assert summary.status == "completed"
+    rows = load_completed_rows(AcquisitionStore.open(tmp_path / "acq", plan())).daily
+    stored = {r["Code"]: r for r in rows if r["Date"] == "2025-03-04"}
+    assert (stored["10010"]["Vo"], stored["10050"]["C"]) == (10**12, None)
+
+
+# ------------------------------------------ re-review 3: ledger tail integrity
+
+
+def interrupted(tmp_path) -> Path:
+    """A resumable store: the master query exhausted its transient retries."""
+
+    responses = healthy()
+    responses[keyed(MASTER, "2025-03-04")] = [TransportResponse(503, b"{}")] * 3
+    with pytest.raises(AcquisitionStopped, match="transient_failures_exhausted"):
+        run_offline_fixture_acquisition(
+            tmp_path / "acq",
+            plan(),
+            fixture(responses),
+            clock=FakeClock(),
+            sleep=lambda s: None,
+        )
+    return tmp_path / "acq"
+
+
+@pytest.mark.parametrize("cut", [1, 20])  # missing final newline; cut mid-record
+def test_incomplete_final_line_is_refused_without_repair(tmp_path, cut):
+    root = interrupted(tmp_path)
+    ledger = root / "ledger.jsonl"
+    original = ledger.read_bytes()
+    damaged = original[:-cut]
+    ledger.write_bytes(damaged)
+    transport = fixture()
+    with pytest.raises(LedgerIntegrityError) as refused:
+        run_offline_fixture_acquisition(
+            root,
+            plan(),
+            transport,
+            clock=FakeClock(),
+            sleep=lambda s: None,
+            resume=True,
+        )
+    assert refused.value.reason == "ledger_incomplete_final_line"
+    complete = damaged.rfind(b"\n") + 1
+    assert refused.value.evidence == {
+        "ledger_bytes": len(damaged),
+        "ledger_sha256": hashlib.sha256(damaged).hexdigest(),
+        "complete_lines": original.count(b"\n") - 1,
+        "complete_bytes": complete,
+        "trailing_bytes": len(damaged) - complete,
+    }
+    assert ledger.read_bytes() == damaged  # not repaired, truncated or extended
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda lines: [*lines[:2], lines[2][: len(lines[2]) // 2], *lines[3:]],
+        lambda lines: [*lines[:2], lines[2].replace(b":", b": ", 1), *lines[3:]],
+        lambda lines: [*lines[:2], b"", *lines[2:]],
+    ],
+    ids=["line_cut_but_newline_kept", "non_canonical_bytes", "blank_line"],
+)
+def test_damaged_middle_lines_are_reported_with_their_position(tmp_path, damage):
+    root = interrupted(tmp_path)
+    ledger = root / "ledger.jsonl"
+    lines = ledger.read_bytes().split(b"\n")[:-1]
+    damaged = b"".join(line + b"\n" for line in damage(lines))
+    ledger.write_bytes(damaged)
+    with pytest.raises(LedgerIntegrityError, match="ledger_chain_broken") as refused:
+        AcquisitionStore.open(root, plan())
+    assert refused.value.evidence["first_bad_line"] == 2
+    assert ledger.read_bytes() == damaged
+
+
+def test_intact_final_line_resumes_and_every_line_stays_canonical(tmp_path):
+    root = interrupted(tmp_path)
+    summary = run_offline_fixture_acquisition(
+        root, plan(), fixture(), clock=FakeClock(), sleep=lambda s: None, resume=True
+    )
+    assert summary.status == "completed"
+    data = (root / "ledger.jsonl").read_bytes()
+    assert data.endswith(b"\n")
+    for line in data.split(b"\n")[:-1]:
+        record = json.loads(line)
+        assert (
+            json.dumps(
+                record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+            == line
+        )
+
+
+def test_ledger_changed_after_verification_is_never_extended(tmp_path):
+    root = interrupted(tmp_path)
+    store = AcquisitionStore.open(root, plan())
+    ledger = root / "ledger.jsonl"
+    with ledger.open("ab") as handle:
+        handle.write(b'{"partial":')  # e.g. a concurrent or crashed writer
+    damaged = ledger.read_bytes()
+    with pytest.raises(LedgerIntegrityError, match="changed_since_verification"):
+        store.append({"type": "stop", "reason": "probe", "terminal": False})
+    assert ledger.read_bytes() == damaged
+
+
+# ------------------------------------------ re-review 4: storage budget on resume
+
+
+def body_size(key: tuple) -> int:
+    return len(healthy()[key][0].body)
+
+
+CALENDAR_AND_MASTER = (keyed(CALENDAR), keyed(MASTER, "2025-03-04"))
+
+
+def crashed_with_master_orphan(tmp_path, max_bytes: int) -> Path:
+    store = AcquisitionStore.create(tmp_path / "acq", plan(max_bytes=max_bytes))
+    crash_on(store, "page", nth=2)  # master body saved, its page record lost
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(store, fixture(), FakeClock())
+    return tmp_path / "acq"
+
+
+@pytest.mark.parametrize("extra_orphan", [0, 400])  # budget reached; exceeded
+def test_resume_stops_before_any_fetch_when_bodies_fill_the_budget(
+    tmp_path, extra_orphan
+):
+    budget = sum(body_size(k) for k in CALENDAR_AND_MASTER)
+    root = crashed_with_master_orphan(tmp_path, budget)
+    if extra_orphan:
+        blob = b'{"data": []' + b" " * extra_orphan + b"}"
+        (root / "responses" / f"{hashlib.sha256(blob).hexdigest()}.json").write_bytes(
+            blob
+        )
+    before = {p.name: p.read_bytes() for p in (root / "responses").iterdir()}
+    transport = fixture()
+    with pytest.raises(AcquisitionStopped) as stopped:
+        run_offline_fixture_acquisition(
+            root,
+            plan(max_bytes=budget),
+            transport,
+            clock=FakeClock(),
+            sleep=lambda s: None,
+            resume=True,
+        )
+    assert stopped.value.reason == "storage_budget_exhausted_before_request"
+    assert stopped.value.terminal
+    assert transport.calls == []  # no fetch was started
+    after = {p.name: p.read_bytes() for p in (root / "responses").iterdir()}
+    assert after == before  # orphans neither deleted nor overwritten
+    records = AcquisitionStore.open(root, plan(max_bytes=budget)).verify()
+    orphans = [r for r in records if r["type"] == "orphan_detected"]
+    assert sum(r["bytes"] for r in orphans) == body_size(CALENDAR_AND_MASTER[1]) + (
+        len(blob) if extra_orphan else 0
+    )
+    assert [r["type"] for r in records[-1:]] == ["stop"]
+
+
+def test_resume_below_the_budget_completes_and_reuses_the_orphan(tmp_path):
+    total = sum(body_size(k) for k in healthy())
+    root = crashed_with_master_orphan(tmp_path, total)
+    summary = run_offline_fixture_acquisition(
+        root,
+        plan(max_bytes=total),
+        fixture(),
+        clock=FakeClock(),
+        sleep=lambda s: None,
+        resume=True,
+    )
+    assert (summary.status, summary.bytes, summary.orphan_bodies) == (
+        "completed",
+        total,
+        0,
+    )
+    # a completed plan stays idempotent even though its bodies now fill the budget
+    again = run_offline_fixture_acquisition(
+        root,
+        plan(max_bytes=total),
+        fixture({}),
+        clock=FakeClock(),
+        sleep=lambda s: None,
+        resume=True,
+    )
+    assert again == summary
