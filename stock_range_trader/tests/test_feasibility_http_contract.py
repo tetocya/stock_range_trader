@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
 from feasibility.acquisition import (
+    DAILY,
     AcquisitionStopped,
+    DateQuery,
     OfflineFixtureTransport,
     run_offline_fixture_acquisition,
 )
 from feasibility.http_contract import (
     HTTP_OUTPUT_ROOT,
     JOURNAL_SCHEMA,
+    MAX_WAIT_SECONDS,
+    AccountRateEvent,
+    AccountRateLedger,
+    AccountRatePolicy,
+    AccountSlotAssessment,
     ApprovalScopeCheck,
     BodyFileEvidence,
     BodyInventory,
@@ -34,11 +41,14 @@ from feasibility.http_contract import (
     PageRequest,
     ReceiptAlignment,
     RetryRules,
+    assess_account_slot,
     assess_live_acquisition_gate,
     budget_snapshot,
     calendar_anchor_reference,
+    check_account_plan_consistency,
     check_approval_scope,
     check_receipt_alignment,
+    commit_account_ledger,
     derive_calendar_anchor,
     make_attempt_id,
     require_live_acquisition_permission,
@@ -47,10 +57,13 @@ from feasibility.http_contract import (
 )
 
 NOW = datetime(2026, 9, 24, 12, tzinfo=UTC)
+ACCOUNT = "artificial-account"
 DIGEST = "a" * 64
 BODY_DIGEST = "b" * 64
 MICRO = timedelta(microseconds=1)
 CLOSED_TAIL = (
+    "account_identity_unverified",
+    "account_shared_store_not_implemented",
     "owner_approval_authenticity_unverified",
     "independent_receipt_custody_unconfigured",
     "http_transport_not_implemented",
@@ -107,6 +120,7 @@ def plan(**changes) -> HttpAcquisitionPlan:
         expires_at=NOW + timedelta(hours=1),
         limits=limits(),
         retry=retry(),
+        account_ref=ACCOUNT,
     )
     values.update(changes)
     return HttpAcquisitionPlan(**values)
@@ -469,7 +483,7 @@ def test_resume_after_approval_expiry_cannot_reserve():
     journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=503)
     resumed = EvidenceJournal(fixed, journal.data, approval=claim)
     state = budget_snapshot(resumed, BodyInventory(()), now=NOW + seconds(250))
-    assert not state.can_reserve_next_attempt
+    assert not state.plan_allows_next_attempt
     assert "approval_expired" in state.blocking_reasons
     with pytest.raises(HttpContractError, match="attempt_outside_approval_validity"):
         resumed.append(reserve(resumed, page(fixed), 2, NOW + seconds(250)))
@@ -547,7 +561,7 @@ def test_claim_metadata_never_proves_authenticity_or_opens_gate():
     gate = assess_live_acquisition_gate(
         fixed, claim, journal, inventory, receipt(journal, inventory), now=NOW
     )
-    assert gate.reasons[-3:] == CLOSED_TAIL
+    assert gate.reasons[-5:] == CLOSED_TAIL
     assert not gate.permitted
     assert not assess_live_acquisition_gate(
         fixed, None, journal, inventory, None, now=NOW
@@ -590,10 +604,10 @@ def test_reservation_respects_the_plan_wait_to_the_microsecond(
         journal, inventory_of(journal), now=NOW + seconds(wait) - MICRO
     )
     assert early.earliest_next_attempt_at == NOW + seconds(wait)
-    assert not early.can_reserve_next_attempt
+    assert not early.plan_allows_next_attempt
     assert early.blocking_reasons == ("rate_limit_wait",)
     on_time = budget_snapshot(journal, inventory_of(journal), now=NOW + seconds(wait))
-    assert on_time.can_reserve_next_attempt and on_time.blocking_reasons == ()
+    assert on_time.plan_allows_next_attempt and on_time.blocking_reasons == ()
     assert (on_time.next_page, on_time.next_attempt_number) == (next_page, number)
 
 
@@ -655,7 +669,7 @@ def test_expiry_during_a_retry_wait_blocks_the_next_attempt(
     claim = approval(fixed, **claim_changes)
     journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=429)
     state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(1))
-    assert reason in state.blocking_reasons and not state.can_reserve_next_attempt
+    assert reason in state.blocking_reasons and not state.plan_allows_next_attempt
 
 
 def test_clock_anomalies_are_rejected():
@@ -742,7 +756,7 @@ def test_journal_reserved_sent_429_retry_unknown_counts_survive_resume():
     assert state.remaining_transfer_bytes == fixed.limits.max_transfer_bytes - 510
     assert state.remaining_decoded_bytes == fixed.limits.max_decoded_bytes - 620
     assert state.elapsed_seconds == 133
-    assert state.can_reserve_next_attempt
+    assert state.plan_allows_next_attempt
     assert (state.next_page, state.next_attempt_number) == (request, 3)
     with pytest.raises(HttpContractError, match="journal_chain_or_plan_mismatch"):
         EvidenceJournal(plan(limits=limits(max_attempts=9)), journal.data)
@@ -833,7 +847,7 @@ def test_allowance_is_the_smaller_of_page_cap_and_remaining_budget():
     journal, at = pages_with(fixed, [500, 499])  # 1 byte of transfer budget left
     assert journal.next_reservation_allowances[0] == 1
     state = budget_snapshot(journal, inventory_of(journal), now=at)
-    assert state.next_allowed_transfer_bytes == 1 and state.can_reserve_next_attempt
+    assert state.next_allowed_transfer_bytes == 1 and state.plan_allows_next_attempt
     with pytest.raises(HttpContractError, match="reserved_allowance_invalid"):
         journal.append(
             reserve(journal, page(fixed, 2), 1, at, allowed_transfer_bytes=500)
@@ -1025,7 +1039,7 @@ def test_body_inventory_counts_orphan_and_partial_without_reset():
     state = budget_snapshot(journal_for(fixed), inventory, now=NOW)
     assert state.orphan_files == state.partial_files == 1
     assert state.remaining_saved_bytes == 0
-    assert not state.can_reserve_next_attempt
+    assert not state.plan_allows_next_attempt
     under_budget = budget_snapshot(
         journal_for(plan()),
         BodyInventory((BodyFileEvidence("orphan-only", 1, "orphan", BODY_DIGEST),)),
@@ -1102,7 +1116,7 @@ def test_complete_journal_is_idempotent_and_rejects_a_second_attempt():
     assert state.status == "completed"
     assert state.blocking_reasons == ("run_completed",)
     assert state.completed_pages == len(fixed.queries)
-    assert not state.can_reserve_next_attempt
+    assert not state.plan_allows_next_attempt
     with pytest.raises(HttpContractError, match="journal_event_after_terminal_state"):
         resumed.append(reserve(resumed, page(fixed), 2, at + seconds(62)))
 
@@ -1366,7 +1380,7 @@ def test_gate_reports_inconsistent_evidence_as_reasons_not_exceptions():
         fixed, other, journal, inventory, None, now=at
     )
     assert "journal_invalid:attempt_approval_mismatch" in swapped.reasons
-    assert gate.reasons[-3:] == swapped.reasons[-3:] == CLOSED_TAIL
+    assert gate.reasons[-5:] == swapped.reasons[-5:] == CLOSED_TAIL
 
 
 def test_result_objects_cannot_be_constructed_as_permission():
@@ -1400,7 +1414,7 @@ def test_entry_point_takes_raw_evidence_and_always_closes():
         require_live_acquisition_permission(
             fixed, claim, journal, inventory, receipt(journal, inventory), now=NOW
         )
-    assert closed.value.reasons[-3:] == CLOSED_TAIL
+    assert closed.value.reasons[-5:] == CLOSED_TAIL
 
 
 def test_offline_entry_still_rejects_nonfixture_before_creating_store(tmp_path):
@@ -1411,3 +1425,467 @@ def test_offline_entry_still_rejects_nonfixture_before_creating_store(tmp_path):
         )
     assert not output.exists()
     assert OfflineFixtureTransport.__name__ == "OfflineFixtureTransport"
+
+
+# ------------------------------------------- round 3, High 1: fixed plan scope
+
+OUTSIDE = DateQuery(DAILY, market_date="2025-02-03")
+
+
+def test_plan_scope_cannot_be_widened_through_public_or_input_objects():
+    with pytest.raises(HttpContractError, match="daily_dates_must_be_tuple"):
+        plan(daily_dates=["2025-03-04", "2025-03-03"])
+    fixed = plan()
+    with pytest.raises(TypeError):
+        fixed.query_positions[OUTSIDE] = 0  # read-only view
+    for name, value in (
+        ("daily_dates", ("2025-02-03", "2025-03-04")),
+        ("_queries", fixed.queries + (OUTSIDE,)),
+        ("_sha256", DIGEST),
+    ):
+        with pytest.raises(FrozenInstanceError):
+            setattr(fixed, name, value)
+    assert OUTSIDE not in fixed.query_positions
+    assert fixed.queries == plan().queries and fixed.sha256 == plan().sha256
+
+
+def test_reservation_outside_the_fixed_dates_is_refused_without_side_effects():
+    fixed = plan()
+    journal = exchange(journal_for(fixed), page(fixed), 1, NOW, status=503)
+    before = (journal.data, budget_snapshot(journal, BodyInventory(()), now=NOW))
+    with pytest.raises(HttpContractError, match="page_outside_fixed_plan"):
+        journal.append(
+            reserve(
+                journal,
+                PageRequest(OUTSIDE, 0),
+                1,
+                NOW + seconds(13),
+                attempt_id=DIGEST,
+            )
+        )
+    assert (
+        journal.data,
+        budget_snapshot(journal, BodyInventory(()), now=NOW),
+    ) == before
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("_queries", lambda p: p.queries + (OUTSIDE,)),
+        ("_positions", lambda p: {**p.query_positions, OUTSIDE: len(p.queries)}),
+        ("_sha256", lambda p: DIGEST),
+        ("daily_dates", lambda p: ("2025-02-03", *p.daily_dates)),
+    ],
+)
+def test_tampered_derived_scope_under_the_same_hash_is_detected(name, value):
+    fixed = plan()
+    object.__setattr__(fixed, name, value(fixed))  # deliberate in-process tamper
+    with pytest.raises(HttpContractError, match="plan_fixed_scope_inconsistent"):
+        EvidenceJournal(fixed, approval=None)
+    with pytest.raises(HttpContractError, match="plan_fixed_scope_inconsistent"):
+        EvidenceJournal(fixed, approval=approval(plan()))
+
+
+def test_journal_with_an_out_of_plan_reservation_is_refused_on_reopen():
+    fixed = plan()
+    event = JournalEvent(
+        "attempt_reserved",
+        NOW,
+        attempt_id=DIGEST,
+        page=PageRequest(OUTSIDE, 0),
+        attempt_number=1,
+        approval_sha256=approval(fixed).sha256,
+        allowed_transfer_bytes=500,
+        allowed_decoded_bytes=600,
+        allowed_saved_bytes=450,
+    )
+    data = forge(fixed, b"", event.to_dict())
+    with pytest.raises(HttpContractError, match="page_outside_fixed_plan"):
+        EvidenceJournal(fixed, data, approval=approval(fixed))
+
+
+def test_normal_plan_runs_to_completion_and_resumes():
+    fixed = plan()
+    claim = approval(fixed)
+    journal, inventory, at = complete_pages(fixed, claim)
+    journal = journal.append(JournalEvent("run_completed", at))
+    resumed = EvidenceJournal(fixed, journal.data, approval=claim)
+    assert resumed.completed and resumed.data == journal.data
+    assert budget_snapshot(resumed, inventory, now=at).completed_pages == 4
+    assert plan(account_ref="another-account").sha256 != fixed.sha256
+
+
+# ------------------------------------------ round 3, High 2: account rate ledger
+
+PLAN_B = dict(
+    artifact_id="artificial-other",
+    output_dir=str(HTTP_OUTPUT_ROOT / "artificial-other"),
+)
+
+
+def account_policy(**changes) -> AccountRatePolicy:
+    values = dict(
+        min_interval_seconds=13,
+        min_wait_after_429_seconds=120,
+        min_wait_after_5xx_seconds=13,
+        min_wait_after_network_error_seconds=13,
+        request_timeout_seconds=30,
+        slot_lease_seconds=60,
+    )
+    values.update(changes)
+    return AccountRatePolicy(**values)
+
+
+def open_account(ref=ACCOUNT, **changes) -> AccountRateLedger:
+    opened = AccountRateEvent(
+        "ledger_opened", NOW - seconds(60), policy=account_policy(**changes)
+    )
+    return AccountRateLedger(ref).append(opened)
+
+
+def slot_event(kind, at, slot_id, *, plan_sha=None, holder="runner-a", **extra):
+    return AccountRateEvent(
+        kind, at, slot_id=slot_id, plan_sha256=plan_sha, holder_id=holder, **extra
+    )
+
+
+def account_exchange(
+    ledger, journal, at, *, outcome="response", holder="runner-a", retry_after=None
+):
+    """Record the account slot of the plan journal's latest attempt."""
+
+    attempt_id = last_attempt_id(journal)
+    ledger = ledger.append(
+        slot_event(
+            "slot_reserved", at, attempt_id, plan_sha=journal.plan.sha256, holder=holder
+        )
+    )
+    ledger = ledger.append(slot_event("slot_sent", at, attempt_id, holder=holder))
+    return ledger.append(
+        slot_event(
+            "slot_settled",
+            at,
+            attempt_id,
+            holder=holder,
+            outcome=outcome,
+            retry_after_seconds=retry_after,
+        )
+    )
+
+
+def run_plan_a(status=200, *, retry_after=None):
+    fixed = plan()
+    journal = exchange(
+        journal_for(fixed), page(fixed), 1, NOW, status=status, retry_after=retry_after
+    )
+    outcome = {200: "response", 429: "429", 503: "5xx"}[status]
+    ledger = account_exchange(open_account(), journal, NOW, outcome=outcome)
+    return journal, ledger
+
+
+@pytest.mark.parametrize("status,wait", [(200, 13), (429, 120), (503, 13)])
+def test_plan_b_inherits_plan_a_waits_on_the_same_account(status, wait):
+    _, ledger = run_plan_a(status)
+    fixed_b = plan(**PLAN_B)
+    journal_b = journal_for(fixed_b)
+    # Plan B's own journal is empty: plan-local rules alone would allow it ...
+    assert budget_snapshot(
+        journal_b, BodyInventory(()), now=NOW + seconds(1)
+    ).plan_allows_next_attempt
+    # ... but the shared account state does not.
+    early = assess_account_slot(ledger, fixed_b, now=NOW + seconds(1))
+    assert not early.account_allows_next_attempt
+    assert early.blocking_reasons == ("account_rate_limit_wait",)
+    assert early.earliest_next_slot_at == NOW + seconds(wait)
+    edge = assess_account_slot(ledger, fixed_b, now=NOW + seconds(wait) - MICRO)
+    assert not edge.account_allows_next_attempt
+    assert assess_account_slot(
+        ledger, fixed_b, now=NOW + seconds(wait)
+    ).account_allows_next_attempt
+    attempt = reserve(journal_b, page(fixed_b), 1, NOW + seconds(wait) - MICRO)
+    with pytest.raises(HttpContractError, match="account_rate_limit_wait"):
+        ledger.append(
+            slot_event(
+                "slot_reserved",
+                NOW + seconds(wait) - MICRO,
+                attempt.attempt_id,
+                plan_sha=fixed_b.sha256,
+            )
+        )
+    assert ledger.append(
+        slot_event(
+            "slot_reserved",
+            NOW + seconds(wait),
+            attempt.attempt_id,
+            plan_sha=fixed_b.sha256,
+        )
+    )
+
+
+def test_calendar_plan_completion_then_daily_plan_waits_on_the_account():
+    evidence = discovery_evidence()
+    calendar = EvidenceJournal(
+        evidence.plan, evidence.journal_data, approval=evidence.approval
+    )
+    ledger = account_exchange(
+        open_account(), calendar, [e for e in calendar.events][2].at
+    )
+    daily = anchored_plan(evidence)
+    assert not assess_account_slot(
+        ledger, daily, now=NOW + seconds(13) - MICRO
+    ).account_allows_next_attempt
+    assert assess_account_slot(
+        ledger, daily, now=NOW + seconds(13)
+    ).account_allows_next_attempt
+
+
+def test_other_account_is_separate_and_mismatched_ledgers_are_refused():
+    _, ledger = run_plan_a(429)
+    other = plan(**PLAN_B, account_ref="other-account")
+    own = open_account("other-account")
+    assert assess_account_slot(
+        own, other, now=NOW + seconds(1)
+    ).account_allows_next_attempt
+    assert (
+        "account_ref_mismatch"
+        in assess_account_slot(ledger, other, now=NOW + seconds(1)).blocking_reasons
+    )
+    with pytest.raises(HttpContractError, match="account_ledger_account_mismatch"):
+        AccountRateLedger("other-account", ledger.data)
+    assessment = assess_account_slot(own, other, now=NOW + seconds(1))
+    assert assessment.account_identity_verified is False
+    with pytest.raises(TypeError):
+        AccountSlotAssessment(ACCOUNT, NOW, (), account_identity_verified=True)
+
+
+def test_concurrent_reservations_cannot_share_a_send_slot():
+    base = open_account()
+    first, second = plan(), plan(**PLAN_B)
+    slot_a = reserve(journal_for(first), page(first), 1).attempt_id
+    slot_b = reserve(journal_for(second), page(second), 1).attempt_id
+    proposal_a = base.append(
+        slot_event("slot_reserved", NOW, slot_a, plan_sha=first.sha256)
+    )
+    proposal_b = base.append(
+        slot_event(
+            "slot_reserved", NOW, slot_b, plan_sha=second.sha256, holder="runner-b"
+        )
+    )
+    store = commit_account_ledger(ACCOUNT, base.data, proposal_a.data)  # A wins
+    with pytest.raises(HttpContractError, match="stale_or_conflicting_commit"):
+        commit_account_ledger(ACCOUNT, store.data, proposal_b.data)
+    with pytest.raises(HttpContractError, match="account_slot_in_use"):
+        store.append(
+            slot_event(
+                "slot_reserved", NOW, slot_b, plan_sha=second.sha256, holder="runner-b"
+            )
+        )
+    two_records = proposal_a.append(slot_event("slot_sent", NOW, slot_a))
+    with pytest.raises(HttpContractError, match="stale_or_conflicting_commit"):
+        commit_account_ledger(ACCOUNT, base.data, two_records.data)
+
+
+def test_unknown_outcome_across_a_plan_switch_is_reclaimed_only_after_the_lease():
+    first, second = plan(), plan(**PLAN_B)
+    slot_a = reserve(journal_for(first), page(first), 1).attempt_id
+    ledger = open_account().append(
+        slot_event("slot_reserved", NOW, slot_a, plan_sha=first.sha256)
+    )
+    ledger = ledger.append(slot_event("slot_sent", NOW + seconds(5), slot_a))
+    # runner-a stops here; plan B (runner-b) must not use the account meanwhile
+    assessment = assess_account_slot(ledger, second, now=NOW + seconds(30))
+    assert assessment.blocking_reasons == ("account_slot_in_use",)
+    reclaim = slot_event(
+        "slot_settled", NOW + seconds(60) - MICRO, slot_a, holder="runner-b",
+        outcome="unknown",
+    )  # fmt: skip
+    with pytest.raises(HttpContractError, match="reclaim_before_lease_expiry"):
+        ledger.append(reclaim)
+    with pytest.raises(HttpContractError, match="account_slot_holder_mismatch"):
+        ledger.append(replace(reclaim, at=NOW + seconds(60), outcome="response"))
+    ledger = ledger.append(replace(reclaim, at=NOW + seconds(60)))
+    resumed = AccountRateLedger(ACCOUNT, ledger.data)
+    for current in (ledger, resumed):
+        state = assess_account_slot(current, second, now=NOW + seconds(73) - MICRO)
+        assert state.blocking_reasons == ("account_rate_limit_wait",)
+        assert state.earliest_next_slot_at == NOW + seconds(73)
+
+
+def test_send_must_fit_inside_the_slot_lease():
+    fixed = plan()
+    slot_id = reserve(journal_for(fixed), page(fixed), 1).attempt_id
+    ledger = open_account().append(
+        slot_event("slot_reserved", NOW, slot_id, plan_sha=fixed.sha256)
+    )
+    with pytest.raises(HttpContractError, match="lease_too_short_for_send"):
+        ledger.append(slot_event("slot_sent", NOW + seconds(30) + MICRO, slot_id))
+    assert ledger.append(slot_event("slot_sent", NOW + seconds(30), slot_id))
+
+
+def test_account_policy_must_cover_the_plan_rules():
+    _, ledger = run_plan_a()
+    strict = plan(**PLAN_B, retry=retry(min_wait_after_429_seconds=300))
+    assert (
+        "account_policy_weaker_than_plan"
+        in assess_account_slot(ledger, strict, now=NOW + seconds(60)).blocking_reasons
+    )
+    with pytest.raises(HttpContractError, match="slot_lease_shorter_than_request"):
+        account_policy(slot_lease_seconds=10)
+
+
+def test_account_state_and_plan_journal_must_agree():
+    journal, ledger = run_plan_a(200)
+    check_account_plan_consistency(ledger, journal)
+    with pytest.raises(HttpContractError, match="account_ledger_missing_plan_attempt"):
+        check_account_plan_consistency(open_account(), journal)
+    wrong = account_exchange(open_account(), journal, NOW, outcome="429")
+    with pytest.raises(HttpContractError, match="account_slot_outcome_mismatch"):
+        check_account_plan_consistency(wrong, journal)
+    late = account_exchange(open_account(), journal, NOW + seconds(1))
+    with pytest.raises(HttpContractError, match="reserved_after_plan_attempt"):
+        check_account_plan_consistency(late, journal)
+    with pytest.raises(HttpContractError, match="missing_from_plan_journal"):
+        check_account_plan_consistency(ledger, journal_for(journal.plan))
+
+
+def gate_for(journal, ledger, now):
+    inventory = BodyInventory(())
+    return assess_live_acquisition_gate(
+        journal.plan,
+        journal.approval,
+        journal,
+        inventory,
+        None,
+        now=now,
+        account_ledger=ledger,
+    ).reasons
+
+
+def test_gate_requires_consistent_account_state_and_stays_closed():
+    journal, ledger = run_plan_a(429)
+    later = NOW + seconds(200)
+    assert "account_rate_state_missing" in gate_for(journal, None, later)
+    tampered = AccountRateLedger.__new__(AccountRateLedger)
+    tampered._init(ACCOUNT, (ledger.data.replace(b'"429"', b'"200"', 1),), "0", 0, None)
+    assert any(
+        r.startswith("account_rate_state_invalid:")
+        for r in gate_for(journal, tampered, later)
+    )
+    stale = AccountRateLedger(ACCOUNT, b"".join(ledger._lines[:2]))  # before settle
+    reasons = gate_for(journal, stale, later)
+    assert "account_rate_blocked:account_slot_in_use" in reasons
+    assert "account_rate_state_inconsistent:account_ledger_missing_plan_attempt" in (
+        gate_for(journal, open_account(), later)
+    )
+    early = gate_for(journal, ledger, NOW + seconds(1))
+    assert "account_rate_blocked:account_rate_limit_wait" in early
+    settled = gate_for(journal, ledger, later)
+    assert not any(r.startswith("account_rate_") for r in settled)
+    assert settled[-5:] == CLOSED_TAIL
+    with pytest.raises(HttpContractError, match="raw_evidence_required"):
+        require_live_acquisition_permission(
+            journal.plan,
+            journal.approval,
+            journal,
+            BodyInventory(()),
+            None,
+            now=later,
+            account_ledger=assess_account_slot(ledger, journal.plan, now=later),
+        )
+
+
+def test_plan_snapshot_flag_is_named_plan_only():
+    state = budget_snapshot(journal_for(plan()), BodyInventory(()), now=NOW)
+    assert state.plan_allows_next_attempt
+    assert not hasattr(state, "can_reserve_next_attempt")
+
+
+# ---------------------------------------- round 3, Medium: bounded wait values
+
+
+@pytest.mark.parametrize(
+    "value,reason",
+    [
+        (10**400, "retry_after_seconds_out_of_range"),
+        (MAX_WAIT_SECONDS + 1, "retry_after_seconds_out_of_range"),
+        (-1, "retry_after_seconds_must_be_nonnegative_integer"),
+        (float("inf"), "retry_after_seconds_must_be_nonnegative_integer"),
+        (float("nan"), "retry_after_seconds_must_be_nonnegative_integer"),
+        (True, "retry_after_seconds_must_be_nonnegative_integer"),
+        ("120", "retry_after_seconds_must_be_nonnegative_integer"),
+    ],
+)
+def test_invalid_retry_after_is_refused_before_recording(value, reason):
+    fixed = plan()
+    with pytest.raises(HttpContractError, match=reason):
+        exchange(journal_for(fixed), page(fixed), 1, NOW, status=429, retry_after=value)
+    with pytest.raises(HttpContractError, match=reason):
+        slot_event(
+            "slot_settled", NOW, DIGEST, outcome="429", retry_after_seconds=value
+        )
+
+
+def test_largest_retry_after_sets_an_exact_next_time():
+    fixed = plan(expires_at=NOW + timedelta(days=3))
+    journal = exchange(
+        journal_for(fixed, approval(fixed, valid_until=NOW + timedelta(days=2))),
+        page(fixed),
+        1,
+        NOW,
+        status=429,
+        retry_after=MAX_WAIT_SECONDS,
+    )
+    state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(1))
+    assert state.earliest_next_attempt_at == NOW + seconds(MAX_WAIT_SECONDS)
+
+
+def test_tampered_journal_with_a_huge_retry_after_is_a_contract_error():
+    fixed = plan()
+    claim = approval(fixed)
+    journal = journal_for(fixed, claim).append(
+        reserve(journal_for(fixed, claim), page(fixed), 1)
+    )
+    journal = journal.append(
+        JournalEvent("attempt_sent", NOW, attempt_id=last_attempt_id(journal))
+    )
+    response = JournalEvent(
+        "response_received",
+        NOW,
+        attempt_id=last_attempt_id(journal),
+        status=429,
+        transfer_bytes=10,
+        decoded_bytes=20,
+    ).to_dict()
+    response["retry_after_seconds"] = 10**400
+    with pytest.raises(HttpContractError, match="retry_after_seconds_out_of_range"):
+        EvidenceJournal(fixed, forge(fixed, journal.data, response), approval=claim)
+
+
+@pytest.mark.parametrize(
+    "build,reason",
+    [
+        (lambda: limits(max_elapsed_seconds=10**400), "max_elapsed_seconds_out_of_range"),
+        (lambda: retry(min_wait_after_429_seconds=10**400),
+         "min_wait_after_429_seconds_out_of_range"),
+        (lambda: retry(timeout_seconds=MAX_WAIT_SECONDS + 1), "timeout_seconds_out_of_range"),
+        (lambda: plan(expires_at=datetime(9999, 12, 31, tzinfo=UTC)),
+         "plan_time_window_unrepresentable"),
+        (lambda: account_policy(slot_lease_seconds=10**400), "slot_lease_seconds_out_of_range"),
+    ],
+)  # fmt: skip
+def test_unrepresentable_durations_and_windows_are_refused(build, reason):
+    with pytest.raises(HttpContractError, match=reason):
+        build()
+
+
+def test_unrepresentable_next_time_is_a_reason_not_an_exception():
+    fixed = plan()
+    journal = journal_for(fixed).append(reserve(journal_for(fixed), page(fixed), 1))
+    far = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)  # + 13 s overflows
+    journal = journal.append(
+        JournalEvent("outcome_unknown", far, attempt_id=last_attempt_id(journal))
+    )
+    state = budget_snapshot(journal, BodyInventory(()), now=far)
+    assert "next_attempt_time_unrepresentable" in state.blocking_reasons
+    assert state.earliest_next_attempt_at is None

@@ -9,7 +9,6 @@ The live-acquisition gate is intentionally closed.
 from __future__ import annotations
 
 import copy
-import functools
 import hashlib
 import json
 import os
@@ -17,6 +16,7 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import NoReturn
 
 from .acquisition import CALENDAR, DAILY, HOLIDAY_DIVISIONS, MASTER, DateQuery
@@ -33,6 +33,10 @@ HTTP_OUTPUT_ROOT = (
     Path(__file__).resolve().parents[1] / "outputs" / "feasibility" / "http"
 )
 _SAFE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}\Z")
+_LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+# Contract bounds keep every wait, timeout, lease and budget representable.
+MAX_WAIT_SECONDS = 86_400
+MAX_ELAPSED_SECONDS = 366 * 86_400
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -63,6 +67,28 @@ def _positive_int(value: object, name: str) -> int:
 def _nonnegative_int(value: object, name: str) -> int:
     if type(value) is not int or value < 0:
         raise HttpContractError(f"{name}_must_be_nonnegative_integer")
+    return value
+
+
+def _bounded_seconds(
+    value: object, name: str, maximum: int, *, allow_zero: bool = False
+) -> int:
+    (_nonnegative_int if allow_zero else _positive_int)(value, name)
+    if value > maximum:
+        raise HttpContractError(f"{name}_out_of_range")
+    return value
+
+
+def _add_seconds(at: datetime, seconds: int) -> datetime:
+    try:
+        return at + timedelta(seconds=seconds)
+    except OverflowError:
+        raise HttpContractError("time_not_representable") from None
+
+
+def _label(value: object, name: str) -> str:
+    if type(value) is not str or not _LABEL.fullmatch(value):
+        raise HttpContractError(f"{name}_invalid")
     return value
 
 
@@ -144,6 +170,9 @@ class HttpLimits:
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
             _positive_int(value, name)
+        _bounded_seconds(
+            self.max_elapsed_seconds, "max_elapsed_seconds", MAX_ELAPSED_SECONDS
+        )
         for total, per_page in (
             (self.max_transfer_bytes, self.max_page_transfer_bytes),
             (self.max_decoded_bytes, self.max_page_decoded_bytes),
@@ -174,6 +203,14 @@ class RetryRules:
             "timeout_seconds",
         ):
             _positive_int(getattr(self, name), name)
+        for name in (
+            "min_interval_seconds",
+            "min_wait_after_429_seconds",
+            "min_wait_after_5xx_seconds",
+            "min_wait_after_network_error_seconds",
+            "timeout_seconds",
+        ):
+            _bounded_seconds(getattr(self, name), name, MAX_WAIT_SECONDS)
         if self.min_interval_seconds < 13 or self.min_wait_after_429_seconds < 120:
             raise HttpContractError("free_rate_limit_policy_too_weak")
         if self.retry_after_policy != "max_server_and_local_wait":
@@ -200,6 +237,7 @@ class HttpAcquisitionPlan:
     expires_at: datetime
     limits: HttpLimits
     retry: RetryRules
+    account_ref: str
     auth_reference: str = AUTH_REFERENCE
 
     def __post_init__(self) -> None:
@@ -242,79 +280,126 @@ class HttpAcquisitionPlan:
         _output_path(self.output_dir, self.artifact_id)
         if _utc(self.not_before, "not_before") >= _utc(self.expires_at, "expires_at"):
             raise HttpContractError("plan_time_window_invalid")
+        try:
+            _add_seconds(self.expires_at, MAX_ELAPSED_SECONDS + MAX_WAIT_SECONDS)
+        except HttpContractError:
+            raise HttpContractError("plan_time_window_unrepresentable") from None
         if type(self.limits) is not HttpLimits or type(self.retry) is not RetryRules:
             raise HttpContractError("plan_limits_or_retry_type_invalid")
+        _label(self.account_ref, "account_ref")
         if self.auth_reference != AUTH_REFERENCE:
             raise HttpContractError("unsupported_auth_reference")
-        if len(self.queries) > self.limits.max_attempts or len(self.queries) > (
+        # Everything derived from the fields is computed once and stored as
+        # immutable values; nothing the caller holds can change the scope later.
+        queries = _derive_queries(self)
+        if len(queries) > self.limits.max_attempts or len(queries) > (
             self.limits.max_pages_total
         ):
             raise HttpContractError("budget_below_fixed_query_count")
+        for name, value in _derived_scope(self, queries).items():
+            object.__setattr__(self, name, value)
 
-    @functools.cached_property
+    @property
     def queries(self) -> tuple[DateQuery, ...]:
-        if self.kind == "calendar_discovery":
-            return (
-                DateQuery(CALENDAR, start=self.calendar_start, end=self.calendar_end),
-            )
-        queries = ()
-        if self.kind == "predeclared_daily":
-            queries += (
-                DateQuery(CALENDAR, start=self.calendar_start, end=self.calendar_end),
-            )
-        queries += (DateQuery(MASTER, market_date=self.reference_date),)
-        return queries + tuple(
-            DateQuery(DAILY, market_date=day) for day in self.daily_dates
-        )
+        return self._queries
 
-    @functools.cached_property
+    @property
+    def query_positions(self) -> MappingProxyType:
+        """Read-only view; the fixed scope cannot be widened through it."""
+
+        return self._positions
+
+    @property
     def allowed_endpoints(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(q.endpoint for q in self.queries))
+        return self._endpoints
+
+    @property
+    def sha256(self) -> str:
+        return self._sha256
+
+    @property
+    def scope_sha256(self) -> str:
+        return self._scope_sha256
+
+    def verify_fixed_scope(self) -> None:
+        """Re-derive the scope from the fields and compare with the stored values."""
+
+        for name, expected in _derived_scope(self, _derive_queries(self)).items():
+            stored = getattr(self, name, None)
+            if name == "_positions":
+                same = type(stored) is MappingProxyType and dict(stored) == dict(
+                    expected
+                )
+            else:
+                same = stored == expected
+            if not same:
+                raise HttpContractError("plan_fixed_scope_inconsistent")
 
     def scope(self) -> dict:
-        return {
-            "kind": self.kind,
-            "reference_date": self.reference_date,
-            "calendar_start": self.calendar_start,
-            "calendar_end": self.calendar_end,
-            "master_date": self.master_date,
-            "daily_dates": list(self.daily_dates),
-            "calendar_source_sha256": self.calendar_source_sha256,
-            "calendar_source_reference": self.calendar_source_reference,
-            "allowed_endpoints": list(self.allowed_endpoints),
-            "queries": [q.to_dict() for q in self.queries],
-            "pagination": "sequential_same_query_until_no_pagination_key",
-        }
+        return _scope_dict(self, self._queries)
 
     def to_dict(self) -> dict:
-        return {
-            "schema": PLAN_SCHEMA,
-            "purpose": PURPOSE,
-            "provider": "jquants",
-            "api_version": "v2",
-            "artifact_id": self.artifact_id,
-            "scope": self.scope(),
-            "output_dir": self.output_dir,
-            "not_before": _utc(self.not_before, "not_before"),
-            "expires_at": _utc(self.expires_at, "expires_at"),
-            "limits": asdict(self.limits),
-            "retry": asdict(self.retry),
-            "auth_reference": self.auth_reference,
-            "resume_policy": "same_plan_same_cumulative_budget_only",
-            "expiry_policy": "stop_without_reauthorization",
-        }
+        return _plan_dict(self, self._queries)
 
-    @functools.cached_property
-    def sha256(self) -> str:
-        return _digest(self.to_dict())
 
-    @functools.cached_property
-    def scope_sha256(self) -> str:
-        return _digest(self.scope())
+def _derive_queries(plan: HttpAcquisitionPlan) -> tuple[DateQuery, ...]:
+    if plan.kind == "calendar_discovery":
+        return (DateQuery(CALENDAR, start=plan.calendar_start, end=plan.calendar_end),)
+    queries = ()
+    if plan.kind == "predeclared_daily":
+        queries += (
+            DateQuery(CALENDAR, start=plan.calendar_start, end=plan.calendar_end),
+        )
+    queries += (DateQuery(MASTER, market_date=plan.reference_date),)
+    return queries + tuple(
+        DateQuery(DAILY, market_date=day) for day in plan.daily_dates
+    )
 
-    @functools.cached_property
-    def query_positions(self) -> dict[DateQuery, int]:
-        return {query: index for index, query in enumerate(self.queries)}
+
+def _derived_scope(plan: HttpAcquisitionPlan, queries: tuple) -> dict:
+    return {
+        "_queries": queries,
+        "_positions": MappingProxyType({q: i for i, q in enumerate(queries)}),
+        "_endpoints": tuple(dict.fromkeys(q.endpoint for q in queries)),
+        "_sha256": _digest(_plan_dict(plan, queries)),
+        "_scope_sha256": _digest(_scope_dict(plan, queries)),
+    }
+
+
+def _scope_dict(plan: HttpAcquisitionPlan, queries: tuple) -> dict:
+    return {
+        "kind": plan.kind,
+        "reference_date": plan.reference_date,
+        "calendar_start": plan.calendar_start,
+        "calendar_end": plan.calendar_end,
+        "master_date": plan.master_date,
+        "daily_dates": list(plan.daily_dates),
+        "calendar_source_sha256": plan.calendar_source_sha256,
+        "calendar_source_reference": plan.calendar_source_reference,
+        "allowed_endpoints": list(dict.fromkeys(q.endpoint for q in queries)),
+        "queries": [q.to_dict() for q in queries],
+        "pagination": "sequential_same_query_until_no_pagination_key",
+    }
+
+
+def _plan_dict(plan: HttpAcquisitionPlan, queries: tuple) -> dict:
+    return {
+        "schema": PLAN_SCHEMA,
+        "purpose": PURPOSE,
+        "provider": "jquants",
+        "api_version": "v2",
+        "artifact_id": plan.artifact_id,
+        "scope": _scope_dict(plan, queries),
+        "output_dir": plan.output_dir,
+        "not_before": _utc(plan.not_before, "not_before"),
+        "expires_at": _utc(plan.expires_at, "expires_at"),
+        "limits": asdict(plan.limits),
+        "retry": asdict(plan.retry),
+        "account_ref": plan.account_ref,
+        "auth_reference": plan.auth_reference,
+        "resume_policy": "same_plan_same_cumulative_budget_only",
+        "expiry_policy": "stop_without_reauthorization",
+    }
 
 
 @dataclass(frozen=True)
@@ -447,6 +532,7 @@ def check_approval_scope(
         or type(approval) is not OwnerApprovalClaim
     ):
         raise HttpContractError("approval_claim_required")
+    plan.verify_fixed_scope()
     _check_approval_fields(plan, approval)
     current = _utc(now, "now")
     if not (
@@ -601,14 +687,16 @@ class JournalEvent:
             type(self.status) is not int or not 100 <= self.status <= 599
         ):
             raise HttpContractError("invalid_http_status")
-        for name in (
-            "transfer_bytes",
-            "decoded_bytes",
-            "saved_bytes",
-            "retry_after_seconds",
-        ):
+        for name in ("transfer_bytes", "decoded_bytes", "saved_bytes"):
             if getattr(self, name) is not None:
                 _nonnegative_int(getattr(self, name), name)
+        if self.retry_after_seconds is not None:
+            _bounded_seconds(
+                self.retry_after_seconds,
+                "retry_after_seconds",
+                MAX_WAIT_SECONDS,
+                allow_zero=True,
+            )
         if self.next_key is not None:
             _text(self.next_key, "next_key")
         if self.reason is not None:
@@ -735,7 +823,12 @@ class _JournalState:
     def __init__(
         self, plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim | None
     ) -> None:
+        plan.verify_fixed_scope()
         self.plan = plan
+        # The verified, immutable scope used by every transition, resume and
+        # completion check (never a caller-held structure).
+        self.queries = plan.queries
+        self.positions = plan.query_positions
         self.approval = approval
         self.approval_sha256 = approval.sha256 if approval is not None else None
         self.attempts: dict[str, _Attempt] = {}
@@ -813,21 +906,20 @@ class _JournalState:
         if self.last_network_at is None:
             return start
         return max(
-            start,
-            self.last_network_at + timedelta(seconds=self.required_wait_seconds()),
+            start, _add_seconds(self.last_network_at, self.required_wait_seconds())
         )
 
     def deadline(self) -> datetime | None:
         if self.first_reserved_at is None:
             return None
-        return self.first_reserved_at + timedelta(
-            seconds=self.plan.limits.max_elapsed_seconds
+        return _add_seconds(
+            self.first_reserved_at, self.plan.limits.max_elapsed_seconds
         )
 
     def next_page(self) -> tuple[PageRequest | None, int | None, str | None]:
         """The page a runner would reserve next, or why none can be reserved."""
 
-        for query in self.plan.queries[self.complete_prefix :]:
+        for query in self.queries[self.complete_prefix :]:
             prior = self.pages.get(query.query_id, ())
             if len(prior) >= self.plan.limits.max_pages_per_query:
                 return None, None, "page_limit_reached"
@@ -868,12 +960,15 @@ class _JournalState:
 
     def _on_attempt_reserved(self, event: JournalEvent, at: datetime) -> None:
         plan, limits, page = self.plan, self.plan.limits, event.page
-        validate_page_request(plan, page)
+        if type(page) is not PageRequest or page.query not in self.positions:
+            raise HttpContractError("page_outside_fixed_plan")
+        if page.page_index >= limits.max_pages_per_query:
+            raise HttpContractError("page_index_exceeds_plan_limit")
         if self.over_budget:
             raise HttpContractError("previous_page_budget_overrun")
         if self.open_attempt is not None:
             raise HttpContractError("prior_attempt_unsettled")
-        if plan.query_positions[page.query] > self.complete_prefix:
+        if self.positions[page.query] > self.complete_prefix:
             raise HttpContractError("prior_query_incomplete")
         if self.completed_pages >= limits.max_pages_total:
             raise HttpContractError("page_budget_exhausted")
@@ -1040,7 +1135,7 @@ class _JournalState:
     def _on_run_completed(self, event: JournalEvent, at: datetime) -> None:
         # Completion is bookkeeping: the deadline bounds reservations, sends and
         # responses, so a run whose pages all finished in time may be closed later.
-        if self.complete_prefix != len(self.plan.queries):
+        if self.complete_prefix != len(self.queries):
             raise HttpContractError("run_completed_with_missing_page")
         if self.over_budget:
             raise HttpContractError("run_completed_after_budget_overrun")
@@ -1070,6 +1165,7 @@ class EvidenceJournal:
     ) -> None:
         if type(plan) is not HttpAcquisitionPlan or type(data) is not bytes:
             raise HttpContractError("journal_requires_plan_and_bytes")
+        plan.verify_fixed_scope()
         if approval is not None:
             if type(approval) is not OwnerApprovalClaim:
                 raise HttpContractError("journal_approval_claim_type_invalid")
@@ -1284,9 +1380,9 @@ class BudgetSnapshot:
     remaining_transfer_bytes: int
     remaining_decoded_bytes: int
     remaining_saved_bytes: int
-    can_reserve_next_attempt: bool
+    plan_allows_next_attempt: bool
     status: str
-    earliest_next_attempt_at: datetime
+    earliest_next_attempt_at: datetime | None
     next_page: PageRequest | None
     next_attempt_number: int | None
     next_allowed_transfer_bytes: int
@@ -1300,9 +1396,12 @@ def budget_snapshot(
 ) -> BudgetSnapshot:
     """Reconstruct counters from an existing journal; resume never starts at zero.
 
-    ``can_reserve_next_attempt`` is true only when ``blocking_reasons`` is
-    empty. A runner must still re-check the plan, approval and rate rules at
-    send time (the journal enforces this on ``attempt_sent``).
+    ``plan_allows_next_attempt`` covers this plan's own budget, validity and
+    waits only; it is true when ``blocking_reasons`` is empty. It says nothing
+    about other plans or processes on the same account: that is the account
+    rate ledger (``assess_account_slot``), and real HTTP permission exists only
+    through ``require_live_acquisition_permission`` (closed in this contract).
+    A runner must re-check both at send time.
     """
 
     if type(journal) is not EvidenceJournal or type(inventory) is not BodyInventory:
@@ -1339,7 +1438,11 @@ def budget_snapshot(
         else "open"
     )
     next_page, next_number, page_problem = state.next_page()
-    earliest = state.earliest_next_attempt_at()
+    try:
+        earliest = state.earliest_next_attempt_at()
+        deadline = state.deadline()
+    except HttpContractError:
+        earliest = deadline = None
     approval = journal.approval
     if status == "completed":
         reasons = ["run_completed"]
@@ -1365,13 +1468,18 @@ def budget_snapshot(
             (remaining_decoded == 0, "decoded_budget_exhausted"),
             (remaining_saved == 0, "saved_budget_exhausted"),
             (page_problem is not None, page_problem),
-            (current < earliest, "rate_limit_wait"),
-            (state.deadline() is not None and earliest >= state.deadline(),
-             "deadline_before_next_allowed_attempt"),
-            (earliest >= plan.expires_at, "plan_expires_before_next_allowed_attempt"),
-            (approval is not None and earliest >= approval.valid_until,
-             "approval_expires_before_next_allowed_attempt"),
+            (earliest is None, "next_attempt_time_unrepresentable"),
         )  # fmt: skip
+        if earliest is not None:
+            checks += (
+                (current < earliest, "rate_limit_wait"),
+                (deadline is not None and earliest >= deadline,
+                 "deadline_before_next_allowed_attempt"),
+                (earliest >= plan.expires_at,
+                 "plan_expires_before_next_allowed_attempt"),
+                (approval is not None and earliest >= approval.valid_until,
+                 "approval_expires_before_next_allowed_attempt"),
+            )  # fmt: skip
         reasons = [reason for blocked, reason in checks if blocked]
     return BudgetSnapshot(
         reserved_attempts=state.reserved,
@@ -1391,7 +1499,7 @@ def budget_snapshot(
         remaining_transfer_bytes=remaining_transfer,
         remaining_decoded_bytes=remaining_decoded,
         remaining_saved_bytes=remaining_saved,
-        can_reserve_next_attempt=not reasons,
+        plan_allows_next_attempt=not reasons,
         status=status,
         earliest_next_attempt_at=earliest,
         next_page=next_page,
@@ -1652,6 +1760,449 @@ def verify_calendar_anchor(
     return anchor
 
 
+# ----------------------------------------------------------- account rate ledger
+
+ACCOUNT_LEDGER_SCHEMA = "historical-feasibility-account-rate-ledger-v1"
+_ACCOUNT_OUTCOMES = frozenset({"response", "429", "5xx", "unknown"})
+
+
+@dataclass(frozen=True)
+class AccountRatePolicy:
+    """Account-wide waits shared by every plan that uses the same account.
+
+    ``slot_lease_seconds`` bounds how long one reserved send slot may stay
+    open; a request must be able to finish (``request_timeout_seconds``)
+    inside it, so a slot reclaimed after the lease can no longer be in flight.
+    """
+
+    min_interval_seconds: int
+    min_wait_after_429_seconds: int
+    min_wait_after_5xx_seconds: int
+    min_wait_after_network_error_seconds: int
+    request_timeout_seconds: int
+    slot_lease_seconds: int
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            _bounded_seconds(value, name, MAX_WAIT_SECONDS)
+        if self.min_interval_seconds < 13 or self.min_wait_after_429_seconds < 120:
+            raise HttpContractError("free_rate_limit_policy_too_weak")
+        if self.slot_lease_seconds < self.request_timeout_seconds:
+            raise HttpContractError("slot_lease_shorter_than_request_timeout")
+
+    def wait_after(self, outcome: str) -> int:
+        specific = {
+            "response": 0,
+            "429": self.min_wait_after_429_seconds,
+            "5xx": self.min_wait_after_5xx_seconds,
+            "unknown": self.min_wait_after_network_error_seconds,
+        }[outcome]
+        return max(self.min_interval_seconds, specific)
+
+    def covers(self, retry: RetryRules) -> bool:
+        """True when this policy is at least as strict as a plan's own rules."""
+
+        return (
+            self.min_interval_seconds >= retry.min_interval_seconds
+            and self.min_wait_after_429_seconds >= retry.min_wait_after_429_seconds
+            and self.min_wait_after_5xx_seconds >= retry.min_wait_after_5xx_seconds
+            and self.min_wait_after_network_error_seconds
+            >= retry.min_wait_after_network_error_seconds
+            and self.request_timeout_seconds >= retry.timeout_seconds
+        )
+
+
+_ACCOUNT_REQUIRED = {
+    "ledger_opened": frozenset({"policy"}),
+    "slot_reserved": frozenset({"slot_id", "plan_sha256", "holder_id"}),
+    "slot_sent": frozenset({"slot_id", "holder_id"}),
+    "slot_settled": frozenset({"slot_id", "holder_id", "outcome"}),
+}
+
+
+@dataclass(frozen=True)
+class AccountRateEvent:
+    """One account-wide slot event; ``slot_id`` is the plan journal's attempt id."""
+
+    kind: str
+    at: datetime
+    policy: AccountRatePolicy | None = None
+    slot_id: str | None = None
+    plan_sha256: str | None = None
+    holder_id: str | None = None
+    outcome: str | None = None
+    retry_after_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _ACCOUNT_REQUIRED:
+            raise HttpContractError("unknown_account_event")
+        _utc(self.at, "event_at")
+        if self.policy is not None and type(self.policy) is not AccountRatePolicy:
+            raise HttpContractError("account_policy_type_invalid")
+        for name in ("slot_id", "plan_sha256"):
+            if getattr(self, name) is not None:
+                _hex(getattr(self, name), name)
+        if self.holder_id is not None:
+            _label(self.holder_id, "holder_id")
+        if self.outcome is not None and self.outcome not in _ACCOUNT_OUTCOMES:
+            raise HttpContractError("account_outcome_invalid")
+        if self.retry_after_seconds is not None:
+            _bounded_seconds(
+                self.retry_after_seconds,
+                "retry_after_seconds",
+                MAX_WAIT_SECONDS,
+                allow_zero=True,
+            )
+        fields = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name not in ("kind", "at")
+        }
+        required = _ACCOUNT_REQUIRED[self.kind]
+        optional = {"retry_after_seconds"} if self.kind == "slot_settled" else set()
+        if any(fields[name] is None for name in required):
+            raise HttpContractError("account_event_missing_required_field")
+        if any(
+            value is not None
+            for name, value in fields.items()
+            if name not in required | optional
+        ):
+            raise HttpContractError("account_event_has_forbidden_field")
+        if self.retry_after_seconds is not None and self.outcome == "unknown":
+            raise HttpContractError("retry_after_requires_a_response")
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "at": _utc(self.at, "event_at"),
+            "policy": asdict(self.policy) if self.policy is not None else None,
+            "slot_id": self.slot_id,
+            "plan_sha256": self.plan_sha256,
+            "holder_id": self.holder_id,
+            "outcome": self.outcome,
+            "retry_after_seconds": self.retry_after_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> AccountRateEvent:
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise HttpContractError("account_event_schema_invalid")
+        raw = dict(value)
+        raw["at"] = _read_utc(raw["at"], "event_at")
+        policy = raw["policy"]
+        if policy is not None:
+            if type(policy) is not dict or set(policy) != set(
+                AccountRatePolicy.__dataclass_fields__
+            ):
+                raise HttpContractError("account_policy_schema_invalid")
+            raw["policy"] = AccountRatePolicy(**policy)
+        return cls(**raw)
+
+
+@dataclass(frozen=True)
+class _Slot:
+    plan_sha256: str
+    holder_id: str
+    reserved_at: datetime
+    sent_at: datetime | None = None
+    outcome: str | None = None
+
+
+class _AccountState:
+    """At most one open send slot per account; waits carry across plans."""
+
+    def __init__(self, account_ref: str) -> None:
+        self.account_ref = account_ref
+        self.policy: AccountRatePolicy | None = None
+        self.opened_at: datetime | None = None
+        self.slots: dict[str, _Slot] = {}
+        self.open_slot: str | None = None
+        self.last_event_at: datetime | None = None
+        self.last_settled_at: datetime | None = None
+        self.last_outcome: str | None = None
+        self.last_retry_after = 0
+
+    def clone(self) -> _AccountState:
+        new = copy.copy(self)
+        new.slots = dict(self.slots)
+        return new
+
+    def earliest_next_slot_at(self) -> datetime:
+        if self.last_settled_at is None:
+            return self.opened_at
+        wait = max(self.policy.wait_after(self.last_outcome), self.last_retry_after)
+        return _add_seconds(self.last_settled_at, wait)
+
+    def lease_end(self, slot: _Slot) -> datetime:
+        return _add_seconds(slot.reserved_at, self.policy.slot_lease_seconds)
+
+    def apply(self, event: AccountRateEvent) -> None:
+        at = event.at.astimezone(UTC)
+        if self.last_event_at is not None and at < self.last_event_at:
+            raise HttpContractError("account_clock_regressed")
+        if event.kind == "ledger_opened":
+            if self.policy is not None or self.last_event_at is not None:
+                raise HttpContractError("account_ledger_reopened")
+            self.policy, self.opened_at = event.policy, at
+        elif self.policy is None:
+            raise HttpContractError("account_ledger_not_opened")
+        else:
+            getattr(self, "_on_" + event.kind)(event, at)
+        self.last_event_at = at
+
+    def _open(self, event: AccountRateEvent) -> _Slot:
+        if event.slot_id != self.open_slot:
+            raise HttpContractError("account_slot_not_open")
+        return self.slots[event.slot_id]
+
+    def _on_slot_reserved(self, event: AccountRateEvent, at: datetime) -> None:
+        if self.open_slot is not None:
+            raise HttpContractError("account_slot_in_use")
+        if event.slot_id in self.slots:
+            raise HttpContractError("account_slot_reused")
+        if at < self.earliest_next_slot_at():
+            raise HttpContractError("account_rate_limit_wait")
+        self.slots[event.slot_id] = _Slot(event.plan_sha256, event.holder_id, at)
+        self.open_slot = event.slot_id
+
+    def _on_slot_sent(self, event: AccountRateEvent, at: datetime) -> None:
+        slot = self._open(event)
+        if event.holder_id != slot.holder_id:
+            raise HttpContractError("account_slot_holder_mismatch")
+        if slot.sent_at is not None:
+            raise HttpContractError("account_slot_already_sent")
+        # The whole request must fit in the lease, so a reclaim never overlaps it.
+        if _add_seconds(at, self.policy.request_timeout_seconds) > self.lease_end(slot):
+            raise HttpContractError("account_slot_lease_too_short_for_send")
+        self.slots[event.slot_id] = replace(slot, sent_at=at)
+
+    def _on_slot_settled(self, event: AccountRateEvent, at: datetime) -> None:
+        slot = self._open(event)
+        if event.holder_id != slot.holder_id:
+            # Another process may reclaim an abandoned slot, only after its lease
+            # and only as an unknown outcome (the request may have been sent).
+            if event.outcome != "unknown":
+                raise HttpContractError("account_slot_holder_mismatch")
+            if at < self.lease_end(slot):
+                raise HttpContractError("account_slot_reclaim_before_lease_expiry")
+        elif event.outcome != "unknown" and slot.sent_at is None:
+            raise HttpContractError("account_slot_outcome_without_send")
+        self.slots[event.slot_id] = replace(slot, outcome=event.outcome)
+        self.open_slot = None
+        self.last_settled_at = at
+        self.last_outcome = event.outcome
+        self.last_retry_after = event.retry_after_seconds or 0
+
+
+class AccountRateLedger:
+    """Account-wide, hash-chained send-slot ledger contract (bytes in, bytes out).
+
+    Every plan that uses the same account shares one ledger, so the waits of
+    one plan (a 429, an unknown outcome, the plain interval) bind the next
+    attempt of any other plan. ``account_ref`` is an owner-chosen label, never
+    a credential; declaring it does not prove which real account a key uses,
+    and the ledger cannot see requests made outside it (other apps, devices).
+    """
+
+    def __init__(self, account_ref: str, data: bytes = b"") -> None:
+        _label(account_ref, "account_ref")
+        if type(data) is not bytes:
+            raise HttpContractError("account_ledger_requires_bytes")
+        if data and not data.endswith(b"\n"):
+            raise HttpContractError("account_ledger_incomplete_final_line")
+        state = _AccountState(account_ref)
+        head, lines = "0" * 64, []
+        for sequence, line in enumerate(data.split(b"\n")[:-1]):
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                raise HttpContractError("account_ledger_invalid_json") from None
+            if type(record) is not dict or set(record) != {
+                "schema",
+                "sequence",
+                "previous_hash",
+                "account_ref",
+                "event",
+                "event_id",
+            }:
+                raise HttpContractError("account_ledger_record_schema_invalid")
+            try:
+                canonical_line = _canonical(record).encode("utf-8")
+            except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+                raise HttpContractError("account_ledger_record_noncanonical") from None
+            if line != canonical_line:
+                raise HttpContractError("account_ledger_record_noncanonical")
+            content = {k: v for k, v in record.items() if k != "event_id"}
+            if (
+                record["schema"] != ACCOUNT_LEDGER_SCHEMA
+                or type(record["sequence"]) is not int
+                or record["sequence"] != sequence
+                or record["previous_hash"] != head
+                or record["event_id"] != _digest(content)
+            ):
+                raise HttpContractError("account_ledger_chain_mismatch")
+            if record["account_ref"] != account_ref:
+                raise HttpContractError("account_ledger_account_mismatch")
+            state.apply(AccountRateEvent.from_dict(record["event"]))
+            lines.append(line + b"\n")
+            head = record["event_id"]
+        self._init(account_ref, tuple(lines), head, len(data), state)
+
+    def _init(self, account_ref, lines, head, size, state) -> None:
+        self.account_ref = account_ref
+        self._lines = lines
+        self.head_hash = head
+        self._byte_count = size
+        self._state = state
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(self._lines)
+
+    @property
+    def event_count(self) -> int:
+        return len(self._lines)
+
+    @property
+    def byte_count(self) -> int:
+        return self._byte_count
+
+    @property
+    def policy(self) -> AccountRatePolicy | None:
+        return self._state.policy
+
+    def append(self, event: AccountRateEvent) -> AccountRateLedger:
+        if type(event) is not AccountRateEvent:
+            raise HttpContractError("account_event_required")
+        content = {
+            "schema": ACCOUNT_LEDGER_SCHEMA,
+            "sequence": self.event_count,
+            "previous_hash": self.head_hash,
+            "account_ref": self.account_ref,
+            "event": event.to_dict(),
+        }
+        record = {**content, "event_id": _digest(content)}
+        line = (_canonical(record) + "\n").encode("utf-8")
+        state = self._state.clone()
+        state.apply(AccountRateEvent.from_dict(json.loads(line)["event"]))
+        new = object.__new__(AccountRateLedger)
+        new._init(
+            self.account_ref,
+            (*self._lines, line),
+            record["event_id"],
+            self._byte_count + len(line),
+            state,
+        )
+        return new
+
+
+def commit_account_ledger(
+    account_ref: str, current: bytes, proposed: bytes
+) -> AccountRateLedger:
+    """Acceptance rule of the shared store's atomic compare-and-append.
+
+    ``proposed`` must be exactly ``current`` plus one valid record. The storage
+    layer (not implemented here) must read ``current`` and write ``proposed``
+    under one exclusive lock; a writer whose view is stale (another process
+    appended first) is refused instead of reserving a slot already taken.
+    """
+
+    if type(current) is not bytes or type(proposed) is not bytes:
+        raise HttpContractError("account_ledger_requires_bytes")
+    AccountRateLedger(account_ref, current)
+    if not proposed.startswith(current) or (
+        proposed.count(b"\n") != current.count(b"\n") + 1
+    ):
+        raise HttpContractError("account_ledger_stale_or_conflicting_commit")
+    return AccountRateLedger(account_ref, proposed)
+
+
+@dataclass(frozen=True)
+class AccountSlotAssessment:
+    """Account-wide rate state only; informational, never a send permission."""
+
+    account_ref: str
+    earliest_next_slot_at: datetime | None
+    blocking_reasons: tuple[str, ...]
+    account_identity_verified: bool = field(default=False, init=False)
+
+    @property
+    def account_allows_next_attempt(self) -> bool:
+        return not self.blocking_reasons
+
+
+def assess_account_slot(
+    ledger: AccountRateLedger, plan: HttpAcquisitionPlan, *, now: datetime
+) -> AccountSlotAssessment:
+    """Whether the shared account state allows a slot now (plan budget excluded)."""
+
+    if type(ledger) is not AccountRateLedger or type(plan) is not HttpAcquisitionPlan:
+        raise HttpContractError("account_ledger_and_plan_required")
+    current = datetime.fromisoformat(_utc(now, "now"))
+    state = ledger._state
+    if state.last_event_at is not None and current < state.last_event_at:
+        raise HttpContractError("account_clock_regressed")
+    reasons, earliest = [], None
+    if ledger.account_ref != plan.account_ref:
+        reasons.append("account_ref_mismatch")
+    if state.policy is None:
+        reasons.append("account_ledger_not_opened")
+    else:
+        if not state.policy.covers(plan.retry):
+            reasons.append("account_policy_weaker_than_plan")
+        try:
+            if state.open_slot is not None:
+                reasons.append("account_slot_in_use")
+                if current >= state.lease_end(state.slots[state.open_slot]):
+                    reasons.append("account_slot_reclaimable_as_unknown")
+            else:
+                earliest = state.earliest_next_slot_at()
+                if current < earliest:
+                    reasons.append("account_rate_limit_wait")
+        except HttpContractError:
+            reasons.append("account_time_not_representable")
+    return AccountSlotAssessment(ledger.account_ref, earliest, tuple(reasons))
+
+
+def _status_outcome(status: int) -> str:
+    return "429" if status == 429 else "5xx" if 500 <= status < 600 else "response"
+
+
+def check_account_plan_consistency(
+    ledger: AccountRateLedger, journal: EvidenceJournal
+) -> None:
+    """Every plan attempt holds an account slot of the same plan, and vice versa.
+
+    A plan attempt must not be reserved before its account slot, and a known
+    HTTP outcome must not contradict the slot's outcome (an account-side
+    ``unknown`` or a still-open slot is conservative and accepted).
+    """
+
+    if type(ledger) is not AccountRateLedger or type(journal) is not EvidenceJournal:
+        raise HttpContractError("account_ledger_and_journal_required")
+    if ledger.account_ref != journal.plan.account_ref:
+        raise HttpContractError("account_ref_mismatch")
+    slots, plan_sha = ledger._state.slots, journal.plan.sha256
+    attempts = journal._state.attempts
+    for attempt_id, attempt in attempts.items():
+        slot = slots.get(attempt_id)
+        if slot is None:
+            raise HttpContractError("account_ledger_missing_plan_attempt")
+        if slot.plan_sha256 != plan_sha:
+            raise HttpContractError("account_slot_plan_mismatch")
+        if slot.reserved_at > attempt.reserved_at:
+            raise HttpContractError("account_slot_reserved_after_plan_attempt")
+        if attempt.status is not None and slot.outcome not in (
+            None,
+            "unknown",
+            _status_outcome(attempt.status),
+        ):
+            raise HttpContractError("account_slot_outcome_mismatch")
+    for slot_id, slot in slots.items():
+        if slot.plan_sha256 == plan_sha and slot_id not in attempts:
+            raise HttpContractError("account_slot_missing_from_plan_journal")
+
+
 # ------------------------------------------------------------------ live gate
 
 
@@ -1679,6 +2230,32 @@ def _code(error: HttpContractError) -> str:
     return str(error)
 
 
+def _account_reasons(plan, verified_journal, account_ledger, now) -> list[str]:
+    """Account-wide rate state; missing or unprovable state never passes."""
+
+    if account_ledger is None:
+        return ["account_rate_state_missing"]
+    if type(account_ledger) is not AccountRateLedger:
+        return ["account_rate_state_required"]
+    try:
+        shared = AccountRateLedger(plan.account_ref, account_ledger.data)
+    except HttpContractError as error:
+        return [f"account_rate_state_invalid:{_code(error)}"]
+    reasons = []
+    if verified_journal is not None:
+        try:
+            check_account_plan_consistency(shared, verified_journal)
+        except HttpContractError as error:
+            reasons.append(f"account_rate_state_inconsistent:{_code(error)}")
+    try:
+        assessment = assess_account_slot(shared, plan, now=now)
+    except HttpContractError as error:
+        reasons.append(f"account_rate_state_invalid:{_code(error)}")
+    else:
+        reasons.extend(f"account_rate_blocked:{r}" for r in assessment.blocking_reasons)
+    return reasons
+
+
 def assess_live_acquisition_gate(
     plan: HttpAcquisitionPlan,
     approval: OwnerApprovalClaim | None,
@@ -1688,6 +2265,7 @@ def assess_live_acquisition_gate(
     *,
     now: datetime,
     calendar_evidence: CalendarDiscoveryEvidence | None = None,
+    account_ledger: AccountRateLedger | None = None,
 ) -> LiveAcquisitionGate:
     """Never authorizes I/O: trusted approval/anchor and HTTP entry do not exist.
 
@@ -1731,9 +2309,10 @@ def assess_live_acquisition_gate(
         except HttpContractError as error:
             reasons.append(f"budget_state_invalid:{_code(error)}")
         else:
-            if not snapshot.can_reserve_next_attempt:
+            if not snapshot.plan_allows_next_attempt:
                 reasons.append("cumulative_budget_unavailable")
                 reasons.extend(f"budget_blocked:{r}" for r in snapshot.blocking_reasons)
+    reasons.extend(_account_reasons(plan, verified, account_ledger, now))
     if plan.kind == "calendar_anchored_daily":
         if calendar_evidence is None:
             reasons.append("calendar_anchor_declared_unverified")
@@ -1746,6 +2325,8 @@ def assess_live_acquisition_gate(
         reasons.append("calendar_source_declared_unverified")
     reasons.extend(
         (
+            "account_identity_unverified",
+            "account_shared_store_not_implemented",
             "owner_approval_authenticity_unverified",
             "independent_receipt_custody_unconfigured",
             "http_transport_not_implemented",
@@ -1763,13 +2344,15 @@ def require_live_acquisition_permission(
     *,
     now: datetime,
     calendar_evidence: CalendarDiscoveryEvidence | None = None,
+    account_ledger: AccountRateLedger | None = None,
 ) -> NoReturn:
     """The only contract entry a future HTTP runner may call before reserving.
 
     It accepts raw evidence of the exact expected types and evaluates it
     itself; a result object (``LiveAcquisitionGate``, ``ApprovalScopeCheck``,
-    ``ReceiptAlignment``, ``CalendarAnchor``) is refused wherever evidence is
-    expected. In this contract PR it always raises ``LiveAcquisitionClosed``.
+    ``ReceiptAlignment``, ``CalendarAnchor``, ``AccountSlotAssessment``) is
+    refused wherever evidence is expected. The account rate ledger is required
+    evidence: without it (or when it is inconsistent) the gate stays closed. In this contract PR it always raises ``LiveAcquisitionClosed``.
     Code running in the same process can still monkeypatch anything; this is a
     contract boundary, not a sandbox.
     """
@@ -1785,6 +2368,7 @@ def require_live_acquisition_permission(
         (approval, OwnerApprovalClaim),
         (receipt, ExternalReceiptClaim),
         (calendar_evidence, CalendarDiscoveryEvidence),
+        (account_ledger, AccountRateLedger),
     ):
         if value is not None and type(value) is not expected:
             raise HttpContractError("raw_evidence_required")
@@ -1796,5 +2380,6 @@ def require_live_acquisition_permission(
         receipt,
         now=now,
         calendar_evidence=calendar_evidence,
+        account_ledger=account_ledger,
     )
     raise LiveAcquisitionClosed(gate.reasons)

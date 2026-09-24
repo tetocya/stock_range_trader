@@ -212,12 +212,21 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
   Calendarの取得結果から既存Daily planの対象日・予算を自動生成・拡張する関数はない。
 
 各planはR、対象日付、Calendar出典の参照先とhash、endpoint、逐次ページ送り、最大試行・ページ・時間、転送／展開／保存容量、
-1ページ上限、Retry規則、専用出力先、成果物ID、有効期間を正規化JSONのSHA-256で固定する。
-重複日付・不正な型・曖昧なtimezone・指定root外を拒否する。日付順序や同じ瞬間のtimezone表記差は
+1ページ上限、Retry規則、使用するアカウントの識別ラベル（`account_ref`）、専用出力先、成果物ID、有効期間を
+正規化JSONのSHA-256で固定する。
+重複日付・不正な型・曖昧なtimezone・指定root外を拒否する。待機・timeout・Retry-Afterは1日（86400秒）、
+累積時間は366日を上限とし、有効期間の終わりにそれらを足した時刻が表現できないplanも拒否する。日付順序や同じ瞬間のtimezone表記差は
 同じhashとなる。出力識別子はこのcheckoutの `outputs/feasibility/http/<artifact_id>` に限定するが、
 これは**契約時のパス照合だけ**であり、ファイルの安全な作成は次PRの課題である（plan hashにはこのcheckoutの
 絶対パスが入るため、別checkoutでは別hashになる）。
 6月試験worktree、`.delayed_replay`、既存DB・台帳・承認ファイルは今回の出力対象にならない。
+
+**取得範囲の固定。** planは作成時に対象query・位置・endpoint・hashを一度だけ導出し、変更できない値
+（タプルと読み取り専用の対応表）として保持する。入力の日付は変更できないタプルだけを受け付ける。
+台帳は開くたびにplanのフィールドから範囲とhashを再導出して保持値と照合し（不一致は `plan_fixed_scope_inconsistent`）、
+以後の予約・resume・完了判定はすべてこの照合済みの範囲で行う。範囲外の予約は `page_outside_fixed_plan` で拒否し、
+台帳・予算の状態は変わらない。同一プロセス内で `object.__setattr__` 等により意図的に改変されたplanは、
+台帳を開く時点で検出するが、それ以外の実行時改変（monkeypatch等）までは防がない。
 
 ### 承認の識別と台帳・receiptへの束縛
 
@@ -244,13 +253,43 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 応答はplanの `timeout_seconds` 以内、かつ累積deadline以内でなければ記録できない（それを超えたら結果不明として記録する）。
 
 `budget_snapshot()` は `earliest_next_attempt_at`、次に予約すべきページと試行番号、試行ごとの許容量、
-機械可読な `blocking_reasons` を返す。`can_reserve_next_attempt` は理由が空のときだけ真で、評価時刻が
-`earliest_next_attempt_at` より前なら `rate_limit_wait` となる。待機明けの時刻がplan・承認の期限や累積deadline以降なら
-それぞれ `*_before_next_allowed_attempt` を返す。時計の逆行・timezoneなしの時刻は拒否する。
+機械可読な `blocking_reasons` を返す。`plan_allows_next_attempt` は**このplan内の**予算・期間・待機だけを表し、
+理由が空のときだけ真になる（旧名 `can_reserve_next_attempt` は、アカウント全体の送信許可と誤読されないよう廃止）。
+評価時刻が `earliest_next_attempt_at` より前なら `rate_limit_wait`、待機明けの時刻がplan・承認の期限や累積deadline以降なら
+それぞれ `*_before_next_allowed_attempt` を返す。時計の逆行・timezoneなしの時刻は拒否し、表現できない次回時刻は
+例外ではなく `next_attempt_time_unrepresentable` として返す。
 
-実HTTP送信では、契約上の予約に加えて**送信直前にも**これらの制限を検査する必要がある（台帳は `attempt_sent`
-で期間とdeadlineを再検査する）。ローカルの間隔制御は、同一アカウントを使う別プロセス・別端末の要求数を
-制御できない。アカウントの排他運用は所有者の運用判断として別に確定する。
+### アカウント単位の共有rate limit
+
+同じアカウントへの要求制限は、CalendarとDailyのようにplanが分かれていても共有される。そのためplan内台帳とは別に、
+アカウントごとの共有台帳 `AccountRateLedger`（hash鎖、schema `historical-feasibility-account-rate-ledger-v1`）を定める。
+
+- 記録: アカウントの識別ラベル、アカウント共通の待機規則（`AccountRatePolicy`）、試行ID（plan台帳の試行IDと同じ）、
+  対応するplan hash、送信枠の保持者ID、予約・送信・確定の時刻、結果（`response`／`429`／`5xx`／`unknown`）とRetry-After、
+  各記録の連番・直前hash・記録hash。APIキーは識別子にも台帳にも保存しない。
+- 送信枠は**アカウント全体で同時に1つ**だけで、確定前に別planが予約することはできない（`account_slot_in_use`）。
+  次の予約は、直前に確定した枠（どのplanでも）から `max(規則の間隔, 結果別の待機, Retry-After)` を待つ（`account_rate_limit_wait`）。
+  アカウント規則は各planの規則以上に厳しくなければならない（`account_policy_weaker_than_plan`）。
+- 保持者が停止して枠が未確定のまま残った場合、別の保持者は枠のlease（`slot_lease_seconds`）が切れた後にだけ、
+  結果不明として回収できる。送信はlease内にtimeoutまで収まる時刻でなければ記録できないため、回収後に元の要求が
+  通信中であることはない。結果不明は通信失敗の待機で保守的に扱う。
+- 更新は「現在の内容に正確に1記録を足したものだけを受け入れる」比較付き追記（`commit_account_ledger`）とする。
+  古い内容に基づく追記・複数記録の同時追記は拒否されるため、並行する実行プロセスが同じ送信枠を予約できない。
+  実際の排他ロック・原子的な読込みと書込みは保存PRで実装する。
+- `check_account_plan_consistency()` は、plan台帳の各試行に同じplan hashの送信枠があり、試行が枠より前に予約されておらず、
+  判明したHTTP結果が枠の結果と矛盾しないこと、そのplanの枠がplan台帳にすべてあることを照合する。
+- `assess_account_slot()` の `account_allows_next_attempt` はアカウント全体の状態だけを表す。plan内の可否とは別の状態であり、
+  実HTTP送信の可否は `require_live_acquisition_permission()` だけが扱う（今回は常に閉じる）。
+
+Gateはアカウント台帳を必須の証拠とし、欠落（`account_rate_state_missing`）、改変・不正（`account_rate_state_invalid:<code>`）、
+plan台帳との不整合・古い内容（`account_rate_state_inconsistent:<code>`）、待機中・枠使用中（`account_rate_blocked:<code>`）を
+理由として返す。さらに `account_identity_unverified`（ラベルと実際の認証アカウントの一致は証明されない）と
+`account_shared_store_not_implemented`（共有台帳の永続化・排他ロックは未実装）を常に返す。
+
+実HTTP送信では、契約上の予約に加えて**送信直前にも**plan台帳とアカウント台帳の両方の制限を検査する必要がある
+（plan台帳は `attempt_sent` で期間とdeadlineを、アカウント台帳は `slot_sent` でleaseを再検査する）。
+アカウント台帳が把握できるのは、この台帳を通した要求だけである。同じアカウントを使う外部アプリ・別端末・
+台帳を使わない別プロセスの要求は検出できないため、アカウントの排他運用は所有者の運用判断として別に確定する。
 
 ### 試行ごとの許容量と累積予算
 
@@ -281,8 +320,9 @@ receipt照合が示すのは、入力された台帳・原本一覧・承認clai
 （例: `budget_state_invalid:<code>`、`journal_invalid:<code>`）として返す。
 
 `LiveAcquisitionGate.permitted`、`ApprovalScopeCheck.authenticity_verified`、`ReceiptAlignment.independent_custody_verified`、
-`CalendarAnchor.independent_custody_verified` は呼出側が設定できない（常に `False`）。将来のHTTP実行入口は
-`require_live_acquisition_permission()` だけを予約前に呼び、生の証拠（plan、承認claim、台帳、原本一覧、receipt、Calendar証拠）を
+`CalendarAnchor.independent_custody_verified`、`AccountSlotAssessment.account_identity_verified` は
+呼出側が設定できない（常に `False`）。将来のHTTP実行入口は `require_live_acquisition_permission()` だけを予約前に呼び、
+生の証拠（plan、承認claim、台帳、原本一覧、receipt、Calendar証拠、アカウント台帳）を
 渡して、その場で評価させなければならない。結果オブジェクトを許可の証拠として受け取らない（型が違えば
 `raw_evidence_required`）。この入口は今回常に `LiveAcquisitionClosed` を送出する。同一プロセス内のmonkeypatch等は防がない。
 
@@ -290,17 +330,20 @@ receipt照合が示すのは、入力された台帳・原本一覧・承認clai
 
 台帳を開く・resumeするときは全行を検証し、`append` は検証済みの状態の複製に新しいイベントだけを適用する
 （両者が同じbytes・状態になることをテストで確認）。人工測定（2510イベント・約2 MB）で、append全体0.15秒、
-全件検証0.07秒。5010イベントで0.41秒・0.14秒。appendは状態の複製とタプル連結のため件数に比例してわずかに遅くなる。
+全件検証0.07秒。5010イベントで0.40秒・0.14秒。appendは状態の複製とタプル連結のため件数に比例してわずかに遅くなる。
+アカウント台帳は1507イベントでappend全体0.04秒・全件検証0.02秒、plan台帳との照合は1ミリ秒未満（いずれも人工測定）。
 
 ### 次PRと所有者判断
 
 HTTP・保存PRで、実通信の総deadline、送信直前の制限の再検査、暗黙Retry無効化、本文の逐次・圧縮前後容量と
-許容量での打切り、実ファイルと台帳の照合、fd相対I/O、クラッシュ後の安全な再開、Calendar原本の実取得と保存を実装・検証する。
+許容量での打切り、実ファイルと台帳の照合、fd相対I/O、クラッシュ後の安全な再開、Calendar原本の実取得と保存、
+アカウント台帳の永続化・排他ロック・原子的な比較付き追記を実装・検証する。
 J-Quantsの公式レート制限はFree 5回／分のsliding windowで、429には通常 `Retry-After` が付かず、
 公式は少なくとも1分（確実性のため約2分）の待機を案内する。契約値としては13秒間隔と429後120秒を
 下限にしたが、**今回のコードは待機・timeoutを実行しない**（台帳が時刻の規則を検査するだけ）。
 
 所有者はR・対象営業日集合・各予算、承認の独立した真正性検証方式、外部receiptの保管先・署名方式・
-固定頻度、実出力rootの運用、同一アカウントの排他運用を別途確定する必要がある。
+固定頻度、実出力rootの運用、アカウントの識別ラベルとアカウント規則、実アカウントとの対応を確かめる方法、
+同一アカウントの排他運用（外部アプリ・別端末を使わない運用を含む）を別途確定する必要がある。
 契約の人工テストは `python -m pytest -q tests/test_feasibility_http_contract.py` で再実行できる。
 この結果を実アカウント権限、実HTTP接続、市場データ、正式Real OOSの検証成功として扱わない。
