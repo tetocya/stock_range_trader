@@ -801,6 +801,8 @@ class _Attempt:
     sent_at: datetime | None = None
     status: int | None = None
     body_sha256: str | None = None
+    settled_at: datetime | None = None  # response observed or outcome declared unknown
+    retry_after: int | None = None  # Retry-After observed on the response
 
 
 class _JournalState:
@@ -1061,7 +1063,13 @@ class _JournalState:
             state = "responded"
         else:
             state = "failed" if transient else "nonretryable"
-        self.attempts[event.attempt_id] = replace(attempt, state=state, status=status)
+        self.attempts[event.attempt_id] = replace(
+            attempt,
+            state=state,
+            status=status,
+            settled_at=at,
+            retry_after=event.retry_after_seconds,
+        )
         self.responses += 1
         self.http_429 += status == 429
         self.last_network_at = at
@@ -1076,7 +1084,9 @@ class _JournalState:
         attempt = self._attempt(event)
         if attempt.state not in ("reserved", "sent"):
             raise HttpContractError("unknown_outcome_order_invalid")
-        self.attempts[event.attempt_id] = replace(attempt, state="unknown")
+        self.attempts[event.attempt_id] = replace(
+            attempt, state="unknown", settled_at=at
+        )
         self.unknown += 1
         self.open_attempt = None
         self.last_network_at = at
@@ -1816,13 +1826,21 @@ _ACCOUNT_REQUIRED = {
     "ledger_opened": frozenset({"policy"}),
     "slot_reserved": frozenset({"slot_id", "plan_sha256", "holder_id"}),
     "slot_sent": frozenset({"slot_id", "holder_id"}),
-    "slot_settled": frozenset({"slot_id", "holder_id", "outcome"}),
+    "slot_settled": frozenset(
+        {"slot_id", "holder_id", "outcome", "effective_wait_seconds"}
+    ),
 }
 
 
 @dataclass(frozen=True)
 class AccountRateEvent:
-    """One account-wide slot event; ``slot_id`` is the plan journal's attempt id."""
+    """One account-wide slot event; ``slot_id`` is the plan journal's attempt id.
+
+    On ``slot_settled``, ``observed_retry_after_seconds`` is the value seen on
+    the HTTP response (copied unchanged from the plan journal) and
+    ``effective_wait_seconds`` is the wait the account applies after this slot;
+    the latter may be longer than any rule, but never shorter.
+    """
 
     kind: str
     at: datetime
@@ -1831,7 +1849,8 @@ class AccountRateEvent:
     plan_sha256: str | None = None
     holder_id: str | None = None
     outcome: str | None = None
-    retry_after_seconds: int | None = None
+    observed_retry_after_seconds: int | None = None
+    effective_wait_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _ACCOUNT_REQUIRED:
@@ -1846,12 +1865,16 @@ class AccountRateEvent:
             _label(self.holder_id, "holder_id")
         if self.outcome is not None and self.outcome not in _ACCOUNT_OUTCOMES:
             raise HttpContractError("account_outcome_invalid")
-        if self.retry_after_seconds is not None:
+        if self.observed_retry_after_seconds is not None:
             _bounded_seconds(
-                self.retry_after_seconds,
+                self.observed_retry_after_seconds,
                 "retry_after_seconds",
                 MAX_WAIT_SECONDS,
                 allow_zero=True,
+            )
+        if self.effective_wait_seconds is not None:
+            _bounded_seconds(
+                self.effective_wait_seconds, "effective_wait_seconds", MAX_WAIT_SECONDS
             )
         fields = {
             name: getattr(self, name)
@@ -1859,7 +1882,9 @@ class AccountRateEvent:
             if name not in ("kind", "at")
         }
         required = _ACCOUNT_REQUIRED[self.kind]
-        optional = {"retry_after_seconds"} if self.kind == "slot_settled" else set()
+        optional = (
+            {"observed_retry_after_seconds"} if self.kind == "slot_settled" else set()
+        )
         if any(fields[name] is None for name in required):
             raise HttpContractError("account_event_missing_required_field")
         if any(
@@ -1868,7 +1893,7 @@ class AccountRateEvent:
             if name not in required | optional
         ):
             raise HttpContractError("account_event_has_forbidden_field")
-        if self.retry_after_seconds is not None and self.outcome == "unknown":
+        if self.observed_retry_after_seconds is not None and self.outcome == "unknown":
             raise HttpContractError("retry_after_requires_a_response")
 
     def to_dict(self) -> dict:
@@ -1880,7 +1905,8 @@ class AccountRateEvent:
             "plan_sha256": self.plan_sha256,
             "holder_id": self.holder_id,
             "outcome": self.outcome,
-            "retry_after_seconds": self.retry_after_seconds,
+            "observed_retry_after_seconds": self.observed_retry_after_seconds,
+            "effective_wait_seconds": self.effective_wait_seconds,
         }
 
     @classmethod
@@ -1906,6 +1932,9 @@ class _Slot:
     reserved_at: datetime
     sent_at: datetime | None = None
     outcome: str | None = None
+    settled_at: datetime | None = None
+    observed_retry_after: int | None = None
+    effective_wait: int | None = None
 
 
 class _AccountState:
@@ -1919,8 +1948,7 @@ class _AccountState:
         self.open_slot: str | None = None
         self.last_event_at: datetime | None = None
         self.last_settled_at: datetime | None = None
-        self.last_outcome: str | None = None
-        self.last_retry_after = 0
+        self.last_effective_wait = 0
 
     def clone(self) -> _AccountState:
         new = copy.copy(self)
@@ -1930,8 +1958,7 @@ class _AccountState:
     def earliest_next_slot_at(self) -> datetime:
         if self.last_settled_at is None:
             return self.opened_at
-        wait = max(self.policy.wait_after(self.last_outcome), self.last_retry_after)
-        return _add_seconds(self.last_settled_at, wait)
+        return _add_seconds(self.last_settled_at, self.last_effective_wait)
 
     def lease_end(self, slot: _Slot) -> datetime:
         return _add_seconds(slot.reserved_at, self.policy.slot_lease_seconds)
@@ -1987,11 +2014,22 @@ class _AccountState:
                 raise HttpContractError("account_slot_reclaim_before_lease_expiry")
         elif event.outcome != "unknown" and slot.sent_at is None:
             raise HttpContractError("account_slot_outcome_without_send")
-        self.slots[event.slot_id] = replace(slot, outcome=event.outcome)
+        required = max(
+            self.policy.wait_after(event.outcome),
+            event.observed_retry_after_seconds or 0,
+        )
+        if event.effective_wait_seconds < required:
+            raise HttpContractError("account_effective_wait_below_rule")
+        self.slots[event.slot_id] = replace(
+            slot,
+            outcome=event.outcome,
+            settled_at=at,
+            observed_retry_after=event.observed_retry_after_seconds,
+            effective_wait=event.effective_wait_seconds,
+        )
         self.open_slot = None
         self.last_settled_at = at
-        self.last_outcome = event.outcome
-        self.last_retry_after = event.retry_after_seconds or 0
+        self.last_effective_wait = event.effective_wait_seconds
 
 
 class AccountRateLedger:
@@ -2117,6 +2155,145 @@ def commit_account_ledger(
     return AccountRateLedger(account_ref, proposed)
 
 
+def _status_outcome(status: int) -> str:
+    return "429" if status == 429 else "5xx" if 500 <= status < 600 else "response"
+
+
+def _plan_rule_wait(retry: RetryRules, outcome: str) -> int:
+    specific = {
+        "response": 0,
+        "429": retry.min_wait_after_429_seconds,
+        "5xx": retry.min_wait_after_5xx_seconds,
+        "unknown": retry.min_wait_after_network_error_seconds,
+    }[outcome]
+    return max(retry.min_interval_seconds, specific)
+
+
+@dataclass(frozen=True)
+class LedgerReconciliation:
+    """Informational comparison of one plan journal with the account ledger.
+
+    ``consistent``: both ledgers describe the same attempts and results.
+    ``pending``: a crash left exactly one side behind; the missing record is
+    fixed by the other side's evidence and must be appended before any new
+    slot. ``inconsistent``: a contradiction that is never repaired
+    automatically. Only ``consistent`` lets the account state be used.
+    """
+
+    plan_sha256: str
+    status: str
+    issues: tuple[str, ...]
+
+
+def reconcile_account_and_plan(
+    ledger: AccountRateLedger, journal: EvidenceJournal
+) -> LedgerReconciliation:
+    """Match every attempt of the plan with its account slot (same plan, same id).
+
+    Write protocol per attempt: account ``slot_reserved`` -> plan
+    ``attempt_reserved`` -> plan ``attempt_sent`` -> account ``slot_sent`` ->
+    HTTP request -> plan result -> account ``slot_settled`` copying the plan's
+    outcome and observed Retry-After. Times are checked for causal order only
+    (a send cannot follow the observed response; a result cannot be settled
+    before it was observed); append times may differ.
+    """
+
+    if type(ledger) is not AccountRateLedger or type(journal) is not EvidenceJournal:
+        raise HttpContractError("account_ledger_and_journal_required")
+    plan = journal.plan
+    bad: list[str] = []
+    pending: list[str] = []
+    state = ledger._state
+    if ledger.account_ref != plan.account_ref:
+        bad.append("account_ref_mismatch")
+    if state.policy is None:
+        bad.append("account_ledger_not_opened")
+    attempts, slots = journal._state.attempts, state.slots
+    for attempt_id, attempt in attempts.items():
+        slot = slots.get(attempt_id)
+        if slot is None:
+            bad.append("account_ledger_missing_plan_attempt")
+        elif slot.plan_sha256 != plan.sha256:
+            bad.append("account_slot_plan_mismatch")
+        elif state.policy is not None:
+            _pair_attempt_and_slot(plan, state, attempt, slot, bad, pending)
+    for slot_id, slot in slots.items():
+        if slot.plan_sha256 != plan.sha256 or slot_id in attempts:
+            continue
+        # Stopped after the account reservation, before the plan recorded it.
+        if slot.sent_at is not None:
+            bad.append("account_sent_without_plan_attempt")
+        elif slot.outcome is None:
+            pending.append("pending_plan_attempt_record")
+        # Settled as unknown without a send: an abandoned reservation (consistent).
+    issues = tuple(dict.fromkeys(bad + pending))
+    status = "inconsistent" if bad else "pending" if pending else "consistent"
+    return LedgerReconciliation(plan.sha256, status, issues)
+
+
+def _pair_attempt_and_slot(plan, state, attempt, slot, bad, pending) -> None:
+    if slot.reserved_at > attempt.reserved_at:
+        bad.append("account_slot_reserved_after_plan_attempt")
+    if slot.sent_at is not None and (
+        attempt.sent_at is None or slot.sent_at < attempt.sent_at
+    ):
+        bad.append("account_sent_before_plan_send")
+    lease_end = state.lease_end(slot)
+    if attempt.status is not None:  # the plan observed an HTTP response
+        outcome = _status_outcome(attempt.status)
+        if slot.sent_at is None:
+            bad.append("plan_result_without_account_send")
+        elif slot.sent_at > attempt.settled_at:
+            bad.append("account_send_after_plan_response")
+        if attempt.settled_at > lease_end:
+            bad.append("plan_result_after_account_lease")
+        if slot.outcome is None:
+            pending.append("pending_account_settlement")
+            return
+        if slot.outcome != outcome:
+            bad.append("account_slot_outcome_mismatch")
+            return
+        if slot.observed_retry_after != attempt.retry_after:
+            bad.append("account_retry_after_mismatch")
+        if slot.settled_at < attempt.settled_at:
+            bad.append("account_settled_before_plan_result")
+        required = max(
+            _plan_rule_wait(plan.retry, outcome),
+            state.policy.wait_after(outcome),
+            attempt.retry_after or 0,
+        )
+    elif attempt.state == "unknown":
+        if slot.outcome is None:
+            pending.append("pending_account_settlement")
+            return
+        if slot.outcome != "unknown":
+            bad.append("account_result_contradicts_plan_unknown")
+            return
+        required = max(
+            _plan_rule_wait(plan.retry, "unknown"), state.policy.wait_after("unknown")
+        )
+    else:  # the plan attempt is still open (reserved or sent)
+        if slot.outcome is None:
+            pending.append("pending_settlement_on_both_ledgers")
+        elif slot.outcome != "unknown":
+            bad.append("account_result_without_plan_result")
+        else:
+            pending.append("pending_plan_settlement")  # e.g. slot reclaimed
+        return
+    if slot.effective_wait < required:
+        bad.append("account_effective_wait_below_plan_rule")
+
+
+def check_account_plan_consistency(
+    ledger: AccountRateLedger, journal: EvidenceJournal
+) -> None:
+    """Raise unless the two ledgers are fully consistent (pending also raises)."""
+
+    result = reconcile_account_and_plan(ledger, journal)
+    if result.status != "consistent":
+        raise HttpContractError(result.issues[0])
+
+
 @dataclass(frozen=True)
 class AccountSlotAssessment:
     """Account-wide rate state only; informational, never a send permission."""
@@ -2132,12 +2309,27 @@ class AccountSlotAssessment:
 
 
 def assess_account_slot(
-    ledger: AccountRateLedger, plan: HttpAcquisitionPlan, *, now: datetime
+    ledger: AccountRateLedger,
+    plan: HttpAcquisitionPlan,
+    *,
+    now: datetime,
+    plan_journals: tuple[EvidenceJournal, ...],
 ) -> AccountSlotAssessment:
-    """Whether the shared account state allows a slot now (plan budget excluded)."""
+    """Whether the shared account state allows a slot now (plan budget excluded).
+
+    ``plan_journals`` must contain the journal of every plan that holds a slot
+    in the ledger. Each is reconciled with the ledger; a missing journal, a
+    pending crash state or an inconsistency blocks every plan on the account,
+    so a known result of one plan can never be skipped by looking only at the
+    ledger's latest event.
+    """
 
     if type(ledger) is not AccountRateLedger or type(plan) is not HttpAcquisitionPlan:
         raise HttpContractError("account_ledger_and_plan_required")
+    if type(plan_journals) is not tuple or any(
+        type(journal) is not EvidenceJournal for journal in plan_journals
+    ):
+        raise HttpContractError("plan_journals_must_be_a_tuple_of_journals")
     current = datetime.fromisoformat(_utc(now, "now"))
     state = ledger._state
     if state.last_event_at is not None and current < state.last_event_at:
@@ -2145,6 +2337,22 @@ def assess_account_slot(
     reasons, earliest = [], None
     if ledger.account_ref != plan.account_ref:
         reasons.append("account_ref_mismatch")
+    by_plan: dict[str, EvidenceJournal] = {}
+    for journal in plan_journals:
+        if journal.plan.sha256 in by_plan:
+            reasons.append("duplicate_plan_journal")
+        by_plan[journal.plan.sha256] = journal
+    # Every plan with a slot, and every supplied journal (its attempts must all
+    # hold slots: a stale or truncated account ledger is not a clean state).
+    referenced = [slot.plan_sha256 for slot in state.slots.values()]
+    for plan_sha in dict.fromkeys([*referenced, *by_plan]):
+        journal = by_plan.get(plan_sha)
+        if journal is None:
+            reasons.append("account_plan_journal_missing")
+            continue
+        result = reconcile_account_and_plan(ledger, journal)
+        if result.status != "consistent":
+            reasons.extend(f"account_ledger_{result.status}:{i}" for i in result.issues)
     if state.policy is None:
         reasons.append("account_ledger_not_opened")
     else:
@@ -2161,46 +2369,9 @@ def assess_account_slot(
                     reasons.append("account_rate_limit_wait")
         except HttpContractError:
             reasons.append("account_time_not_representable")
-    return AccountSlotAssessment(ledger.account_ref, earliest, tuple(reasons))
-
-
-def _status_outcome(status: int) -> str:
-    return "429" if status == 429 else "5xx" if 500 <= status < 600 else "response"
-
-
-def check_account_plan_consistency(
-    ledger: AccountRateLedger, journal: EvidenceJournal
-) -> None:
-    """Every plan attempt holds an account slot of the same plan, and vice versa.
-
-    A plan attempt must not be reserved before its account slot, and a known
-    HTTP outcome must not contradict the slot's outcome (an account-side
-    ``unknown`` or a still-open slot is conservative and accepted).
-    """
-
-    if type(ledger) is not AccountRateLedger or type(journal) is not EvidenceJournal:
-        raise HttpContractError("account_ledger_and_journal_required")
-    if ledger.account_ref != journal.plan.account_ref:
-        raise HttpContractError("account_ref_mismatch")
-    slots, plan_sha = ledger._state.slots, journal.plan.sha256
-    attempts = journal._state.attempts
-    for attempt_id, attempt in attempts.items():
-        slot = slots.get(attempt_id)
-        if slot is None:
-            raise HttpContractError("account_ledger_missing_plan_attempt")
-        if slot.plan_sha256 != plan_sha:
-            raise HttpContractError("account_slot_plan_mismatch")
-        if slot.reserved_at > attempt.reserved_at:
-            raise HttpContractError("account_slot_reserved_after_plan_attempt")
-        if attempt.status is not None and slot.outcome not in (
-            None,
-            "unknown",
-            _status_outcome(attempt.status),
-        ):
-            raise HttpContractError("account_slot_outcome_mismatch")
-    for slot_id, slot in slots.items():
-        if slot.plan_sha256 == plan_sha and slot_id not in attempts:
-            raise HttpContractError("account_slot_missing_from_plan_journal")
+    return AccountSlotAssessment(
+        ledger.account_ref, earliest, tuple(dict.fromkeys(reasons))
+    )
 
 
 # ------------------------------------------------------------------ live gate
@@ -2230,8 +2401,10 @@ def _code(error: HttpContractError) -> str:
     return str(error)
 
 
-def _account_reasons(plan, verified_journal, account_ledger, now) -> list[str]:
-    """Account-wide rate state; missing or unprovable state never passes."""
+def _account_reasons(
+    plan, verified_journal, account_ledger, related_journals, now
+) -> list[str]:
+    """Account-wide rate state; missing, pending or unprovable state never passes."""
 
     if account_ledger is None:
         return ["account_rate_state_missing"]
@@ -2241,14 +2414,26 @@ def _account_reasons(plan, verified_journal, account_ledger, now) -> list[str]:
         shared = AccountRateLedger(plan.account_ref, account_ledger.data)
     except HttpContractError as error:
         return [f"account_rate_state_invalid:{_code(error)}"]
-    reasons = []
+    reasons, journals = [], []
     if verified_journal is not None:
-        try:
-            check_account_plan_consistency(shared, verified_journal)
+        journals.append(verified_journal)
+    if type(related_journals) is not tuple:
+        reasons.append("related_journals_must_be_a_tuple")
+        related_journals = ()
+    for related in related_journals:
+        if type(related) is not EvidenceJournal:
+            reasons.append("related_journal_required")
+            continue
+        try:  # re-opened from its bytes under its own plan and approval
+            journals.append(
+                EvidenceJournal(related.plan, related.data, approval=related.approval)
+            )
         except HttpContractError as error:
-            reasons.append(f"account_rate_state_inconsistent:{_code(error)}")
+            reasons.append(f"related_journal_invalid:{_code(error)}")
     try:
-        assessment = assess_account_slot(shared, plan, now=now)
+        assessment = assess_account_slot(
+            shared, plan, now=now, plan_journals=tuple(journals)
+        )
     except HttpContractError as error:
         reasons.append(f"account_rate_state_invalid:{_code(error)}")
     else:
@@ -2266,6 +2451,7 @@ def assess_live_acquisition_gate(
     now: datetime,
     calendar_evidence: CalendarDiscoveryEvidence | None = None,
     account_ledger: AccountRateLedger | None = None,
+    related_journals: tuple[EvidenceJournal, ...] = (),
 ) -> LiveAcquisitionGate:
     """Never authorizes I/O: trusted approval/anchor and HTTP entry do not exist.
 
@@ -2312,7 +2498,9 @@ def assess_live_acquisition_gate(
             if not snapshot.plan_allows_next_attempt:
                 reasons.append("cumulative_budget_unavailable")
                 reasons.extend(f"budget_blocked:{r}" for r in snapshot.blocking_reasons)
-    reasons.extend(_account_reasons(plan, verified, account_ledger, now))
+    reasons.extend(
+        _account_reasons(plan, verified, account_ledger, related_journals, now)
+    )
     if plan.kind == "calendar_anchored_daily":
         if calendar_evidence is None:
             reasons.append("calendar_anchor_declared_unverified")
@@ -2345,6 +2533,7 @@ def require_live_acquisition_permission(
     now: datetime,
     calendar_evidence: CalendarDiscoveryEvidence | None = None,
     account_ledger: AccountRateLedger | None = None,
+    related_journals: tuple[EvidenceJournal, ...] = (),
 ) -> NoReturn:
     """The only contract entry a future HTTP runner may call before reserving.
 
@@ -2352,7 +2541,10 @@ def require_live_acquisition_permission(
     itself; a result object (``LiveAcquisitionGate``, ``ApprovalScopeCheck``,
     ``ReceiptAlignment``, ``CalendarAnchor``, ``AccountSlotAssessment``) is
     refused wherever evidence is expected. The account rate ledger is required
-    evidence: without it (or when it is inconsistent) the gate stays closed. In this contract PR it always raises ``LiveAcquisitionClosed``.
+    evidence, together with the journal of every other plan that holds a slot
+    in it (``related_journals``); without them, or when any pair is pending or
+    inconsistent, the gate stays closed. In this contract PR it always raises
+    ``LiveAcquisitionClosed``.
     Code running in the same process can still monkeypatch anything; this is a
     contract boundary, not a sandbox.
     """
@@ -2372,6 +2564,10 @@ def require_live_acquisition_permission(
     ):
         if value is not None and type(value) is not expected:
             raise HttpContractError("raw_evidence_required")
+    if type(related_journals) is not tuple or any(
+        type(related) is not EvidenceJournal for related in related_journals
+    ):
+        raise HttpContractError("raw_evidence_required")
     gate = assess_live_acquisition_gate(
         plan,
         approval,
@@ -2381,5 +2577,6 @@ def require_live_acquisition_permission(
         now=now,
         calendar_evidence=calendar_evidence,
         account_ledger=account_ledger,
+        related_journals=related_journals,
     )
     raise LiveAcquisitionClosed(gate.reasons)

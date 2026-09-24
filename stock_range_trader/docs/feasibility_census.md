@@ -264,27 +264,85 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 同じアカウントへの要求制限は、CalendarとDailyのようにplanが分かれていても共有される。そのためplan内台帳とは別に、
 アカウントごとの共有台帳 `AccountRateLedger`（hash鎖、schema `historical-feasibility-account-rate-ledger-v1`）を定める。
 
-- 記録: アカウントの識別ラベル、アカウント共通の待機規則（`AccountRatePolicy`）、試行ID（plan台帳の試行IDと同じ）、
-  対応するplan hash、送信枠の保持者ID、予約・送信・確定の時刻、結果（`response`／`429`／`5xx`／`unknown`）とRetry-After、
+- 記録: アカウントの識別ラベル、アカウント共通の待機規則（`AccountRatePolicy`）、送信枠ID（plan台帳の試行IDと同じ）、
+  対応するplan hash、送信枠の保持者ID、予約・送信・確定の時刻、結果（`response`／`429`／`5xx`／`unknown`）、
+  応答で観測したRetry-After（`observed_retry_after_seconds`）、アカウントが適用する実効待機（`effective_wait_seconds`）、
   各記録の連番・直前hash・記録hash。APIキーは識別子にも台帳にも保存しない。
 - 送信枠は**アカウント全体で同時に1つ**だけで、確定前に別planが予約することはできない（`account_slot_in_use`）。
-  次の予約は、直前に確定した枠（どのplanでも）から `max(規則の間隔, 結果別の待機, Retry-After)` を待つ（`account_rate_limit_wait`）。
+  次の予約は、直前に確定した枠（どのplanでも）の確定時刻から実効待機を経過した後だけ（`account_rate_limit_wait`）。
+- 観測したRetry-Afterと実効待機は別の値である。観測値はplan台帳の値をそのまま写し、変更しない。実効待機は
+  観測値・アカウント規則の結果別待機以上でなければ記録できず（`account_effective_wait_below_rule`）、
+  より長い値を採用してもよい。plan側の規則以上であることは照合で確認する。
   アカウント規則は各planの規則以上に厳しくなければならない（`account_policy_weaker_than_plan`）。
-- 保持者が停止して枠が未確定のまま残った場合、別の保持者は枠のlease（`slot_lease_seconds`）が切れた後にだけ、
-  結果不明として回収できる。送信はlease内にtimeoutまで収まる時刻でなければ記録できないため、回収後に元の要求が
-  通信中であることはない。結果不明は通信失敗の待機で保守的に扱う。
-- 更新は「現在の内容に正確に1記録を足したものだけを受け入れる」比較付き追記（`commit_account_ledger`）とする。
-  古い内容に基づく追記・複数記録の同時追記は拒否されるため、並行する実行プロセスが同じ送信枠を予約できない。
-  実際の排他ロック・原子的な読込みと書込みは保存PRで実装する。
-- `check_account_plan_consistency()` は、plan台帳の各試行に同じplan hashの送信枠があり、試行が枠より前に予約されておらず、
-  判明したHTTP結果が枠の結果と矛盾しないこと、そのplanの枠がplan台帳にすべてあることを照合する。
-- `assess_account_slot()` の `account_allows_next_attempt` はアカウント全体の状態だけを表す。plan内の可否とは別の状態であり、
-  実HTTP送信の可否は `require_live_acquisition_permission()` だけが扱う（今回は常に閉じる）。
+
+#### 1回の試行の書込み順序と照合
+
+`reconcile_account_and_plan()` は、同じplan hash・同じ試行ID（＝送信枠ID）を持つ記録だけを同一の試行として照合し、
+`consistent`（一致）／`pending`（片側だけ進んだ途中状態）／`inconsistent`（矛盾）のいずれかを返す。
+書込み順序の契約は次のとおり。
+
+1. アカウント台帳 `slot_reserved`
+2. plan台帳 `attempt_reserved`
+3. plan台帳 `attempt_sent`
+4. アカウント台帳 `slot_sent`
+5. HTTP要求（両台帳への送信記録の後）
+6. plan台帳 `response_received`（状態コード・観測Retry-After）または `outcome_unknown`
+7. アカウント台帳 `slot_settled`（6の結果と観測Retry-Afterを写し、実効待機を付ける）
+
+照合するのは結果と時刻の因果関係で、記録の種類が違う時刻に完全一致は要求しない（両台帳の追記時刻が違っても、
+順序が成り立てば一致とする）。
+
+- plan側に確定したHTTP結果があれば、共有側の確定結果が同じ種類（429／5xx／それ以外）でなければ矛盾
+  （`account_slot_outcome_mismatch`。共有側 `unknown` も矛盾として扱い、短い待機に丸めない）。
+- 観測Retry-Afterは両台帳で一致しなければ矛盾（`account_retry_after_mismatch`。片側だけの記録を含む）。
+- 実効待機がplan規則・アカウント規則・観測Retry-Afterの最大値より短ければ矛盾（`account_effective_wait_below_plan_rule`）。
+- 時刻: 送信枠の予約はplanの予約以前、共有側の送信記録はplanの送信記録以降かつ応答の観測以前
+  （`account_send_after_plan_response`／`account_sent_before_plan_send`）、共有側の確定は応答の観測以降
+  （`account_settled_before_plan_result`）、応答の観測は送信枠のlease内（`plan_result_after_account_lease`）。
+
+`assess_account_slot()` は、共有台帳に送信枠を持つすべてのplanと、渡されたすべてのplan台帳を照合する。
+台帳の欠落（`account_plan_journal_missing`）、途中状態（`account_ledger_pending:<code>`）、矛盾
+（`account_ledger_inconsistent:<code>`）が1つでもあれば、アカウント上の**どのplanにも**送信枠を与えない。
+共有台帳の直近イベントだけで判定し、別planの既知の結果を見落とすことはない。Gateと入口は、対象plan以外の
+関係plan台帳を `related_journals` として受け取り、bytesから開き直して照合する。
+
+#### 片側だけ更新された状態（クラッシュ）と回復
+
+| 停止位置 | 照合結果 | 回復に必要な証拠と追記 |
+| --- | --- | --- |
+| 1の後（planに試行なし） | `pending_plan_attempt_record` | 送信記録がないので、同じ保持者が送信枠を `unknown` で確定する（送信なしの放棄として一致） |
+| 2〜4の後（両側とも未確定） | `pending_settlement_on_both_ledgers` | plan台帳に `outcome_unknown`、共有台帳に `unknown` の確定を追記する |
+| 6の後（planに結果、共有は未確定） | `pending_account_settlement` | plan台帳の結果と観測Retry-Afterを**そのまま**写した確定を追記する。推測や `unknown` への置換は矛盾になる |
+| 共有側がlease後に `unknown` で回収され、planは送信中 | `pending_plan_settlement` | plan台帳に `outcome_unknown` を追記する |
+| 共有側に結果があり、planに結果がない／planが `unknown` | 矛盾（`account_result_without_plan_result`／`account_result_contradicts_plan_unknown`） | 自動回復しない。所有者が原本・通信記録を確認する |
+| planに結果があり、共有側が `unknown`・別結果・Retry-After欠落 | 矛盾 | 自動回復しない（lease回収後に古い実行が結果を書いた場合を含む） |
+| 共有側に送信記録があり、planに試行がない | 矛盾（`account_sent_without_plan_attempt`） | 自動回復しない |
+
+途中状態・矛盾はいずれも、推測で正常完了に変えない。回復は、上表の証拠から一意に決まる1記録の追記だけで、
+それ以外（原本・イベントの欠落）は停止する。拒否された追記は台帳を変更しない（台帳は不変値で、追記は新しい値を返す）。
+**両台帳への書込みは今回も別々で、2台帳を原子的に更新する仕組みはない。実HTTP環境でのクラッシュ耐性は
+保存PRで実装・検証するまで完成していない。**
+
+#### leaseと並行実行の限界
+
+- **lease満了は、元のHTTP通信が終わった証拠ではない。** 契約上は、送信記録をlease内に要求timeoutが収まる時刻に
+  限っているが、元の実行が通信中に停止・遅延し（OSの停止、時計のずれ、timeoutの実装不備など）、lease回収後に
+  復帰して結果を書く可能性は残る。今回の契約は、回収後の送信枠への古い実行による確定を拒否し（`account_slot_not_open`）、
+  古い実行がplan台帳に書いた結果を矛盾として検出して全planを停止させるだけで、実際の通信を止めることはできない。
+  HTTP・保存PRでは、通信timeout、送信枠の所有権、古い実行による確定の拒否を一体で実装する必要があり、
+  永続的な送信枠には所有権の世代（fencing token。例: 予約記録のhashや連番）を持たせ、送信・確定の記録にその世代を
+  要求する設計を検討する。
+- **比較付き追記（`commit_account_ledger`）は、渡された旧状態との差分を判定する契約にすぎない。**
+  複数プロセスが同じ実ファイルへ同時にアクセスするときの原子的な読込み・比較・追記、ロック、永続化、
+  クラッシュ後の回復は今回のコードでは保証しない。HTTP・保存PRで実装・検証する必須事項である。
+
+`assess_account_slot()` の `account_allows_next_attempt` はアカウント全体の状態だけを表す。plan内の可否とは別の状態であり、
+実HTTP送信の可否は `require_live_acquisition_permission()` だけが扱う（今回は常に閉じる）。
 
 Gateはアカウント台帳を必須の証拠とし、欠落（`account_rate_state_missing`）、改変・不正（`account_rate_state_invalid:<code>`）、
-plan台帳との不整合・古い内容（`account_rate_state_inconsistent:<code>`）、待機中・枠使用中（`account_rate_blocked:<code>`）を
-理由として返す。さらに `account_identity_unverified`（ラベルと実際の認証アカウントの一致は証明されない）と
-`account_shared_store_not_implemented`（共有台帳の永続化・排他ロックは未実装）を常に返す。
+関係plan台帳の欠落・途中状態・矛盾・待機中・枠使用中（`account_rate_blocked:<code>`）を理由として返す。
+さらに `account_identity_unverified`（ラベルと実際の認証アカウントの一致は証明されない）と
+`account_shared_store_not_implemented`（共有台帳の永続化・排他ロック・原子的更新は未実装）を常に返す。
 
 実HTTP送信では、契約上の予約に加えて**送信直前にも**plan台帳とアカウント台帳の両方の制限を検査する必要がある
 （plan台帳は `attempt_sent` で期間とdeadlineを、アカウント台帳は `slot_sent` でleaseを再検査する）。
@@ -331,7 +389,8 @@ receipt照合が示すのは、入力された台帳・原本一覧・承認clai
 台帳を開く・resumeするときは全行を検証し、`append` は検証済みの状態の複製に新しいイベントだけを適用する
 （両者が同じbytes・状態になることをテストで確認）。人工測定（2510イベント・約2 MB）で、append全体0.15秒、
 全件検証0.07秒。5010イベントで0.40秒・0.14秒。appendは状態の複製とタプル連結のため件数に比例してわずかに遅くなる。
-アカウント台帳は1507イベントでappend全体0.04秒・全件検証0.02秒、plan台帳との照合は1ミリ秒未満（いずれも人工測定）。
+アカウント台帳は1507イベントでappend全体0.04秒・全件検証0.02秒、2510イベントのplan台帳との照合（`reconcile_account_and_plan`）は
+約0.4ミリ秒（いずれも人工測定）。
 
 ### 次PRと所有者判断
 

@@ -35,6 +35,7 @@ from feasibility.http_contract import (
     HttpContractError,
     HttpLimits,
     JournalEvent,
+    LedgerReconciliation,
     LiveAcquisitionClosed,
     LiveAcquisitionGate,
     OwnerApprovalClaim,
@@ -51,6 +52,7 @@ from feasibility.http_contract import (
     commit_account_ledger,
     derive_calendar_anchor,
     make_attempt_id,
+    reconcile_account_and_plan,
     require_live_acquisition_permission,
     validate_page_request,
     verify_calendar_anchor,
@@ -1550,43 +1552,117 @@ def slot_event(kind, at, slot_id, *, plan_sha=None, holder="runner-a", **extra):
     )
 
 
-def account_exchange(
-    ledger, journal, at, *, outcome="response", holder="runner-a", retry_after=None
-):
-    """Record the account slot of the plan journal's latest attempt."""
+def outcome_of(status: int) -> str:
+    return "429" if status == 429 else "5xx" if 500 <= status < 600 else "response"
 
-    attempt_id = last_attempt_id(journal)
-    ledger = ledger.append(
-        slot_event(
-            "slot_reserved", at, attempt_id, plan_sha=journal.plan.sha256, holder=holder
-        )
+
+def required_wait(fixed, outcome, retry_after=None) -> int:
+    rule = fixed.retry
+    specific = {
+        "response": 0,
+        "429": rule.min_wait_after_429_seconds,
+        "5xx": rule.min_wait_after_5xx_seconds,
+        "unknown": rule.min_wait_after_network_error_seconds,
+    }[outcome]
+    return max(
+        rule.min_interval_seconds,
+        specific,
+        account_policy().wait_after(outcome),
+        retry_after or 0,
     )
-    ledger = ledger.append(slot_event("slot_sent", at, attempt_id, holder=holder))
+
+
+def settle(ledger, fixed, slot_id, at, outcome, *, observed=None, extra=0, **kw):
     return ledger.append(
         slot_event(
             "slot_settled",
             at,
-            attempt_id,
-            holder=holder,
+            slot_id,
             outcome=outcome,
+            observed_retry_after_seconds=observed,
+            effective_wait_seconds=required_wait(fixed, outcome, observed) + extra,
+            **kw,
+        )
+    )
+
+
+def paired_until_send(journal, ledger, request, number=1, at=NOW, *, holder="runner-a"):
+    """Protocol steps 1-4: account reserve, plan reserve, plan sent, account sent."""
+
+    event = reserve(journal, request, number, at)
+    ledger = ledger.append(
+        slot_event(
+            "slot_reserved",
+            at,
+            event.attempt_id,
+            plan_sha=journal.plan.sha256,
+            holder=holder,
+        )
+    )
+    journal = journal.append(event)
+    journal = journal.append(
+        JournalEvent("attempt_sent", at, attempt_id=event.attempt_id)
+    )
+    ledger = ledger.append(slot_event("slot_sent", at, event.attempt_id, holder=holder))
+    return journal, ledger
+
+
+def plan_response(journal, at, status, *, retry_after=None, transfer=10, decoded=20):
+    return journal.append(
+        JournalEvent(
+            "response_received",
+            at,
+            attempt_id=last_attempt_id(journal),
+            status=status,
+            transfer_bytes=transfer,
+            decoded_bytes=decoded,
             retry_after_seconds=retry_after,
         )
     )
 
 
-def run_plan_a(status=200, *, retry_after=None):
-    fixed = plan()
-    journal = exchange(
-        journal_for(fixed), page(fixed), 1, NOW, status=status, retry_after=retry_after
+def paired_exchange(
+    journal, ledger, request, number=1, at=NOW, *, status=200, retry_after=None,
+    settle_at=None, extra=0, holder="runner-a", **response,
+):  # fmt: skip
+    """All protocol steps: the account copies the plan's observed result."""
+
+    journal, ledger = paired_until_send(
+        journal, ledger, request, number, at, holder=holder
     )
-    outcome = {200: "response", 429: "429", 503: "5xx"}[status]
-    ledger = account_exchange(open_account(), journal, NOW, outcome=outcome)
+    journal = plan_response(journal, at, status, retry_after=retry_after, **response)
+    ledger = settle(
+        ledger,
+        journal.plan,
+        last_attempt_id(journal),
+        settle_at or at,
+        outcome_of(status),
+        observed=retry_after,
+        extra=extra,
+        holder=holder,
+    )
     return journal, ledger
+
+
+def run_plan_a(status=200, *, retry_after=None, extra=0):
+    fixed = plan()
+    return paired_exchange(
+        journal_for(fixed),
+        open_account(),
+        page(fixed),
+        status=status,
+        retry_after=retry_after,
+        extra=extra,
+    )
+
+
+def account_view(ledger, fixed, at, *journals):
+    return assess_account_slot(ledger, fixed, now=at, plan_journals=journals)
 
 
 @pytest.mark.parametrize("status,wait", [(200, 13), (429, 120), (503, 13)])
 def test_plan_b_inherits_plan_a_waits_on_the_same_account(status, wait):
-    _, ledger = run_plan_a(status)
+    journal_a, ledger = run_plan_a(status)
     fixed_b = plan(**PLAN_B)
     journal_b = journal_for(fixed_b)
     # Plan B's own journal is empty: plan-local rules alone would allow it ...
@@ -1594,14 +1670,14 @@ def test_plan_b_inherits_plan_a_waits_on_the_same_account(status, wait):
         journal_b, BodyInventory(()), now=NOW + seconds(1)
     ).plan_allows_next_attempt
     # ... but the shared account state does not.
-    early = assess_account_slot(ledger, fixed_b, now=NOW + seconds(1))
+    early = account_view(ledger, fixed_b, NOW + seconds(1), journal_a)
     assert not early.account_allows_next_attempt
     assert early.blocking_reasons == ("account_rate_limit_wait",)
     assert early.earliest_next_slot_at == NOW + seconds(wait)
-    edge = assess_account_slot(ledger, fixed_b, now=NOW + seconds(wait) - MICRO)
+    edge = account_view(ledger, fixed_b, NOW + seconds(wait) - MICRO, journal_a)
     assert not edge.account_allows_next_attempt
-    assert assess_account_slot(
-        ledger, fixed_b, now=NOW + seconds(wait)
+    assert account_view(
+        ledger, fixed_b, NOW + seconds(wait), journal_a
     ).account_allows_next_attempt
     attempt = reserve(journal_b, page(fixed_b), 1, NOW + seconds(wait) - MICRO)
     with pytest.raises(HttpContractError, match="account_rate_limit_wait"):
@@ -1625,35 +1701,41 @@ def test_plan_b_inherits_plan_a_waits_on_the_same_account(status, wait):
 
 def test_calendar_plan_completion_then_daily_plan_waits_on_the_account():
     evidence = discovery_evidence()
-    calendar = EvidenceJournal(
-        evidence.plan, evidence.journal_data, approval=evidence.approval
+    body = calendar_body()
+    calendar, ledger = paired_exchange(
+        journal_for(evidence.plan, evidence.approval),
+        open_account(),
+        page(evidence.plan),
+        transfer=len(body),
+        decoded=len(body),
     )
-    ledger = account_exchange(
-        open_account(), calendar, [e for e in calendar.events][2].at
+    calendar = finish_page(
+        calendar, NOW, digest=hashlib.sha256(body).hexdigest(), saved=len(body)
     )
+    calendar = calendar.append(JournalEvent("run_completed", NOW))
     daily = anchored_plan(evidence)
-    assert not assess_account_slot(
-        ledger, daily, now=NOW + seconds(13) - MICRO
+    assert not account_view(
+        ledger, daily, NOW + seconds(13) - MICRO, calendar
     ).account_allows_next_attempt
-    assert assess_account_slot(
-        ledger, daily, now=NOW + seconds(13)
+    assert account_view(
+        ledger, daily, NOW + seconds(13), calendar
     ).account_allows_next_attempt
+    missing = account_view(ledger, daily, NOW + seconds(13))
+    assert missing.blocking_reasons == ("account_plan_journal_missing",)
 
 
 def test_other_account_is_separate_and_mismatched_ledgers_are_refused():
-    _, ledger = run_plan_a(429)
+    journal_a, ledger = run_plan_a(429)
     other = plan(**PLAN_B, account_ref="other-account")
     own = open_account("other-account")
-    assert assess_account_slot(
-        own, other, now=NOW + seconds(1)
-    ).account_allows_next_attempt
+    assert account_view(own, other, NOW + seconds(1)).account_allows_next_attempt
     assert (
         "account_ref_mismatch"
-        in assess_account_slot(ledger, other, now=NOW + seconds(1)).blocking_reasons
+        in account_view(ledger, other, NOW + seconds(1), journal_a).blocking_reasons
     )
     with pytest.raises(HttpContractError, match="account_ledger_account_mismatch"):
         AccountRateLedger("other-account", ledger.data)
-    assessment = assess_account_slot(own, other, now=NOW + seconds(1))
+    assessment = account_view(own, other, NOW + seconds(1))
     assert assessment.account_identity_verified is False
     with pytest.raises(TypeError):
         AccountSlotAssessment(ACCOUNT, NOW, (), account_identity_verified=True)
@@ -1688,28 +1770,48 @@ def test_concurrent_reservations_cannot_share_a_send_slot():
 
 def test_unknown_outcome_across_a_plan_switch_is_reclaimed_only_after_the_lease():
     first, second = plan(), plan(**PLAN_B)
-    slot_a = reserve(journal_for(first), page(first), 1).attempt_id
-    ledger = open_account().append(
-        slot_event("slot_reserved", NOW, slot_a, plan_sha=first.sha256)
+    journal_a, ledger = paired_until_send(
+        journal_for(first), open_account(), page(first), at=NOW
     )
-    ledger = ledger.append(slot_event("slot_sent", NOW + seconds(5), slot_a))
-    # runner-a stops here; plan B (runner-b) must not use the account meanwhile
-    assessment = assess_account_slot(ledger, second, now=NOW + seconds(30))
-    assert assessment.blocking_reasons == ("account_slot_in_use",)
+    slot_a = last_attempt_id(journal_a)
+    # runner-a stops after sending; plan B (runner-b) must not use the account
+    stuck = account_view(ledger, second, NOW + seconds(30), journal_a)
+    assert stuck.blocking_reasons == (
+        "account_ledger_pending:pending_settlement_on_both_ledgers",
+        "account_slot_in_use",
+    )
     reclaim = slot_event(
         "slot_settled", NOW + seconds(60) - MICRO, slot_a, holder="runner-b",
-        outcome="unknown",
+        outcome="unknown", effective_wait_seconds=13,
     )  # fmt: skip
     with pytest.raises(HttpContractError, match="reclaim_before_lease_expiry"):
         ledger.append(reclaim)
     with pytest.raises(HttpContractError, match="account_slot_holder_mismatch"):
         ledger.append(replace(reclaim, at=NOW + seconds(60), outcome="response"))
     ledger = ledger.append(replace(reclaim, at=NOW + seconds(60)))
-    resumed = AccountRateLedger(ACCOUNT, ledger.data)
-    for current in (ledger, resumed):
-        state = assess_account_slot(current, second, now=NOW + seconds(73) - MICRO)
+    # The plan side still shows the attempt as sent: recover it as unknown first.
+    assert (
+        "account_ledger_pending:pending_plan_settlement"
+        in account_view(ledger, second, NOW + seconds(80), journal_a).blocking_reasons
+    )
+    journal_a = journal_a.append(
+        JournalEvent("outcome_unknown", NOW + seconds(61), attempt_id=slot_a)
+    )
+    for current_ledger, current_journal in (
+        (ledger, journal_a),
+        (
+            AccountRateLedger(ACCOUNT, ledger.data),
+            EvidenceJournal(first, journal_a.data, approval=journal_a.approval),
+        ),  # resumed
+    ):
+        state = account_view(
+            current_ledger, second, NOW + seconds(73) - MICRO, current_journal
+        )
         assert state.blocking_reasons == ("account_rate_limit_wait",)
         assert state.earliest_next_slot_at == NOW + seconds(73)
+        assert account_view(
+            current_ledger, second, NOW + seconds(73), current_journal
+        ).account_allows_next_attempt
 
 
 def test_send_must_fit_inside_the_slot_lease():
@@ -1724,32 +1826,17 @@ def test_send_must_fit_inside_the_slot_lease():
 
 
 def test_account_policy_must_cover_the_plan_rules():
-    _, ledger = run_plan_a()
+    journal_a, ledger = run_plan_a()
     strict = plan(**PLAN_B, retry=retry(min_wait_after_429_seconds=300))
     assert (
         "account_policy_weaker_than_plan"
-        in assess_account_slot(ledger, strict, now=NOW + seconds(60)).blocking_reasons
+        in account_view(ledger, strict, NOW + seconds(60), journal_a).blocking_reasons
     )
     with pytest.raises(HttpContractError, match="slot_lease_shorter_than_request"):
         account_policy(slot_lease_seconds=10)
 
 
-def test_account_state_and_plan_journal_must_agree():
-    journal, ledger = run_plan_a(200)
-    check_account_plan_consistency(ledger, journal)
-    with pytest.raises(HttpContractError, match="account_ledger_missing_plan_attempt"):
-        check_account_plan_consistency(open_account(), journal)
-    wrong = account_exchange(open_account(), journal, NOW, outcome="429")
-    with pytest.raises(HttpContractError, match="account_slot_outcome_mismatch"):
-        check_account_plan_consistency(wrong, journal)
-    late = account_exchange(open_account(), journal, NOW + seconds(1))
-    with pytest.raises(HttpContractError, match="reserved_after_plan_attempt"):
-        check_account_plan_consistency(late, journal)
-    with pytest.raises(HttpContractError, match="missing_from_plan_journal"):
-        check_account_plan_consistency(ledger, journal_for(journal.plan))
-
-
-def gate_for(journal, ledger, now):
+def gate_for(journal, ledger, now, related=()):
     inventory = BodyInventory(())
     return assess_live_acquisition_gate(
         journal.plan,
@@ -1759,6 +1846,7 @@ def gate_for(journal, ledger, now):
         None,
         now=now,
         account_ledger=ledger,
+        related_journals=related,
     ).reasons
 
 
@@ -1767,22 +1855,37 @@ def test_gate_requires_consistent_account_state_and_stays_closed():
     later = NOW + seconds(200)
     assert "account_rate_state_missing" in gate_for(journal, None, later)
     tampered = AccountRateLedger.__new__(AccountRateLedger)
-    tampered._init(ACCOUNT, (ledger.data.replace(b'"429"', b'"200"', 1),), "0", 0, None)
+    tampered._init(ACCOUNT, (ledger.data.replace(b'"429"', b'"5xx"', 1),), "0", 0, None)
     assert any(
         r.startswith("account_rate_state_invalid:")
         for r in gate_for(journal, tampered, later)
     )
-    stale = AccountRateLedger(ACCOUNT, b"".join(ledger._lines[:2]))  # before settle
+    stale = AccountRateLedger(ACCOUNT, b"".join(ledger._lines[:3]))  # before settle
     reasons = gate_for(journal, stale, later)
     assert "account_rate_blocked:account_slot_in_use" in reasons
-    assert "account_rate_state_inconsistent:account_ledger_missing_plan_attempt" in (
-        gate_for(journal, open_account(), later)
+    assert (
+        "account_rate_blocked:account_ledger_pending:pending_account_settlement"
+        in reasons
     )
+    assert (
+        "account_rate_blocked:account_ledger_inconsistent:"
+        "account_ledger_missing_plan_attempt"
+    ) in gate_for(journal, open_account(), later)
     early = gate_for(journal, ledger, NOW + seconds(1))
     assert "account_rate_blocked:account_rate_limit_wait" in early
     settled = gate_for(journal, ledger, later)
     assert not any(r.startswith("account_rate_") for r in settled)
     assert settled[-5:] == CLOSED_TAIL
+    # Plan B's gate needs plan A's journal: the account ledger alone is not enough.
+    fixed_b = plan(**PLAN_B)
+    b_journal = journal_for(fixed_b)
+    assert "account_rate_blocked:account_plan_journal_missing" in gate_for(
+        b_journal, ledger, later
+    )
+    assert not any(
+        r.startswith("account_rate_")
+        for r in gate_for(b_journal, ledger, later, (journal,))
+    )
     with pytest.raises(HttpContractError, match="raw_evidence_required"):
         require_live_acquisition_permission(
             journal.plan,
@@ -1791,7 +1894,18 @@ def test_gate_requires_consistent_account_state_and_stays_closed():
             BodyInventory(()),
             None,
             now=later,
-            account_ledger=assess_account_slot(ledger, journal.plan, now=later),
+            account_ledger=account_view(ledger, journal.plan, later, journal),
+        )
+    with pytest.raises(HttpContractError, match="raw_evidence_required"):
+        require_live_acquisition_permission(
+            fixed_b,
+            b_journal.approval,
+            b_journal,
+            BodyInventory(()),
+            None,
+            now=later,
+            account_ledger=ledger,
+            related_journals=[journal],
         )
 
 
@@ -1799,6 +1913,319 @@ def test_plan_snapshot_flag_is_named_plan_only():
     state = budget_snapshot(journal_for(plan()), BodyInventory(()), now=NOW)
     assert state.plan_allows_next_attempt
     assert not hasattr(state, "can_reserve_next_attempt")
+
+
+# --------------------------------- round 4, High: results and Retry-After bound
+
+
+def after_plan_response(status, *, retry_after=None, fixed=None):
+    fixed = fixed or plan()
+    journal, ledger = paired_until_send(journal_for(fixed), open_account(), page(fixed))
+    return plan_response(journal, NOW, status, retry_after=retry_after), ledger
+
+
+@pytest.mark.parametrize(
+    "status,account_outcome",
+    [(429, "unknown"), (429, "response"), (200, "unknown"), (503, "response")],
+)
+def test_known_plan_result_must_match_the_account_outcome(status, account_outcome):
+    journal, ledger = after_plan_response(status)
+    ledger = settle(
+        ledger, journal.plan, last_attempt_id(journal), NOW, account_outcome
+    )
+    result = reconcile_account_and_plan(ledger, journal)
+    assert result.status == "inconsistent"
+    assert result.issues == ("account_slot_outcome_mismatch",)
+    blocked = account_view(ledger, plan(**PLAN_B), NOW + seconds(600), journal)
+    assert (
+        "account_ledger_inconsistent:account_slot_outcome_mismatch"
+        in blocked.blocking_reasons
+    )
+
+
+@pytest.mark.parametrize("status", [200, 429, 503])
+def test_matching_results_on_both_ledgers_are_consistent(status):
+    journal, ledger = after_plan_response(status)
+    ledger = settle(
+        ledger, journal.plan, last_attempt_id(journal), NOW, outcome_of(status)
+    )
+    assert reconcile_account_and_plan(ledger, journal) == LedgerReconciliation(
+        journal.plan.sha256, "consistent", ()
+    )
+    check_account_plan_consistency(ledger, journal)
+
+
+def test_plan_retry_after_must_be_carried_to_the_account():
+    journal, ledger = after_plan_response(429, retry_after=600)
+    slot_id = last_attempt_id(journal)
+
+    def settled(observed, effective):
+        return ledger.append(
+            slot_event(
+                "slot_settled",
+                NOW,
+                slot_id,
+                outcome="429",
+                observed_retry_after_seconds=observed,
+                effective_wait_seconds=effective,
+            )
+        )
+
+    for observed in (None, 300):
+        result = reconcile_account_and_plan(settled(observed, 600), journal)
+        assert result.issues == ("account_retry_after_mismatch",)
+    with pytest.raises(HttpContractError, match="account_effective_wait_below_rule"):
+        settled(600, 599)
+    assert reconcile_account_and_plan(settled(600, 600), journal).status == "consistent"
+
+
+def test_known_retry_after_is_never_replaced_by_a_shorter_wait_for_plan_b():
+    journal, ledger = after_plan_response(429, retry_after=600)
+    unknown = settle(ledger, journal.plan, last_attempt_id(journal), NOW, "unknown")
+    fixed_b = plan(**PLAN_B)
+    at = NOW + seconds(121)
+    assert not account_view(unknown, fixed_b, at, journal).account_allows_next_attempt
+    assert (
+        "account_plan_journal_missing"
+        in account_view(unknown, fixed_b, at).blocking_reasons
+    )
+    carried = settle(
+        ledger, journal.plan, last_attempt_id(journal), NOW, "429", observed=600
+    )
+    assert not account_view(carried, fixed_b, at, journal).account_allows_next_attempt
+    assert account_view(
+        carried, fixed_b, NOW + seconds(600), journal
+    ).account_allows_next_attempt
+
+
+def test_account_may_apply_a_longer_wait_without_changing_the_observed_value():
+    journal, ledger = run_plan_a(429, retry_after=600, extra=300)
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+    settled = json.loads(ledger._lines[-1])["event"]
+    assert (
+        settled["observed_retry_after_seconds"],
+        settled["effective_wait_seconds"],
+    ) == (
+        600,
+        900,
+    )
+    view = account_view(ledger, plan(**PLAN_B), NOW + seconds(600), journal)
+    assert view.earliest_next_slot_at == NOW + seconds(900)
+    assert view.blocking_reasons == ("account_rate_limit_wait",)
+
+
+def test_account_wait_below_the_plan_rule_is_inconsistent():
+    strict = plan(retry=retry(min_wait_after_5xx_seconds=60))
+    journal, ledger = after_plan_response(503, fixed=strict)
+    ledger = ledger.append(
+        slot_event(
+            "slot_settled",
+            NOW,
+            last_attempt_id(journal),
+            outcome="5xx",
+            effective_wait_seconds=13,  # the account rule alone would allow this
+        )
+    )
+    assert reconcile_account_and_plan(ledger, journal).issues == (
+        "account_effective_wait_below_plan_rule",
+    )
+
+
+# ----------------------------------- round 4, Medium: causal order of the times
+
+
+def custom_timeline(*, account_reserved, plan_reserved, plan_sent, account_sent,
+                    response, settled, status=200):  # fmt: skip
+    fixed = plan()
+    journal = journal_for(fixed)
+    event = reserve(journal, page(fixed), 1, NOW + seconds(plan_reserved))
+    ledger = open_account().append(
+        slot_event(
+            "slot_reserved",
+            NOW + seconds(account_reserved),
+            event.attempt_id,
+            plan_sha=fixed.sha256,
+        )
+    )
+    journal = journal.append(event).append(
+        JournalEvent(
+            "attempt_sent", NOW + seconds(plan_sent), attempt_id=event.attempt_id
+        )
+    )
+    ledger = ledger.append(
+        slot_event("slot_sent", NOW + seconds(account_sent), event.attempt_id)
+    )
+    journal = plan_response(journal, NOW + seconds(response), status)
+    ledger = settle(
+        ledger, fixed, event.attempt_id, NOW + seconds(settled), outcome_of(status)
+    )
+    return journal, ledger
+
+
+def test_different_append_times_with_a_causal_order_are_accepted():
+    journal, ledger = custom_timeline(
+        account_reserved=-2, plan_reserved=0, plan_sent=1, account_sent=1.5,
+        response=3, settled=10,
+    )  # fmt: skip
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+    view = account_view(ledger, plan(**PLAN_B), NOW + seconds(23) - MICRO, journal)
+    assert view.earliest_next_slot_at == NOW + seconds(23)
+
+
+@pytest.mark.parametrize(
+    "timeline,issue",
+    [
+        (dict(account_reserved=0, plan_reserved=0, plan_sent=0, account_sent=5,
+              response=3, settled=10), "account_send_after_plan_response"),
+        (dict(account_reserved=0, plan_reserved=0, plan_sent=2, account_sent=1,
+              response=3, settled=10), "account_sent_before_plan_send"),
+        (dict(account_reserved=0, plan_reserved=0, plan_sent=0, account_sent=0,
+              response=3, settled=2), "account_settled_before_plan_result"),
+        (dict(account_reserved=1, plan_reserved=0, plan_sent=1, account_sent=1,
+              response=3, settled=10), "account_slot_reserved_after_plan_attempt"),
+    ],
+)  # fmt: skip
+def test_impossible_time_orders_are_refused(timeline, issue):
+    try:
+        journal, ledger = custom_timeline(**timeline)
+    except HttpContractError:
+        pytest.fail("the timeline itself must be recordable")
+    result = reconcile_account_and_plan(ledger, journal)
+    assert result.status == "inconsistent" and issue in result.issues
+
+
+def test_plan_result_after_the_lease_is_inconsistent():
+    fixed = plan()
+    journal, ledger = paired_until_send(journal_for(fixed), open_account(), page(fixed))
+    journal = plan_response(journal, NOW + seconds(30), 200)  # inside the plan timeout
+    ledger = settle(
+        ledger, fixed, last_attempt_id(journal), NOW + seconds(30), "response"
+    )
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+    late = open_account(request_timeout_seconds=20, slot_lease_seconds=20)
+    journal2, late = paired_until_send(journal_for(fixed), late, page(fixed))
+    journal2 = plan_response(journal2, NOW + seconds(20) + MICRO, 200)
+    result = reconcile_account_and_plan(late, journal2)
+    assert "plan_result_after_account_lease" in result.issues
+
+
+# ----------------------------------------- round 4: one-sided crash states
+
+
+def test_crash_after_account_reservation_only():
+    fixed = plan()
+    event = reserve(journal_for(fixed), page(fixed), 1)
+    ledger = open_account().append(
+        slot_event("slot_reserved", NOW, event.attempt_id, plan_sha=fixed.sha256)
+    )
+    journal = journal_for(fixed)
+    assert reconcile_account_and_plan(ledger, journal).issues == (
+        "pending_plan_attempt_record",
+    )
+    # Recovery: the attempt never reached the plan and was never sent.
+    ledger = settle(ledger, fixed, event.attempt_id, NOW + seconds(1), "unknown")
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+
+
+def test_crash_after_sending_is_recovered_as_unknown_on_both_sides():
+    fixed = plan()
+    journal, ledger = paired_until_send(journal_for(fixed), open_account(), page(fixed))
+    assert reconcile_account_and_plan(ledger, journal).issues == (
+        "pending_settlement_on_both_ledgers",
+    )
+    slot_id = last_attempt_id(journal)
+    journal = journal.append(
+        JournalEvent("outcome_unknown", NOW + seconds(5), attempt_id=slot_id)
+    )
+    assert reconcile_account_and_plan(ledger, journal).issues == (
+        "pending_account_settlement",
+    )
+    ledger = settle(ledger, fixed, slot_id, NOW + seconds(6), "unknown")
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+
+
+def test_crash_after_the_plan_result_is_recovered_only_by_copying_it():
+    journal, ledger = after_plan_response(429, retry_after=600)
+    slot_id = last_attempt_id(journal)
+    pending = reconcile_account_and_plan(ledger, journal)
+    assert (pending.status, pending.issues) == (
+        "pending",
+        ("pending_account_settlement",),
+    )
+    assert (
+        "account_ledger_pending:pending_account_settlement"
+        in account_view(
+            ledger, plan(**PLAN_B), NOW + seconds(900), journal
+        ).blocking_reasons
+    )
+    guessed = settle(ledger, journal.plan, slot_id, NOW + seconds(1), "unknown")
+    assert reconcile_account_and_plan(guessed, journal).status == "inconsistent"
+    copied = settle(
+        ledger, journal.plan, slot_id, NOW + seconds(1), "429", observed=600
+    )
+    assert reconcile_account_and_plan(copied, journal).status == "consistent"
+
+
+@pytest.mark.parametrize(
+    "plan_side,issue",
+    [
+        ("open", "account_result_without_plan_result"),
+        ("unknown", "account_result_contradicts_plan_unknown"),
+    ],
+)
+def test_account_result_without_the_plan_result_is_never_repaired(plan_side, issue):
+    fixed = plan()
+    journal, ledger = paired_until_send(journal_for(fixed), open_account(), page(fixed))
+    slot_id = last_attempt_id(journal)
+    if plan_side == "unknown":
+        journal = journal.append(
+            JournalEvent("outcome_unknown", NOW, attempt_id=slot_id)
+        )
+    ledger = settle(ledger, fixed, slot_id, NOW + seconds(1), "429")
+    result = reconcile_account_and_plan(ledger, journal)
+    assert (result.status, result.issues) == ("inconsistent", (issue,))
+
+
+def test_account_send_without_a_plan_attempt_is_inconsistent():
+    fixed = plan()
+    event = reserve(journal_for(fixed), page(fixed), 1)
+    ledger = open_account().append(
+        slot_event("slot_reserved", NOW, event.attempt_id, plan_sha=fixed.sha256)
+    )
+    ledger = ledger.append(slot_event("slot_sent", NOW, event.attempt_id))
+    assert reconcile_account_and_plan(ledger, journal_for(fixed)).issues == (
+        "account_sent_without_plan_attempt",
+    )
+
+
+def test_refusals_leave_both_ledgers_unchanged_and_resume_is_consistent():
+    journal, ledger = after_plan_response(429, retry_after=600)
+    before = (journal.data, ledger.data)
+    with pytest.raises(HttpContractError, match="account_effective_wait_below_rule"):
+        ledger.append(
+            slot_event(
+                "slot_settled",
+                NOW,
+                last_attempt_id(journal),
+                outcome="429",
+                observed_retry_after_seconds=600,
+                effective_wait_seconds=120,
+            )
+        )
+    reconcile_account_and_plan(ledger, journal)
+    assert (journal.data, ledger.data) == before
+    journal, ledger = run_plan_a(429, retry_after=600)
+    resumed_journal = EvidenceJournal(
+        journal.plan, journal.data, approval=journal.approval
+    )
+    resumed_ledger = AccountRateLedger(ACCOUNT, ledger.data)
+    assert (
+        reconcile_account_and_plan(resumed_ledger, resumed_journal).status
+        == "consistent"
+    )
+    assert account_view(
+        resumed_ledger, plan(**PLAN_B), NOW + seconds(600), resumed_journal
+    ).account_allows_next_attempt
 
 
 # ---------------------------------------- round 3, Medium: bounded wait values
@@ -1822,7 +2249,12 @@ def test_invalid_retry_after_is_refused_before_recording(value, reason):
         exchange(journal_for(fixed), page(fixed), 1, NOW, status=429, retry_after=value)
     with pytest.raises(HttpContractError, match=reason):
         slot_event(
-            "slot_settled", NOW, DIGEST, outcome="429", retry_after_seconds=value
+            "slot_settled",
+            NOW,
+            DIGEST,
+            outcome="429",
+            observed_retry_after_seconds=value,
+            effective_wait_seconds=120,
         )
 
 
@@ -1889,3 +2321,28 @@ def test_unrepresentable_next_time_is_a_reason_not_an_exception():
     state = budget_snapshot(journal, BodyInventory(()), now=far)
     assert "next_attempt_time_unrepresentable" in state.blocking_reasons
     assert state.earliest_next_attempt_at is None
+
+
+def test_stale_runner_cannot_settle_a_reclaimed_slot_and_its_late_result_blocks():
+    first = plan()
+    journal, ledger = paired_until_send(journal_for(first), open_account(), page(first))
+    slot_id = last_attempt_id(journal)
+    ledger = ledger.append(
+        slot_event(
+            "slot_settled",
+            NOW + seconds(60),
+            slot_id,
+            holder="runner-b",
+            outcome="unknown",
+            effective_wait_seconds=13,
+        )
+    )
+    with pytest.raises(HttpContractError, match="account_slot_not_open"):
+        settle(ledger, first, slot_id, NOW + seconds(61), "response")
+    late = plan_response(journal, NOW + seconds(30), 200)  # runner-a comes back
+    result = reconcile_account_and_plan(ledger, late)
+    assert result.status == "inconsistent"
+    assert "account_slot_outcome_mismatch" in result.issues
+    assert not account_view(
+        ledger, plan(**PLAN_B), NOW + seconds(300), late
+    ).account_allows_next_attempt
