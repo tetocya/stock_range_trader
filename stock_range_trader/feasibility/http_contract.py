@@ -883,16 +883,10 @@ class _JournalState:
         )
 
     def required_wait_seconds(self) -> int:
-        retry = self.plan.retry
         if self.last_outcome is None:
             return 0
-        specific = {
-            "response": 0,
-            "429": retry.min_wait_after_429_seconds,
-            "5xx": retry.min_wait_after_5xx_seconds,
-            "network": retry.min_wait_after_network_error_seconds,
-        }[self.last_outcome]
-        return max(retry.min_interval_seconds, specific, self.last_retry_after)
+        outcome = "unknown" if self.last_outcome == "network" else self.last_outcome
+        return max(_plan_rule_wait(self.plan.retry, outcome), self.last_retry_after)
 
     def earliest_next_attempt_at(self) -> datetime:
         """Measured from the previous attempt's response or unknown outcome.
@@ -1805,7 +1799,11 @@ class AccountRatePolicy:
             "response": 0,
             "429": self.min_wait_after_429_seconds,
             "5xx": self.min_wait_after_5xx_seconds,
-            "unknown": self.min_wait_after_network_error_seconds,
+            # An unknown outcome may hide an unobserved 429 (see _plan_rule_wait).
+            "unknown": max(
+                self.min_wait_after_network_error_seconds,
+                self.min_wait_after_429_seconds,
+            ),
         }[outcome]
         return max(self.min_interval_seconds, specific)
 
@@ -2224,11 +2222,23 @@ def _status_outcome(status: int) -> str:
 
 
 def _plan_rule_wait(retry: RetryRules, outcome: str) -> int:
+    """Minimum wait after an attempt with this outcome under the plan's rules.
+
+    An ``unknown`` outcome (a lost reply, a timeout, a crash, a reclaimed slot)
+    may have been an unobserved 429, and neither ledger can prove that the
+    request was never sent, so it waits at least as long as after a 429. Its
+    Retry-After was not observed and is never recorded; a longer wait can only
+    come from an effective wait or from another record, never a shorter one.
+    """
+
     specific = {
         "response": 0,
         "429": retry.min_wait_after_429_seconds,
         "5xx": retry.min_wait_after_5xx_seconds,
-        "unknown": retry.min_wait_after_network_error_seconds,
+        "unknown": max(
+            retry.min_wait_after_network_error_seconds,
+            retry.min_wait_after_429_seconds,
+        ),
     }[outcome]
     return max(retry.min_interval_seconds, specific)
 
