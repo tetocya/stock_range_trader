@@ -1656,6 +1656,19 @@ def run_plan_a(status=200, *, retry_after=None, extra=0):
     )
 
 
+def reclaim_event(slot_id, at, **changes):
+    values = dict(
+        slot_id=slot_id,
+        holder_id="runner-b",
+        previous_holder_id="runner-a",
+        lease_expired_at=NOW + seconds(60),  # reserved at NOW, 60 s lease
+        reclaim_reason="lease_expired",
+        effective_wait_seconds=13,
+    )
+    values.update(changes)
+    return AccountRateEvent("slot_reclaimed", at, **values)
+
+
 def account_view(ledger, fixed, at, *journals):
     return assess_account_slot(ledger, fixed, now=at, plan_journals=journals)
 
@@ -1780,14 +1793,16 @@ def test_unknown_outcome_across_a_plan_switch_is_reclaimed_only_after_the_lease(
         "account_ledger_pending:pending_settlement_on_both_ledgers",
         "account_slot_in_use",
     )
-    reclaim = slot_event(
-        "slot_settled", NOW + seconds(60) - MICRO, slot_a, holder="runner-b",
-        outcome="unknown", effective_wait_seconds=13,
-    )  # fmt: skip
+    reclaim = reclaim_event(slot_a, NOW + seconds(60) - MICRO)
     with pytest.raises(HttpContractError, match="reclaim_before_lease_expiry"):
         ledger.append(reclaim)
     with pytest.raises(HttpContractError, match="account_slot_holder_mismatch"):
-        ledger.append(replace(reclaim, at=NOW + seconds(60), outcome="response"))
+        ledger.append(
+            slot_event(
+                "slot_settled", NOW + seconds(60), slot_a, holder="runner-b",
+                outcome="response", effective_wait_seconds=13,
+            )
+        )  # fmt: skip
     ledger = ledger.append(replace(reclaim, at=NOW + seconds(60)))
     # The plan side still shows the attempt as sent: recover it as unknown first.
     assert (
@@ -1804,13 +1819,15 @@ def test_unknown_outcome_across_a_plan_switch_is_reclaimed_only_after_the_lease(
             EvidenceJournal(first, journal_a.data, approval=journal_a.approval),
         ),  # resumed
     ):
+        # The plan recorded unknown at +61 s (after the reclaim at +60 s): the
+        # plan-side wait (+61 + 13) is kept, not only the account's (+60 + 13).
         state = account_view(
-            current_ledger, second, NOW + seconds(73) - MICRO, current_journal
+            current_ledger, second, NOW + seconds(74) - MICRO, current_journal
         )
         assert state.blocking_reasons == ("account_rate_limit_wait",)
-        assert state.earliest_next_slot_at == NOW + seconds(73)
+        assert state.earliest_next_slot_at == NOW + seconds(74)
         assert account_view(
-            current_ledger, second, NOW + seconds(73), current_journal
+            current_ledger, second, NOW + seconds(74), current_journal
         ).account_allows_next_attempt
 
 
@@ -2327,16 +2344,7 @@ def test_stale_runner_cannot_settle_a_reclaimed_slot_and_its_late_result_blocks(
     first = plan()
     journal, ledger = paired_until_send(journal_for(first), open_account(), page(first))
     slot_id = last_attempt_id(journal)
-    ledger = ledger.append(
-        slot_event(
-            "slot_settled",
-            NOW + seconds(60),
-            slot_id,
-            holder="runner-b",
-            outcome="unknown",
-            effective_wait_seconds=13,
-        )
-    )
+    ledger = ledger.append(reclaim_event(slot_id, NOW + seconds(60)))
     with pytest.raises(HttpContractError, match="account_slot_not_open"):
         settle(ledger, first, slot_id, NOW + seconds(61), "response")
     late = plan_response(journal, NOW + seconds(30), 200)  # runner-a comes back
@@ -2346,3 +2354,170 @@ def test_stale_runner_cannot_settle_a_reclaimed_slot_and_its_late_result_blocks(
     assert not account_view(
         ledger, plan(**PLAN_B), NOW + seconds(300), late
     ).account_allows_next_attempt
+
+
+# ------------------------------------ round 5: unknown path, reclaim and waits
+
+
+def unknown_timeline(*, plan_unknown, account_sent=None, account_settled=None,
+                     reclaim_at=None, fixed=None):  # fmt: skip
+    """Plan A: reserve and send at NOW; the other times are given in seconds."""
+
+    fixed = fixed or plan()
+    journal, ledger = journal_for(fixed), open_account()
+    event = reserve(journal, page(fixed), 1, NOW)
+    ledger = ledger.append(
+        slot_event("slot_reserved", NOW, event.attempt_id, plan_sha=fixed.sha256)
+    )
+    journal = journal.append(event).append(
+        JournalEvent("attempt_sent", NOW, attempt_id=event.attempt_id)
+    )
+    steps = [("plan_unknown", plan_unknown)]
+    if account_sent is not None:
+        steps.append(("account_sent", account_sent))
+    if account_settled is not None:
+        steps.append(("account_settled", account_settled))
+    if reclaim_at is not None:
+        steps.append(("reclaim", reclaim_at))
+    for kind, at in sorted(steps, key=lambda step: step[1]):
+        when = NOW + seconds(at)
+        if kind == "plan_unknown":
+            journal = journal.append(
+                JournalEvent("outcome_unknown", when, attempt_id=event.attempt_id)
+            )
+        elif kind == "account_sent":
+            ledger = ledger.append(slot_event("slot_sent", when, event.attempt_id))
+        elif kind == "account_settled":
+            ledger = settle(ledger, fixed, event.attempt_id, when, "unknown")
+        else:
+            ledger = ledger.append(reclaim_event(event.attempt_id, when))
+    return journal, ledger
+
+
+def test_account_send_after_the_plan_declared_unknown_is_refused():
+    journal, ledger = unknown_timeline(
+        plan_unknown=1, account_sent=2, account_settled=3
+    )
+    result = reconcile_account_and_plan(ledger, journal)
+    assert result.issues == ("account_send_after_plan_unknown",)
+    view = account_view(ledger, plan(**PLAN_B), NOW + seconds(600), journal)
+    assert not view.account_allows_next_attempt
+    assert view.earliest_next_slot_at is None  # not uniquely determined
+
+
+def test_holder_settling_unknown_before_the_plan_record_is_refused():
+    journal, ledger = unknown_timeline(
+        plan_unknown=10, account_sent=0, account_settled=1
+    )
+    assert reconcile_account_and_plan(ledger, journal).issues == (
+        "account_settled_before_plan_result",
+    )
+    fixed_b = plan(**PLAN_B)
+    for at in (14, 23, 600):  # neither the account's +14 s nor the plan's +23 s
+        assert not account_view(
+            ledger, fixed_b, NOW + seconds(at), journal
+        ).account_allows_next_attempt
+    # A holder unknown while the plan attempt is still open is also out of order.
+    open_journal, open_ledger = paired_until_send(
+        journal_for(plan()), open_account(), page(plan())
+    )
+    early = settle(
+        open_ledger, plan(), last_attempt_id(open_journal), NOW + seconds(1), "unknown"
+    )
+    assert reconcile_account_and_plan(early, open_journal).issues == (
+        "account_settled_before_plan_result",
+    )
+
+
+def test_reclaim_before_the_plan_record_is_accepted_and_keeps_both_waits():
+    journal, ledger = unknown_timeline(plan_unknown=70, account_sent=0, reclaim_at=60)
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+    fixed_b = plan(**PLAN_B)
+    view = account_view(ledger, fixed_b, NOW + seconds(73), journal)
+    assert view.earliest_next_slot_at == NOW + seconds(83)  # plan: +70 + 13
+    assert view.blocking_reasons == ("account_rate_limit_wait",)
+    assert account_view(
+        ledger, fixed_b, NOW + seconds(83), journal
+    ).account_allows_next_attempt
+    # Resume from bytes keeps the same decision.
+    resumed = account_view(
+        AccountRateLedger(ACCOUNT, ledger.data),
+        fixed_b,
+        NOW + seconds(83) - MICRO,
+        EvidenceJournal(journal.plan, journal.data, approval=journal.approval),
+    )
+    assert resumed.blocking_reasons == ("account_rate_limit_wait",)
+
+
+def test_a_slot_reserved_before_a_later_plan_side_wait_is_inconsistent():
+    journal, ledger = unknown_timeline(plan_unknown=70, account_sent=0, reclaim_at=60)
+    fixed_b = plan(**PLAN_B)
+    slot_b = reserve(journal_for(fixed_b), page(fixed_b), 1).attempt_id
+    early = ledger.append(  # the ledger alone allows +73 s
+        slot_event("slot_reserved", NOW + seconds(73), slot_b, plan_sha=fixed_b.sha256)
+    )
+    view = account_view(
+        early, fixed_b, NOW + seconds(900), journal, journal_for(fixed_b)
+    )
+    assert (
+        "account_ledger_inconsistent:account_slot_reserved_before_plan_wait"
+        in view.blocking_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    "changes,issue",
+    [
+        (dict(previous_holder_id="runner-c"), "account_reclaim_previous_holder_mismatch"),
+        (dict(lease_expired_at=NOW + seconds(59)), "account_reclaim_lease_evidence_mismatch"),
+        (dict(holder_id="runner-a"), "account_reclaim_by_the_holder_itself"),
+        (dict(effective_wait_seconds=12), "account_effective_wait_below_rule"),
+    ],
+)  # fmt: skip
+def test_reclaim_requires_consistent_evidence(changes, issue):
+    fixed = plan()
+    journal, ledger = paired_until_send(journal_for(fixed), open_account(), page(fixed))
+    before = ledger.data
+    with pytest.raises(HttpContractError, match=issue):
+        ledger.append(
+            reclaim_event(last_attempt_id(journal), NOW + seconds(60), **changes)
+        )
+    assert ledger.data == before
+
+
+@pytest.mark.parametrize(
+    "missing", ["previous_holder_id", "lease_expired_at", "reclaim_reason"]
+)
+def test_reclaim_without_its_evidence_cannot_be_recorded(missing):
+    with pytest.raises(HttpContractError, match="account_event_missing_required_field"):
+        reclaim_event(DIGEST, NOW + seconds(60), **{missing: None})
+    with pytest.raises(HttpContractError, match="reclaim_reason_invalid"):
+        reclaim_event(DIGEST, NOW + seconds(60), reclaim_reason="looked_stuck")
+
+
+def test_holder_unknown_after_the_plan_record_is_the_normal_path():
+    journal, ledger = unknown_timeline(
+        plan_unknown=2, account_sent=1, account_settled=5
+    )
+    assert reconcile_account_and_plan(ledger, journal).status == "consistent"
+    view = account_view(ledger, plan(**PLAN_B), NOW + seconds(18) - MICRO, journal)
+    assert view.earliest_next_slot_at == NOW + seconds(18)  # account: +5 + 13
+
+
+def test_inconsistent_unknown_states_stay_blocked_after_reload():
+    journal, ledger = unknown_timeline(
+        plan_unknown=1, account_sent=2, account_settled=3
+    )
+    reloaded = (
+        AccountRateLedger(ACCOUNT, ledger.data),
+        EvidenceJournal(journal.plan, journal.data, approval=journal.approval),
+    )
+    view = account_view(reloaded[0], plan(**PLAN_B), NOW + seconds(900), reloaded[1])
+    assert "account_ledger_inconsistent:account_send_after_plan_unknown" in (
+        view.blocking_reasons
+    )
+    reasons = gate_for(reloaded[1], reloaded[0], NOW + seconds(900))
+    assert any(
+        r.startswith("account_rate_blocked:account_ledger_inconsistent")
+        for r in reasons
+    )

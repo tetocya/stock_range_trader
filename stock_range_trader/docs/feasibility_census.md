@@ -262,7 +262,7 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 ### アカウント単位の共有rate limit
 
 同じアカウントへの要求制限は、CalendarとDailyのようにplanが分かれていても共有される。そのためplan内台帳とは別に、
-アカウントごとの共有台帳 `AccountRateLedger`（hash鎖、schema `historical-feasibility-account-rate-ledger-v1`）を定める。
+アカウントごとの共有台帳 `AccountRateLedger`（hash鎖、schema `historical-feasibility-account-rate-ledger-v2`）を定める。
 
 - 記録: アカウントの識別ラベル、アカウント共通の待機規則（`AccountRatePolicy`）、送信枠ID（plan台帳の試行IDと同じ）、
   対応するplan hash、送信枠の保持者ID、予約・送信・確定の時刻、結果（`response`／`429`／`5xx`／`unknown`）、
@@ -290,7 +290,16 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 7. アカウント台帳 `slot_settled`（6の結果と観測Retry-Afterを写し、実効待機を付ける）
 
 照合するのは結果と時刻の因果関係で、記録の種類が違う時刻に完全一致は要求しない（両台帳の追記時刻が違っても、
-順序が成り立てば一致とする）。
+順序が成り立てば一致とする）。各時刻の意味は次のとおり。
+
+| 記録 | 表す事象 |
+| --- | --- |
+| 共有側 `slot_reserved`／plan側 `attempt_reserved` | 送信枠・試行の予約（HTTPより前） |
+| plan側 `attempt_sent`／共有側 `slot_sent` | 送信直前の記録（実際の送信はこの両方より後） |
+| plan側 `response_received` | 応答を観測した時刻 |
+| plan側 `outcome_unknown` | その試行の結果を不明と宣言した時刻（以後、その試行は送信されない） |
+| 共有側 `slot_settled` | 保持者がplan側の記録を写して確定した時刻（plan側の記録以降） |
+| 共有側 `slot_reclaimed` | 別の保持者がlease満了後に回収した時刻（plan側の記録より前でもよい） |
 
 - plan側に確定したHTTP結果があれば、共有側の確定結果が同じ種類（429／5xx／それ以外）でなければ矛盾
   （`account_slot_outcome_mismatch`。共有側 `unknown` も矛盾として扱い、短い待機に丸めない）。
@@ -299,11 +308,26 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 - 時刻: 送信枠の予約はplanの予約以前、共有側の送信記録はplanの送信記録以降かつ応答の観測以前
   （`account_send_after_plan_response`／`account_sent_before_plan_send`）、共有側の確定は応答の観測以降
   （`account_settled_before_plan_result`）、応答の観測は送信枠のlease内（`plan_result_after_account_lease`）。
+- 結果不明の経路: plan側が不明を宣言した後に共有側が同じ試行の送信を記録していれば矛盾
+  （`account_send_after_plan_unknown`）。保持者自身の `unknown` 確定はplan側の記録以降でなければならず、
+  planが未確定のまま保持者が `unknown` で確定した場合も矛盾（`account_settled_before_plan_result`）。
+  plan側より前の確定を認めるのは、明示的な回収（`slot_reclaimed`）だけである。
+
+**回収の証拠。** 別の保持者が送信枠を閉じる方法は `slot_reclaimed` だけで（`slot_settled` は保持者本人に限る）、
+回収者（`holder_id`）、元の保持者（`previous_holder_id`、送信枠の保持者と一致）、依拠したlease期限
+（`lease_expired_at`、送信枠の予約時刻＋leaseと一致）、理由（`reclaim_reason`、現在は `lease_expired` のみ）、
+実効待機を必須とし、回収時刻はlease期限以降でなければならない。回収は常に結果不明を意味する。
+証拠が欠ける・一致しない回収は記録できず、時刻の逆転を回収と推測して受理することはない。
+回収後の送信枠に古い保持者が送信・確定を記録することもできない（`account_slot_not_open`）。
 
 `assess_account_slot()` は、共有台帳に送信枠を持つすべてのplanと、渡されたすべてのplan台帳を照合する。
 台帳の欠落（`account_plan_journal_missing`）、途中状態（`account_ledger_pending:<code>`）、矛盾
 （`account_ledger_inconsistent:<code>`）が1つでもあれば、アカウント上の**どのplanにも**送信枠を与えない。
-共有台帳の直近イベントだけで判定し、別planの既知の結果を見落とすことはない。Gateと入口は、対象plan以外の
+共有台帳の直近イベントだけで判定し、別planの既知の結果を見落とすことはない。
+すべての組が一致したときだけ次回予約可能時刻を1つに決め、共有台帳の待機期限と、各plan側の記録から計算した
+待機期限（例: 回収の後にplan側が記録した結果不明の時刻＋待機）の遅いほうを使う。共有台帳だけで予約された送信枠が
+直前の試行のplan側待機より早ければ矛盾とする（`account_slot_reserved_before_plan_wait`）。
+一致しない・未確定の状態では次回予約可能時刻を返さない（`earliest_next_slot_at=None`）。Gateと入口は、対象plan以外の
 関係plan台帳を `related_journals` として受け取り、bytesから開き直して照合する。
 
 #### 片側だけ更新された状態（クラッシュ）と回復
@@ -313,7 +337,8 @@ HTTP client、認証情報の読込み、ファイル保存・外部固定点へ
 | 1の後（planに試行なし） | `pending_plan_attempt_record` | 送信記録がないので、同じ保持者が送信枠を `unknown` で確定する（送信なしの放棄として一致） |
 | 2〜4の後（両側とも未確定） | `pending_settlement_on_both_ledgers` | plan台帳に `outcome_unknown`、共有台帳に `unknown` の確定を追記する |
 | 6の後（planに結果、共有は未確定） | `pending_account_settlement` | plan台帳の結果と観測Retry-Afterを**そのまま**写した確定を追記する。推測や `unknown` への置換は矛盾になる |
-| 共有側がlease後に `unknown` で回収され、planは送信中 | `pending_plan_settlement` | plan台帳に `outcome_unknown` を追記する |
+| 共有側がlease後に `slot_reclaimed` で回収され、planは送信中 | `pending_plan_settlement` | plan台帳に `outcome_unknown` を追記する（次の予約は両台帳の待機期限の遅いほうから） |
+| 保持者が、planの記録より前に `unknown` で確定 | 矛盾（`account_settled_before_plan_result`） | 自動回復しない |
 | 共有側に結果があり、planに結果がない／planが `unknown` | 矛盾（`account_result_without_plan_result`／`account_result_contradicts_plan_unknown`） | 自動回復しない。所有者が原本・通信記録を確認する |
 | planに結果があり、共有側が `unknown`・別結果・Retry-After欠落 | 矛盾 | 自動回復しない（lease回収後に古い実行が結果を書いた場合を含む） |
 | 共有側に送信記録があり、planに試行がない | 矛盾（`account_sent_without_plan_attempt`） | 自動回復しない |

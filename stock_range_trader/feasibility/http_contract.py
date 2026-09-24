@@ -1772,7 +1772,7 @@ def verify_calendar_anchor(
 
 # ----------------------------------------------------------- account rate ledger
 
-ACCOUNT_LEDGER_SCHEMA = "historical-feasibility-account-rate-ledger-v1"
+ACCOUNT_LEDGER_SCHEMA = "historical-feasibility-account-rate-ledger-v2"
 _ACCOUNT_OUTCOMES = frozenset({"response", "429", "5xx", "unknown"})
 
 
@@ -1829,17 +1829,32 @@ _ACCOUNT_REQUIRED = {
     "slot_settled": frozenset(
         {"slot_id", "holder_id", "outcome", "effective_wait_seconds"}
     ),
+    # Recovery of an abandoned slot by another holder: explicit evidence only.
+    "slot_reclaimed": frozenset(
+        {
+            "slot_id",
+            "holder_id",
+            "previous_holder_id",
+            "lease_expired_at",
+            "reclaim_reason",
+            "effective_wait_seconds",
+        }
+    ),
 }
+RECLAIM_REASONS = frozenset({"lease_expired"})
 
 
 @dataclass(frozen=True)
 class AccountRateEvent:
     """One account-wide slot event; ``slot_id`` is the plan journal's attempt id.
 
-    On ``slot_settled``, ``observed_retry_after_seconds`` is the value seen on
-    the HTTP response (copied unchanged from the plan journal) and
-    ``effective_wait_seconds`` is the wait the account applies after this slot;
-    the latter may be longer than any rule, but never shorter.
+    On ``slot_settled`` (only by the slot's own holder),
+    ``observed_retry_after_seconds`` is the value seen on the HTTP response
+    (copied unchanged from the plan journal) and ``effective_wait_seconds`` is
+    the wait the account applies after this slot; the latter may be longer than
+    any rule, but never shorter. ``slot_reclaimed`` is the only way another
+    holder may close a slot: it names the previous holder, the lease end it
+    relies on and the reason, and always means an unknown outcome.
     """
 
     kind: str
@@ -1851,6 +1866,9 @@ class AccountRateEvent:
     outcome: str | None = None
     observed_retry_after_seconds: int | None = None
     effective_wait_seconds: int | None = None
+    previous_holder_id: str | None = None
+    lease_expired_at: datetime | None = None
+    reclaim_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _ACCOUNT_REQUIRED:
@@ -1861,8 +1879,16 @@ class AccountRateEvent:
         for name in ("slot_id", "plan_sha256"):
             if getattr(self, name) is not None:
                 _hex(getattr(self, name), name)
-        if self.holder_id is not None:
-            _label(self.holder_id, "holder_id")
+        for name in ("holder_id", "previous_holder_id"):
+            if getattr(self, name) is not None:
+                _label(getattr(self, name), name)
+        if self.lease_expired_at is not None:
+            _utc(self.lease_expired_at, "lease_expired_at")
+        if (
+            self.reclaim_reason is not None
+            and self.reclaim_reason not in RECLAIM_REASONS
+        ):
+            raise HttpContractError("reclaim_reason_invalid")
         if self.outcome is not None and self.outcome not in _ACCOUNT_OUTCOMES:
             raise HttpContractError("account_outcome_invalid")
         if self.observed_retry_after_seconds is not None:
@@ -1907,6 +1933,13 @@ class AccountRateEvent:
             "outcome": self.outcome,
             "observed_retry_after_seconds": self.observed_retry_after_seconds,
             "effective_wait_seconds": self.effective_wait_seconds,
+            "previous_holder_id": self.previous_holder_id,
+            "lease_expired_at": (
+                _utc(self.lease_expired_at, "lease_expired_at")
+                if self.lease_expired_at is not None
+                else None
+            ),
+            "reclaim_reason": self.reclaim_reason,
         }
 
     @classmethod
@@ -1915,6 +1948,10 @@ class AccountRateEvent:
             raise HttpContractError("account_event_schema_invalid")
         raw = dict(value)
         raw["at"] = _read_utc(raw["at"], "event_at")
+        if raw["lease_expired_at"] is not None:
+            raw["lease_expired_at"] = _read_utc(
+                raw["lease_expired_at"], "lease_expired_at"
+            )
         policy = raw["policy"]
         if policy is not None:
             if type(policy) is not dict or set(policy) != set(
@@ -1935,6 +1972,7 @@ class _Slot:
     settled_at: datetime | None = None
     observed_retry_after: int | None = None
     effective_wait: int | None = None
+    reclaimed_by: str | None = None  # set only by an explicit slot_reclaimed
 
 
 class _AccountState:
@@ -2003,33 +2041,59 @@ class _AccountState:
             raise HttpContractError("account_slot_lease_too_short_for_send")
         self.slots[event.slot_id] = replace(slot, sent_at=at)
 
-    def _on_slot_settled(self, event: AccountRateEvent, at: datetime) -> None:
-        slot = self._open(event)
-        if event.holder_id != slot.holder_id:
-            # Another process may reclaim an abandoned slot, only after its lease
-            # and only as an unknown outcome (the request may have been sent).
-            if event.outcome != "unknown":
-                raise HttpContractError("account_slot_holder_mismatch")
-            if at < self.lease_end(slot):
-                raise HttpContractError("account_slot_reclaim_before_lease_expiry")
-        elif event.outcome != "unknown" and slot.sent_at is None:
-            raise HttpContractError("account_slot_outcome_without_send")
-        required = max(
-            self.policy.wait_after(event.outcome),
-            event.observed_retry_after_seconds or 0,
-        )
-        if event.effective_wait_seconds < required:
+    def _close(self, slot_id, slot, at, outcome, observed, effective, by=None):
+        required = max(self.policy.wait_after(outcome), observed or 0)
+        if effective < required:
             raise HttpContractError("account_effective_wait_below_rule")
-        self.slots[event.slot_id] = replace(
+        self.slots[slot_id] = replace(
             slot,
-            outcome=event.outcome,
+            outcome=outcome,
             settled_at=at,
-            observed_retry_after=event.observed_retry_after_seconds,
-            effective_wait=event.effective_wait_seconds,
+            observed_retry_after=observed,
+            effective_wait=effective,
+            reclaimed_by=by,
         )
         self.open_slot = None
         self.last_settled_at = at
-        self.last_effective_wait = event.effective_wait_seconds
+        self.last_effective_wait = effective
+
+    def _on_slot_settled(self, event: AccountRateEvent, at: datetime) -> None:
+        slot = self._open(event)
+        if event.holder_id != slot.holder_id:
+            # Only the holder settles; any other process must use slot_reclaimed.
+            raise HttpContractError("account_slot_holder_mismatch")
+        if event.outcome != "unknown" and slot.sent_at is None:
+            raise HttpContractError("account_slot_outcome_without_send")
+        self._close(
+            event.slot_id,
+            slot,
+            at,
+            event.outcome,
+            event.observed_retry_after_seconds,
+            event.effective_wait_seconds,
+        )
+
+    def _on_slot_reclaimed(self, event: AccountRateEvent, at: datetime) -> None:
+        slot = self._open(event)
+        if event.holder_id == slot.holder_id:
+            raise HttpContractError("account_reclaim_by_the_holder_itself")
+        if event.previous_holder_id != slot.holder_id:
+            raise HttpContractError("account_reclaim_previous_holder_mismatch")
+        lease_end = self.lease_end(slot)
+        if event.lease_expired_at.astimezone(UTC) != lease_end:
+            raise HttpContractError("account_reclaim_lease_evidence_mismatch")
+        if at < lease_end:
+            raise HttpContractError("account_slot_reclaim_before_lease_expiry")
+        # A reclaim always means an unknown outcome: the request may have been sent.
+        self._close(
+            event.slot_id,
+            slot,
+            at,
+            "unknown",
+            None,
+            event.effective_wait_seconds,
+            by=event.holder_id,
+        )
 
 
 class AccountRateLedger:
@@ -2239,6 +2303,13 @@ def _pair_attempt_and_slot(plan, state, attempt, slot, bad, pending) -> None:
     ):
         bad.append("account_sent_before_plan_send")
     lease_end = state.lease_end(slot)
+    if (
+        attempt.state == "unknown"
+        and slot.sent_at is not None
+        and slot.sent_at > attempt.settled_at
+    ):
+        # The plan gave the attempt up before the account says it was sent.
+        bad.append("account_send_after_plan_unknown")
     if attempt.status is not None:  # the plan observed an HTTP response
         outcome = _status_outcome(attempt.status)
         if slot.sent_at is None:
@@ -2269,6 +2340,10 @@ def _pair_attempt_and_slot(plan, state, attempt, slot, bad, pending) -> None:
         if slot.outcome != "unknown":
             bad.append("account_result_contradicts_plan_unknown")
             return
+        # The holder settles after the plan's record (write order); only an
+        # explicit reclaim by another holder may come first.
+        if slot.reclaimed_by is None and slot.settled_at < attempt.settled_at:
+            bad.append("account_settled_before_plan_result")
         required = max(
             _plan_rule_wait(plan.retry, "unknown"), state.policy.wait_after("unknown")
         )
@@ -2277,8 +2352,11 @@ def _pair_attempt_and_slot(plan, state, attempt, slot, bad, pending) -> None:
             pending.append("pending_settlement_on_both_ledgers")
         elif slot.outcome != "unknown":
             bad.append("account_result_without_plan_result")
+        elif slot.reclaimed_by is None:
+            # The holder may settle only after the plan recorded its outcome.
+            bad.append("account_settled_before_plan_result")
         else:
-            pending.append("pending_plan_settlement")  # e.g. slot reclaimed
+            pending.append("pending_plan_settlement")  # reclaimed: plan records unknown
         return
     if slot.effective_wait < required:
         bad.append("account_effective_wait_below_plan_rule")
@@ -2292,6 +2370,37 @@ def check_account_plan_consistency(
     result = reconcile_account_and_plan(ledger, journal)
     if result.status != "consistent":
         raise HttpContractError(result.issues[0])
+
+
+def _plan_side_next(state, by_plan, slot_id) -> datetime | None:
+    """When the plan journal allows the next attempt after this slot's attempt."""
+
+    slot = state.slots[slot_id]
+    journal = by_plan.get(slot.plan_sha256)
+    attempt = journal._state.attempts.get(slot_id) if journal is not None else None
+    if attempt is None or attempt.settled_at is None:
+        return None  # e.g. a reservation abandoned before the plan recorded it
+    outcome = "unknown" if attempt.status is None else _status_outcome(attempt.status)
+    wait = max(_plan_rule_wait(journal.plan.retry, outcome), attempt.retry_after or 0)
+    return _add_seconds(attempt.settled_at, wait)
+
+
+def _plan_side_waits(state, by_plan) -> tuple[str | None, datetime | None]:
+    """Check each slot against the plan-side wait of the slot before it.
+
+    Both ledgers are consistent here; this adds the waits that the plan side
+    measures from its own records (for example an unknown recorded after a
+    reclaim), so neither ledger's wait is shortened for the next plan.
+    """
+
+    slot_ids = list(state.slots)  # reservation order
+    for previous, following in zip(slot_ids, slot_ids[1:], strict=False):
+        required = _plan_side_next(state, by_plan, previous)
+        if required is not None and state.slots[following].reserved_at < required:
+            return "account_slot_reserved_before_plan_wait", None
+    if not slot_ids:
+        return None, None
+    return None, _plan_side_next(state, by_plan, slot_ids[-1])
 
 
 @dataclass(frozen=True)
@@ -2345,14 +2454,27 @@ def assess_account_slot(
     # Every plan with a slot, and every supplied journal (its attempts must all
     # hold slots: a stale or truncated account ledger is not a clean state).
     referenced = [slot.plan_sha256 for slot in state.slots.values()]
+    all_consistent = True
     for plan_sha in dict.fromkeys([*referenced, *by_plan]):
         journal = by_plan.get(plan_sha)
         if journal is None:
             reasons.append("account_plan_journal_missing")
+            all_consistent = False
             continue
         result = reconcile_account_and_plan(ledger, journal)
         if result.status != "consistent":
+            all_consistent = False
             reasons.extend(f"account_ledger_{result.status}:{i}" for i in result.issues)
+    plan_side_next = None
+    if state.policy is not None:  # an ordering invariant, checked in every state
+        try:
+            issue, plan_side_next = _plan_side_waits(state, by_plan)
+        except HttpContractError:
+            reasons.append("account_time_not_representable")
+        else:
+            if issue is not None:
+                all_consistent = False
+                reasons.append(f"account_ledger_inconsistent:{issue}")
     if state.policy is None:
         reasons.append("account_ledger_not_opened")
     else:
@@ -2363,10 +2485,13 @@ def assess_account_slot(
                 reasons.append("account_slot_in_use")
                 if current >= state.lease_end(state.slots[state.open_slot]):
                     reasons.append("account_slot_reclaimable_as_unknown")
-            else:
+            elif all_consistent:
                 earliest = state.earliest_next_slot_at()
+                if plan_side_next is not None and plan_side_next > earliest:
+                    earliest = plan_side_next  # e.g. a plan record after a reclaim
                 if current < earliest:
                     reasons.append("account_rate_limit_wait")
+            # Otherwise the next time is not uniquely determined: no earliest.
         except HttpContractError:
             reasons.append("account_time_not_representable")
     return AccountSlotAssessment(
