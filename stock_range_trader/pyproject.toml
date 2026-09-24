@@ -57,6 +57,7 @@ include = [
     "config*",
     "data*",
     "delayed_replay*",
+    "feasibility*",
     "indicators*",
     "metrics*",
     "reports*",
