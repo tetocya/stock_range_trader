@@ -184,3 +184,55 @@ hash鎖は台帳の外に固定点を持たないため、完全な行単位で�
 
 資金上限やCandidate選択機構を変えると、標本数だけでなく損益・リスク・戦略全体が変わる。
 実測後に設定を変える場合は、変更理由、参照したデータ、影響する仕様、新しい検証区間を記録する。
+
+## 後続の事前実測HTTP取得に向けた契約（通信機能ではない）
+
+`feasibility/http_contract.py` は **historical_feasibility 専用の純粋な値・検証契約**を定義する。
+取得plan、承認の範囲照合、台帳イベントの状態遷移、累積予算、原本一覧と外部receiptの内容照合を
+人工データだけで扱う。HTTP client、認証情報の読込み、ファイル保存・外部固定点への送信、実取得入口はない。
+既存 `run_offline_fixture_acquisition` の具象Transport型検査は変えていない。
+
+### 固定planとCalendarの2方式
+
+- `calendar_discovery`: Calendarだけを対象とする独立plan。後続のDaily日付や予算を自動生成・拡張しない。
+- `predeclared_daily`: 取得前に出典hash付きの営業日集合を固定し、Calendar・Master・Dailyを対象とする。
+- `calendar_anchored_daily`: 別途固定されたCalendar証拠hashから営業日集合を**新planとして**固定し、Master・Dailyを対象とする。
+
+各planはR、対象日付、Calendar出典の参照先とhash、endpoint、逐次ページ送り、最大試行・ページ・時間、転送／展開／保存容量、
+1ページ上限、Retry規則、専用出力先、成果物ID、有効期間を正規化JSONのSHA-256で固定する。
+重複日付・不正な型・曖昧なtimezone・指定root外を拒否する。日付順序や同じ瞬間のtimezone表記差は
+同じhashとなる。出力識別子はこのcheckoutの `outputs/feasibility/http/<artifact_id>` に限定するが、
+これは**契約時のパス照合だけ**であり、ファイルの安全な作成は次PRの課題である。
+6月試験worktree、`.delayed_replay`、既存DB・台帳・承認ファイルは今回の出力対象にならない。
+
+### 承認・予算・証拠の保証範囲
+
+`OwnerApprovalClaim` はplan hash・範囲・endpoint・予算・出力先・期間と、承認者・イベント・証拠参照の
+**自己申告メタデータ**を照合する。既存コードに独立した所有者署名／承認台帳の検証基盤は確認できず、
+`check_approval_scope()` は真正性を `False` のまま返す。任意の承認者名や `approved=true`、環境変数だけで
+実取得の許可は成立しない。今回、所有者承認資料は作成していない。
+
+`EvidenceJournal` は、送信前の予約、送信、応答、結果不明、原本保存、ページ完了を順序付きhash鎖の
+**バイト列契約**として検査する。予約時点で試行数を消費し、429・Retry・結果不明も累積数に残す。
+結果不明の転送／展開量は、次PRで実体を照合するまで1ページ上限分を保守的に仮計上する。
+`BodyInventory` は孤児・途中ファイルを保存容量へ含めるための申告値で、実ディスクを検査しない。
+孤児・途中ファイルが残る間は、容量に余裕があっても次の試行を予約可能と表示しない。
+resumeは既存台帳から予算を再構成し、別plan hashを拒否する。完了済みplanは新試行を受け付けない。
+
+`ExternalReceiptClaim` は成果物ID、plan hash、台帳の行数・バイト数・head hash、原本集合hash、
+固定時刻・発行主体の**内容一致**を検査する。外部保管先の独立性・署名の真正性は検証しない。
+台帳の完全な末尾削除は、独立して固定されたreceiptがなければ検出できない。
+`assess_live_acquisition_gate()` は承認・receiptの真正性とHTTP入口が未実装のため常に閉じる。
+
+### 次PRと所有者判断
+
+HTTP・保存PRで、実通信の総deadline、全HTTP試行の逐次rate limit、429の待機、暗黙Retry無効化、
+本文の逐次・圧縮前後容量、実ファイルと台帳の照合、fd相対I/O、クラッシュ後の安全な再開を実装・検証する。
+J-Quantsの公式レート制限はFree 5回／分のsliding windowで、429には通常 `Retry-After` が付かず、
+公式は少なくとも1分（確実性のため約2分）の待機を案内する。契約値としては13秒間隔と429後120秒を
+下限にしたが、**今回のコードは待機・timeoutを実行しない**。
+
+所有者はR・対象営業日集合・各予算、承認の独立した真正性検証方式、外部receiptの保管先・署名方式・
+固定頻度、実出力rootの運用、同一アカウントの排他運用を別途確定する必要がある。
+契約の人工テストは `python -m pytest -q tests/test_feasibility_http_contract.py` で再実行できる。
+この結果を実アカウント権限、実HTTP接続、市場データ、正式Real OOSの検証成功として扱わない。
