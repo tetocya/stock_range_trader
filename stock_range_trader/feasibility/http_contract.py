@@ -1,25 +1,32 @@
 """Offline-only contracts for a future historical-feasibility HTTP acquisition.
 
-No function in this module performs I/O, verifies an owner's identity, or opens
-an HTTP connection. The live-acquisition gate is intentionally closed.
+No function in this module opens a network connection, reads credentials,
+writes files or verifies an owner's identity. The only file-system access is an
+lstat of the fixed output path's components when a plan or approval is built.
+The live-acquisition gate is intentionally closed.
 """
 
 from __future__ import annotations
 
+import copy
+import functools
 import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NoReturn
 
-from .acquisition import CALENDAR, DAILY, MASTER, DateQuery
+from .acquisition import CALENDAR, DAILY, HOLIDAY_DIVISIONS, MASTER, DateQuery
 
 PLAN_SCHEMA = "historical-feasibility-http-plan-v1"
 APPROVAL_SCHEMA = "historical-feasibility-owner-approval-v1"
 RECEIPT_SCHEMA = "historical-feasibility-external-receipt-v1"
-JOURNAL_SCHEMA = "historical-feasibility-journal-v1"
+JOURNAL_SCHEMA = "historical-feasibility-journal-v2"
+BODY_SET_SCHEMA = "historical-feasibility-body-set-v2"
+ANCHOR_SCHEMA = "historical-feasibility-calendar-anchor-v1"
 PURPOSE = "historical_feasibility"
 AUTH_REFERENCE = "JQUANTS_API_KEY"
 HTTP_OUTPUT_ROOT = (
@@ -221,8 +228,8 @@ class HttpAcquisitionPlan:
             if (
                 dates
                 or self.master_date is not None
-                or self.calendar_source_sha256
-                or self.calendar_source_reference
+                or self.calendar_source_sha256 is not None
+                or self.calendar_source_reference is not None
             ):
                 raise HttpContractError("calendar_discovery_must_be_calendar_only")
         else:
@@ -244,7 +251,7 @@ class HttpAcquisitionPlan:
         ):
             raise HttpContractError("budget_below_fixed_query_count")
 
-    @property
+    @functools.cached_property
     def queries(self) -> tuple[DateQuery, ...]:
         if self.kind == "calendar_discovery":
             return (
@@ -260,7 +267,7 @@ class HttpAcquisitionPlan:
             DateQuery(DAILY, market_date=day) for day in self.daily_dates
         )
 
-    @property
+    @functools.cached_property
     def allowed_endpoints(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(q.endpoint for q in self.queries))
 
@@ -297,13 +304,17 @@ class HttpAcquisitionPlan:
             "expiry_policy": "stop_without_reauthorization",
         }
 
-    @property
+    @functools.cached_property
     def sha256(self) -> str:
         return _digest(self.to_dict())
 
-    @property
+    @functools.cached_property
     def scope_sha256(self) -> str:
         return _digest(self.scope())
+
+    @functools.cached_property
+    def query_positions(self) -> dict[DateQuery, int]:
+        return {query: index for index, query in enumerate(self.queries)}
 
 
 @dataclass(frozen=True)
@@ -348,13 +359,13 @@ class OwnerApprovalClaim:
             or type(self.allowed_endpoints) is not tuple
         ):
             raise HttpContractError("approval_scope_must_be_immutable_tuples")
-        if len(set(self.daily_dates)) != len(self.daily_dates):
-            raise HttpContractError("duplicate_approval_daily_date")
-        object.__setattr__(self, "daily_dates", tuple(sorted(self.daily_dates)))
         if any(type(day) is not str for day in self.daily_dates):
             raise HttpContractError("approval_daily_date_must_be_text")
         for day in self.daily_dates:
             _iso_day(day, "approval_daily_date")
+        if len(set(self.daily_dates)) != len(self.daily_dates):
+            raise HttpContractError("duplicate_approval_daily_date")
+        object.__setattr__(self, "daily_dates", tuple(sorted(self.daily_dates)))
         if self.purpose != PURPOSE or type(self.limits) is not HttpLimits:
             raise HttpContractError("approval_purpose_or_limits_invalid")
         if type(self.retry) is not RetryRules:
@@ -387,23 +398,16 @@ class OwnerApprovalClaim:
             "authenticity_claim": "unverified_external_authority_not_configured",
         }
 
+    @property
+    def sha256(self) -> str:
+        """Hash of the normalized claim content; never proof of who issued it."""
 
-@dataclass(frozen=True)
-class ApprovalScopeCheck:
-    metadata_matches: bool
-    authenticity_verified: bool = False
+        return _digest(self.to_dict())
 
 
-def check_approval_scope(
-    plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim, *, now: datetime
-) -> ApprovalScopeCheck:
-    """Reject all mismatches without asserting that the owner signed a claim."""
-
-    if (
-        type(plan) is not HttpAcquisitionPlan
-        or type(approval) is not OwnerApprovalClaim
-    ):
-        raise HttpContractError("approval_claim_required")
+def _check_approval_fields(
+    plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim
+) -> None:
     expected = {
         "plan_sha256": plan.sha256,
         "artifact_id": plan.artifact_id,
@@ -422,6 +426,28 @@ def check_approval_scope(
     for name, expected_value in expected.items():
         if getattr(approval, name) != expected_value:
             raise HttpContractError(f"approval_{name}_mismatch")
+
+
+@dataclass(frozen=True)
+class ApprovalScopeCheck:
+    """Informational result; never an authorization token for any entry point."""
+
+    metadata_matches: bool
+    approval_sha256: str
+    authenticity_verified: bool = field(default=False, init=False)
+
+
+def check_approval_scope(
+    plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim, *, now: datetime
+) -> ApprovalScopeCheck:
+    """Reject all mismatches without asserting that the owner signed a claim."""
+
+    if (
+        type(plan) is not HttpAcquisitionPlan
+        or type(approval) is not OwnerApprovalClaim
+    ):
+        raise HttpContractError("approval_claim_required")
+    _check_approval_fields(plan, approval)
     current = _utc(now, "now")
     if not (
         _utc(plan.not_before, "not_before")
@@ -431,7 +457,7 @@ def check_approval_scope(
         <= _utc(plan.expires_at, "expires_at")
     ):
         raise HttpContractError("approval_outside_validity_window")
-    return ApprovalScopeCheck(metadata_matches=True)
+    return ApprovalScopeCheck(metadata_matches=True, approval_sha256=approval.sha256)
 
 
 @dataclass(frozen=True)
@@ -470,7 +496,7 @@ class PageRequest:
 def validate_page_request(plan: HttpAcquisitionPlan, page: PageRequest) -> None:
     if type(plan) is not HttpAcquisitionPlan or type(page) is not PageRequest:
         raise HttpContractError("plan_and_page_request_required")
-    if page.query not in plan.queries:
+    if page.query not in plan.query_positions:
         raise HttpContractError("page_outside_fixed_plan")
     if page.page_index >= plan.limits.max_pages_per_query:
         raise HttpContractError("page_index_exceeds_plan_limit")
@@ -502,6 +528,33 @@ _EVENT_KINDS = frozenset(
         "run_stopped",
     }
 )
+_REQUIRED_FIELDS = {
+    "attempt_reserved": frozenset(
+        {
+            "attempt_id",
+            "page",
+            "attempt_number",
+            "approval_sha256",
+            "allowed_transfer_bytes",
+            "allowed_decoded_bytes",
+            "allowed_saved_bytes",
+        }
+    ),
+    "attempt_sent": frozenset({"attempt_id"}),
+    "response_received": frozenset(
+        {"attempt_id", "status", "transfer_bytes", "decoded_bytes"}
+    ),
+    "outcome_unknown": frozenset({"attempt_id"}),
+    "body_saved": frozenset({"attempt_id", "body_sha256", "saved_bytes"}),
+    "page_completed": frozenset({"attempt_id"}),
+    "run_completed": frozenset(),
+    "run_stopped": frozenset({"reason", "terminal"}),
+}
+# A final page has next_key=None; a server wait hint is optional on a response.
+_OPTIONAL_FIELDS = {
+    "page_completed": frozenset({"next_key"}),
+    "response_received": frozenset({"retry_after_seconds"}),
+}
 
 
 @dataclass(frozen=True)
@@ -521,24 +574,39 @@ class JournalEvent:
     next_key: str | None = None
     reason: str | None = None
     terminal: bool | None = None
+    approval_sha256: str | None = None
+    allowed_transfer_bytes: int | None = None
+    allowed_decoded_bytes: int | None = None
+    allowed_saved_bytes: int | None = None
+    retry_after_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in _EVENT_KINDS:
             raise HttpContractError("unknown_journal_event")
         _utc(self.at, "event_at")
-        if self.attempt_id is not None:
-            _hex(self.attempt_id, "attempt_id")
-        if self.body_sha256 is not None:
-            _hex(self.body_sha256, "body_sha256")
+        for name in ("attempt_id", "body_sha256", "approval_sha256"):
+            if getattr(self, name) is not None:
+                _hex(getattr(self, name), name)
         if self.page is not None and type(self.page) is not PageRequest:
             raise HttpContractError("event_page_type_invalid")
-        if self.attempt_number is not None:
-            _positive_int(self.attempt_number, "attempt_number")
+        for name in (
+            "attempt_number",
+            "allowed_transfer_bytes",
+            "allowed_decoded_bytes",
+            "allowed_saved_bytes",
+        ):
+            if getattr(self, name) is not None:
+                _positive_int(getattr(self, name), name)
         if self.status is not None and (
             type(self.status) is not int or not 100 <= self.status <= 599
         ):
             raise HttpContractError("invalid_http_status")
-        for name in ("transfer_bytes", "decoded_bytes", "saved_bytes"):
+        for name in (
+            "transfer_bytes",
+            "decoded_bytes",
+            "saved_bytes",
+            "retry_after_seconds",
+        ):
             if getattr(self, name) is not None:
                 _nonnegative_int(getattr(self, name), name)
         if self.next_key is not None:
@@ -551,45 +619,18 @@ class JournalEvent:
         if self.terminal is not None and type(self.terminal) is not bool:
             raise HttpContractError("terminal_must_be_bool")
         fields = {
-            "attempt_id": self.attempt_id,
-            "page": self.page,
-            "attempt_number": self.attempt_number,
-            "status": self.status,
-            "transfer_bytes": self.transfer_bytes,
-            "decoded_bytes": self.decoded_bytes,
-            "body_sha256": self.body_sha256,
-            "saved_bytes": self.saved_bytes,
-            "next_key": self.next_key,
-            "reason": self.reason,
-            "terminal": self.terminal,
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name not in ("kind", "at")
         }
-        required = {
-            "attempt_reserved": {"attempt_id", "page", "attempt_number"},
-            "attempt_sent": {"attempt_id"},
-            "response_received": {
-                "attempt_id",
-                "status",
-                "transfer_bytes",
-                "decoded_bytes",
-            },
-            "outcome_unknown": {"attempt_id"},
-            "body_saved": {"attempt_id", "body_sha256", "saved_bytes"},
-            "page_completed": {"attempt_id"},
-            "run_completed": set(),
-            "run_stopped": {"reason", "terminal"},
-        }[self.kind]
+        required = _REQUIRED_FIELDS[self.kind]
         if any(fields[name] is None for name in required):
             raise HttpContractError("journal_event_missing_required_field")
+        allowed = required | _OPTIONAL_FIELDS.get(self.kind, frozenset())
         if any(
-            value is not None for name, value in fields.items() if name not in required
+            value is not None for name, value in fields.items() if name not in allowed
         ):
-            # A final page has next_key=None; a continuing page may carry one.
-            if self.kind != "page_completed" or any(
-                value is not None
-                for name, value in fields.items()
-                if name not in required | {"next_key"}
-            ):
-                raise HttpContractError("journal_event_has_forbidden_field")
+            raise HttpContractError("journal_event_has_forbidden_field")
         if self.kind == "body_saved" and self.saved_bytes == 0:
             raise HttpContractError("saved_body_must_be_nonempty")
 
@@ -608,6 +649,11 @@ class JournalEvent:
             "next_key": self.next_key,
             "reason": self.reason,
             "terminal": self.terminal,
+            "approval_sha256": self.approval_sha256,
+            "allowed_transfer_bytes": self.allowed_transfer_bytes,
+            "allowed_decoded_bytes": self.allowed_decoded_bytes,
+            "allowed_saved_bytes": self.allowed_saved_bytes,
+            "retry_after_seconds": self.retry_after_seconds,
         }
 
     @classmethod
@@ -654,19 +700,389 @@ class JournalEvent:
         return cls(**raw)
 
 
-class EvidenceJournal:
-    """Pure, immutable-by-value hash-chain contract; not a file writer."""
+_OPEN_STATES = frozenset({"reserved", "sent", "responded", "body_saved"})
+_RETRYABLE_STATES = frozenset({"unknown", "failed"})
 
-    def __init__(self, plan: HttpAcquisitionPlan, data: bytes = b"") -> None:
+
+@dataclass(frozen=True)
+class _Attempt:
+    page: PageRequest
+    reserved_at: datetime
+    allowed: tuple[int, int, int]
+    state: str = "reserved"
+    sent_at: datetime | None = None
+    status: int | None = None
+    body_sha256: str | None = None
+
+
+class _JournalState:
+    """Verified transition state of one journal.
+
+    ``apply`` checks one event and then updates the state. Opening a journal
+    applies every line to a fresh state; ``append`` applies only the new event
+    to a copy, so both paths enforce exactly the same rules.
+    """
+
+    _DICTS = (
+        "attempts",
+        "page_attempts",
+        "pages",
+        "saved_bodies",
+        "completed_bodies",
+        "query_bodies",
+    )
+
+    def __init__(
+        self, plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim | None
+    ) -> None:
+        self.plan = plan
+        self.approval = approval
+        self.approval_sha256 = approval.sha256 if approval is not None else None
+        self.attempts: dict[str, _Attempt] = {}
+        self.page_attempts: dict[str, tuple[int, str]] = {}
+        # query_id -> completed pages in order: (request, next_key, body_sha256)
+        self.pages: dict[str, tuple[tuple[PageRequest, str | None, str], ...]] = {}
+        self.saved_bodies: dict[str, int] = {}
+        self.completed_bodies: dict[str, bool] = {}
+        self.query_bodies: dict[tuple[str, str], int] = {}
+        self.first_reserved_at: datetime | None = None
+        self.last_event_at: datetime | None = None
+        self.last_network_at: datetime | None = None
+        self.last_outcome: str | None = None
+        self.last_retry_after = 0
+        self.open_attempt: str | None = None
+        self.complete_prefix = 0  # queries 0..n-1 have their final page
+        self.over_budget = False
+        self.completed = False
+        self.terminal_stop = False
+        self.transfer_bytes = self.decoded_bytes = self.saved_total = 0
+        self.reserved = self.sent = self.responses = self.completed_pages = 0
+        self.unknown = self.retries = self.http_429 = 0
+
+    def clone(self) -> _JournalState:
+        new = copy.copy(self)
+        for name in self._DICTS:
+            setattr(new, name, dict(getattr(self, name)))
+        return new
+
+    # ----------------------------------------------------------- derived rules
+
+    def allowances(self) -> tuple[int, int, int]:
+        """Per-attempt caps: min(page cap, remaining total), each budget separately."""
+
+        lim = self.plan.limits
+        return (
+            min(
+                lim.max_page_transfer_bytes,
+                lim.max_transfer_bytes
+                - self.transfer_bytes
+                - self.unknown * lim.max_page_transfer_bytes,
+            ),
+            min(
+                lim.max_page_decoded_bytes,
+                lim.max_decoded_bytes
+                - self.decoded_bytes
+                - self.unknown * lim.max_page_decoded_bytes,
+            ),
+            min(lim.max_page_saved_bytes, lim.max_saved_bytes - self.saved_total),
+        )
+
+    def required_wait_seconds(self) -> int:
+        retry = self.plan.retry
+        if self.last_outcome is None:
+            return 0
+        specific = {
+            "response": 0,
+            "429": retry.min_wait_after_429_seconds,
+            "5xx": retry.min_wait_after_5xx_seconds,
+            "network": retry.min_wait_after_network_error_seconds,
+        }[self.last_outcome]
+        return max(retry.min_interval_seconds, specific, self.last_retry_after)
+
+    def earliest_next_attempt_at(self) -> datetime:
+        """Measured from the previous attempt's response or unknown outcome.
+
+        That time is an upper bound of when the previous request was sent, so
+        the interval is never shorter than the plan's rule.
+        """
+
+        start = self.plan.not_before
+        if self.approval is not None:
+            start = max(start, self.approval.valid_from)
+        start = start.astimezone(UTC)
+        if self.last_network_at is None:
+            return start
+        return max(
+            start,
+            self.last_network_at + timedelta(seconds=self.required_wait_seconds()),
+        )
+
+    def deadline(self) -> datetime | None:
+        if self.first_reserved_at is None:
+            return None
+        return self.first_reserved_at + timedelta(
+            seconds=self.plan.limits.max_elapsed_seconds
+        )
+
+    def next_page(self) -> tuple[PageRequest | None, int | None, str | None]:
+        """The page a runner would reserve next, or why none can be reserved."""
+
+        for query in self.plan.queries[self.complete_prefix :]:
+            prior = self.pages.get(query.query_id, ())
+            if len(prior) >= self.plan.limits.max_pages_per_query:
+                return None, None, "page_limit_reached"
+            request = PageRequest(query, len(prior), prior[-1][1] if prior else None)
+            count, last_id = self.page_attempts.get(request.request_id, (0, None))
+            if count >= self.plan.retry.max_attempts_per_page:
+                return request, None, "page_retry_budget_exhausted"
+            if last_id is not None and self.attempts[last_id].state not in (
+                _RETRYABLE_STATES | _OPEN_STATES
+            ):
+                return request, None, "previous_attempt_not_retryable"
+            return request, count + 1, None
+        return None, None, "all_pages_completed"
+
+    # ------------------------------------------------------------- transitions
+
+    def apply(self, event: JournalEvent) -> None:
+        at = event.at.astimezone(UTC)
+        if self.last_event_at is not None and at < self.last_event_at:
+            raise HttpContractError("journal_clock_regressed")
+        if self.completed or self.terminal_stop:
+            raise HttpContractError("journal_event_after_terminal_state")
+        getattr(self, "_on_" + event.kind)(event, at)
+        self.last_event_at = at
+
+    def _attempt(self, event: JournalEvent) -> _Attempt:
+        attempt = self.attempts.get(event.attempt_id)
+        if attempt is None:
+            raise HttpContractError("event_for_unknown_attempt")
+        return attempt
+
+    def _within(self, at: datetime, prefix: str) -> None:
+        deadline = self.deadline()
+        if deadline is not None and at >= deadline:
+            raise HttpContractError(f"{prefix}_after_cumulative_deadline")
+        if not self.plan.not_before <= at < self.plan.expires_at:
+            raise HttpContractError(f"{prefix}_outside_plan_validity")
+
+    def _on_attempt_reserved(self, event: JournalEvent, at: datetime) -> None:
+        plan, limits, page = self.plan, self.plan.limits, event.page
+        validate_page_request(plan, page)
+        if self.over_budget:
+            raise HttpContractError("previous_page_budget_overrun")
+        if self.open_attempt is not None:
+            raise HttpContractError("prior_attempt_unsettled")
+        if plan.query_positions[page.query] > self.complete_prefix:
+            raise HttpContractError("prior_query_incomplete")
+        if self.completed_pages >= limits.max_pages_total:
+            raise HttpContractError("page_budget_exhausted")
+        allowed = self.allowances()
+        for value, name in zip(allowed, ("transfer", "decoded", "saved"), strict=True):
+            if value <= 0:
+                raise HttpContractError(f"{name}_budget_exhausted")
+        self._within(at, "attempt")
+        if self.approval is None:
+            raise HttpContractError("attempt_requires_approval_claim")
+        if event.approval_sha256 != self.approval_sha256:
+            raise HttpContractError("attempt_approval_mismatch")
+        if not self.approval.valid_from <= at < self.approval.valid_until:
+            raise HttpContractError("attempt_outside_approval_validity")
+        if self.reserved >= limits.max_attempts:
+            raise HttpContractError("attempt_budget_exhausted")
+        if event.attempt_id in self.attempts or event.attempt_id != make_attempt_id(
+            plan, page, event.attempt_number
+        ):
+            raise HttpContractError("attempt_identity_invalid")
+        prior = self.pages.get(page.query.query_id, ())
+        if page.page_index < len(prior):
+            raise HttpContractError("completed_page_retried")
+        if page.page_index and (
+            page.page_index != len(prior) or prior[-1][1] != page.pagination_key
+        ):
+            raise HttpContractError("pagination_chain_invalid")
+        count, last_id = self.page_attempts.get(page.request_id, (0, None))
+        if event.attempt_number != count + 1:
+            raise HttpContractError("page_attempt_number_invalid")
+        if count >= plan.retry.max_attempts_per_page:
+            raise HttpContractError("page_retry_budget_exhausted")
+        if last_id is not None and self.attempts[last_id].state not in (
+            _RETRYABLE_STATES
+        ):
+            raise HttpContractError("previous_attempt_not_retryable")
+        if at < self.earliest_next_attempt_at():
+            raise HttpContractError("attempt_before_rate_limit_wait")
+        declared = (
+            event.allowed_transfer_bytes,
+            event.allowed_decoded_bytes,
+            event.allowed_saved_bytes,
+        )
+        if declared != allowed:
+            raise HttpContractError("reserved_allowance_invalid")
+        self.attempts[event.attempt_id] = _Attempt(page, at, allowed)
+        self.page_attempts[page.request_id] = (count + 1, event.attempt_id)
+        self.reserved += 1
+        self.retries += event.attempt_number > 1
+        if self.first_reserved_at is None:
+            self.first_reserved_at = at
+        self.open_attempt = event.attempt_id
+
+    def _on_attempt_sent(self, event: JournalEvent, at: datetime) -> None:
+        attempt = self._attempt(event)
+        if attempt.state != "reserved":
+            raise HttpContractError("attempt_send_order_invalid")
+        # Re-checked at send time: time may have passed since the reservation.
+        self._within(at, "send")
+        if not self.approval.valid_from <= at < self.approval.valid_until:
+            raise HttpContractError("send_outside_approval_validity")
+        self.attempts[event.attempt_id] = replace(attempt, state="sent", sent_at=at)
+        self.sent += 1
+
+    def _on_response_received(self, event: JournalEvent, at: datetime) -> None:
+        attempt = self._attempt(event)
+        if attempt.state != "sent":
+            raise HttpContractError("response_order_invalid")
+        if (at - attempt.sent_at).total_seconds() > self.plan.retry.timeout_seconds:
+            raise HttpContractError("response_after_timeout")
+        if at > self.deadline():
+            raise HttpContractError("response_after_cumulative_deadline")
+        limits, status = self.plan.limits, event.status
+        self.transfer_bytes += event.transfer_bytes
+        self.decoded_bytes += event.decoded_bytes
+        over = (
+            event.transfer_bytes > attempt.allowed[0]
+            or event.decoded_bytes > attempt.allowed[1]
+            or self.transfer_bytes + self.unknown * limits.max_page_transfer_bytes
+            > limits.max_transfer_bytes
+            or self.decoded_bytes + self.unknown * limits.max_page_decoded_bytes
+            > limits.max_decoded_bytes
+        )
+        transient = status == 429 or 500 <= status < 600
+        if over:
+            # Evidence can record an overrun; nothing may be saved or sent after it.
+            state = "over_allowance"
+            self.over_budget = True
+        elif status == 200:
+            state = "responded"
+        else:
+            state = "failed" if transient else "nonretryable"
+        self.attempts[event.attempt_id] = replace(attempt, state=state, status=status)
+        self.responses += 1
+        self.http_429 += status == 429
+        self.last_network_at = at
+        self.last_outcome = (
+            "429" if status == 429 else "5xx" if 500 <= status < 600 else "response"
+        )
+        self.last_retry_after = event.retry_after_seconds or 0
+        if state != "responded":
+            self.open_attempt = None
+
+    def _on_outcome_unknown(self, event: JournalEvent, at: datetime) -> None:
+        attempt = self._attempt(event)
+        if attempt.state not in ("reserved", "sent"):
+            raise HttpContractError("unknown_outcome_order_invalid")
+        self.attempts[event.attempt_id] = replace(attempt, state="unknown")
+        self.unknown += 1
+        self.open_attempt = None
+        self.last_network_at = at
+        self.last_outcome = "network"
+        self.last_retry_after = 0
+
+    def _on_body_saved(self, event: JournalEvent, at: datetime) -> None:
+        attempt = self._attempt(event)
+        if attempt.state != "responded" or attempt.status != 200:
+            raise HttpContractError("body_save_order_invalid")
+        if event.saved_bytes > attempt.allowed[2]:
+            raise HttpContractError("saved_bytes_exceed_reserved_allowance")
+        digest = event.body_sha256
+        query_key = (attempt.page.query.query_id, digest)
+        if query_key in self.query_bodies:
+            raise HttpContractError("repeated_page_body")
+        previous = self.saved_bodies.get(digest)
+        if previous is not None and previous != event.saved_bytes:
+            raise HttpContractError("body_hash_size_mismatch")
+        if previous is None:
+            self.saved_bodies[digest] = event.saved_bytes
+            self.completed_bodies[digest] = False
+            self.saved_total += event.saved_bytes
+        self.query_bodies[query_key] = attempt.page.page_index
+        if self.saved_total > self.plan.limits.max_saved_bytes:
+            self.over_budget = True
+        self.attempts[event.attempt_id] = replace(
+            attempt, state="body_saved", body_sha256=digest
+        )
+
+    def _on_page_completed(self, event: JournalEvent, at: datetime) -> None:
+        attempt = self._attempt(event)
+        if attempt.state != "body_saved":
+            raise HttpContractError("page_completion_order_invalid")
+        page = attempt.page
+        prior = self.pages.get(page.query.query_id, ())
+        if page.page_index < len(prior):
+            raise HttpContractError("duplicate_completed_page")
+        if event.next_key is not None and event.next_key in {
+            p.pagination_key for p, _, _ in prior
+        } | {page.pagination_key}:
+            raise HttpContractError("pagination_key_loop")
+        self.pages[page.query.query_id] = (
+            *prior,
+            (page, event.next_key, attempt.body_sha256),
+        )
+        self.completed_pages += 1
+        if event.next_key is None:
+            self.complete_prefix += 1
+        if self.completed_pages > self.plan.limits.max_pages_total:
+            raise HttpContractError("page_budget_exhausted")
+        self.completed_bodies[attempt.body_sha256] = True
+        self.attempts[event.attempt_id] = replace(attempt, state="page_completed")
+        self.open_attempt = None
+
+    def _on_run_completed(self, event: JournalEvent, at: datetime) -> None:
+        # Completion is bookkeeping: the deadline bounds reservations, sends and
+        # responses, so a run whose pages all finished in time may be closed later.
+        if self.complete_prefix != len(self.plan.queries):
+            raise HttpContractError("run_completed_with_missing_page")
+        if self.over_budget:
+            raise HttpContractError("run_completed_after_budget_overrun")
+        if self.open_attempt is not None:
+            raise HttpContractError("run_completed_with_unsettled_attempt")
+        self.completed = True
+
+    def _on_run_stopped(self, event: JournalEvent, at: datetime) -> None:
+        self.terminal_stop = bool(event.terminal)
+
+
+class EvidenceJournal:
+    """Hash-chained journal contract (bytes in, bytes out); not a file writer.
+
+    ``EvidenceJournal(plan, data, approval=...)`` re-validates every line (open
+    and resume). ``append`` validates only the new event against a copy of the
+    already verified state; its result has the same bytes and state as a full
+    re-open, which the tests check.
+    """
+
+    def __init__(
+        self,
+        plan: HttpAcquisitionPlan,
+        data: bytes = b"",
+        *,
+        approval: OwnerApprovalClaim | None = None,
+    ) -> None:
         if type(plan) is not HttpAcquisitionPlan or type(data) is not bytes:
             raise HttpContractError("journal_requires_plan_and_bytes")
-        self.plan = plan
-        self.data = data
-        self.events: tuple[JournalEvent, ...] = ()
-        self.head_hash = "0" * 64
+        if approval is not None:
+            if type(approval) is not OwnerApprovalClaim:
+                raise HttpContractError("journal_approval_claim_type_invalid")
+            _check_approval_fields(plan, approval)
+            if not (
+                plan.not_before <= approval.valid_from
+                and approval.valid_until <= plan.expires_at
+            ):
+                raise HttpContractError("approval_outside_plan_window")
         if data and not data.endswith(b"\n"):
             raise HttpContractError("journal_incomplete_final_line")
-        parsed = []
+        state = _JournalState(plan, approval)
+        head, lines, events = "0" * 64, [], []
         for sequence, line in enumerate(data.split(b"\n")[:-1]):
             try:
                 record = json.loads(line)
@@ -692,15 +1108,30 @@ class EvidenceJournal:
                 record["schema"] != JOURNAL_SCHEMA
                 or type(record["sequence"]) is not int
                 or record["sequence"] != sequence
-                or record["previous_hash"] != self.head_hash
+                or record["previous_hash"] != head
                 or record["plan_sha256"] != plan.sha256
                 or record["event_id"] != _digest(content)
             ):
                 raise HttpContractError("journal_chain_or_plan_mismatch")
-            parsed.append(JournalEvent.from_dict(record["event"]))
-            self.head_hash = record["event_id"]
-        self.events = tuple(parsed)
-        self._validate_transitions()
+            event = JournalEvent.from_dict(record["event"])
+            state.apply(event)
+            events.append(event)
+            lines.append(line + b"\n")
+            head = record["event_id"]
+        self._init(plan, approval, tuple(lines), tuple(events), head, len(data), state)
+
+    def _init(self, plan, approval, lines, events, head, size, state) -> None:
+        self.plan = plan
+        self.approval = approval
+        self._lines = lines
+        self.events: tuple[JournalEvent, ...] = events
+        self.head_hash = head
+        self._byte_count = size
+        self._state = state
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(self._lines)
 
     @property
     def event_count(self) -> int:
@@ -708,7 +1139,21 @@ class EvidenceJournal:
 
     @property
     def byte_count(self) -> int:
-        return len(self.data)
+        return self._byte_count
+
+    @property
+    def completed(self) -> bool:
+        return self._state.completed
+
+    @property
+    def approval_sha256(self) -> str | None:
+        return self._state.approval_sha256
+
+    @property
+    def next_reservation_allowances(self) -> tuple[int, int, int]:
+        """(transfer, decoded, saved) a reservation must declare right now."""
+
+        return self._state.allowances()
 
     def append(self, event: JournalEvent) -> EvidenceJournal:
         if type(event) is not JournalEvent:
@@ -721,223 +1166,46 @@ class EvidenceJournal:
             "event": event.to_dict(),
         }
         record = {**content, "event_id": _digest(content)}
-        return EvidenceJournal(
-            self.plan, self.data + (_canonical(record) + "\n").encode()
+        line = (_canonical(record) + "\n").encode("utf-8")
+        parsed = JournalEvent.from_dict(json.loads(line)["event"])  # as on re-open
+        state = self._state.clone()
+        state.apply(parsed)
+        new = object.__new__(EvidenceJournal)
+        new._init(
+            self.plan,
+            self.approval,
+            (*self._lines, line),
+            (*self.events, parsed),
+            record["event_id"],
+            self._byte_count + len(line),
+            state,
         )
-
-    def _validate_transitions(self) -> None:
-        attempts: dict[str, dict] = {}
-        page_attempts: dict[str, int] = {}
-        pages: dict[str, dict[int, tuple[PageRequest, str | None]]] = {}
-        first: datetime | None = None
-        previous: datetime | None = None
-        completed = False
-        terminal_stop = False
-        transfer_bytes = 0
-        decoded_bytes = 0
-        saved_bodies: dict[str, int] = {}
-        unknown_count = 0
-        for event in self.events:
-            at = event.at.astimezone(UTC)
-            if previous is not None and at < previous:
-                raise HttpContractError("journal_clock_regressed")
-            previous = at
-            if completed or terminal_stop:
-                raise HttpContractError("journal_event_after_terminal_state")
-            if event.kind == "attempt_reserved":
-                page = event.page
-                validate_page_request(self.plan, page)
-                if any(a.get("over_budget") for a in attempts.values()):
-                    raise HttpContractError("previous_page_budget_overrun")
-                if any(
-                    a["state"] in ("reserved", "sent", "responded", "body_saved")
-                    for a in attempts.values()
-                ):
-                    raise HttpContractError("prior_attempt_unsettled")
-                earlier_queries = self.plan.queries[
-                    : self.plan.queries.index(page.query)
-                ]
-                if any(
-                    not pages.get(q.query_id)
-                    or pages[q.query_id][max(pages[q.query_id])][1] is not None
-                    for q in earlier_queries
-                ):
-                    raise HttpContractError("prior_query_incomplete")
-                if sum(map(len, pages.values())) >= self.plan.limits.max_pages_total:
-                    raise HttpContractError("page_budget_exhausted")
-                if (
-                    transfer_bytes
-                    + unknown_count * self.plan.limits.max_page_transfer_bytes
-                    >= self.plan.limits.max_transfer_bytes
-                ):
-                    raise HttpContractError("transfer_budget_exhausted")
-                if (
-                    decoded_bytes
-                    + unknown_count * self.plan.limits.max_page_decoded_bytes
-                    >= self.plan.limits.max_decoded_bytes
-                ):
-                    raise HttpContractError("decoded_budget_exhausted")
-                if sum(saved_bodies.values()) >= self.plan.limits.max_saved_bytes:
-                    raise HttpContractError("saved_budget_exhausted")
-                if first is None:
-                    first = at
-                elif (
-                    at - first
-                ).total_seconds() >= self.plan.limits.max_elapsed_seconds:
-                    raise HttpContractError("attempt_after_cumulative_deadline")
-                if not self.plan.not_before <= at < self.plan.expires_at:
-                    raise HttpContractError("attempt_outside_plan_validity")
-                if len(attempts) >= self.plan.limits.max_attempts:
-                    raise HttpContractError("attempt_budget_exhausted")
-                if event.attempt_id in attempts or event.attempt_id != make_attempt_id(
-                    self.plan, page, event.attempt_number
-                ):
-                    raise HttpContractError("attempt_identity_invalid")
-                prior_pages = pages.get(page.query.query_id, {})
-                if page.page_index in prior_pages:
-                    raise HttpContractError("completed_page_retried")
-                if page.page_index:
-                    previous_page = prior_pages.get(page.page_index - 1)
-                    if previous_page is None or previous_page[1] != page.pagination_key:
-                        raise HttpContractError("pagination_chain_invalid")
-                request_id = page.request_id
-                count = page_attempts.get(request_id, 0)
-                if event.attempt_number != count + 1:
-                    raise HttpContractError("page_attempt_number_invalid")
-                if count >= self.plan.retry.max_attempts_per_page:
-                    raise HttpContractError("page_retry_budget_exhausted")
-                if count:
-                    previous_id = make_attempt_id(self.plan, page, count)
-                    previous_state = attempts[previous_id]["state"]
-                    if previous_state not in ("unknown", "failed"):
-                        raise HttpContractError("previous_attempt_not_retryable")
-                page_attempts[request_id] = count + 1
-                attempts[event.attempt_id] = {"page": page, "state": "reserved"}
-            elif event.kind in (
-                "attempt_sent",
-                "response_received",
-                "outcome_unknown",
-                "body_saved",
-                "page_completed",
-            ):
-                attempt = attempts.get(event.attempt_id)
-                if attempt is None:
-                    raise HttpContractError("event_for_unknown_attempt")
-                state = attempt["state"]
-                if event.kind == "attempt_sent":
-                    if state != "reserved":
-                        raise HttpContractError("attempt_send_order_invalid")
-                    attempt["state"] = "sent"
-                elif event.kind == "response_received":
-                    if state != "sent":
-                        raise HttpContractError("response_order_invalid")
-                    if (
-                        event.transfer_bytes > self.plan.limits.max_page_transfer_bytes
-                        or event.decoded_bytes > self.plan.limits.max_page_decoded_bytes
-                    ):
-                        # Evidence can record an overrun; no subsequent send is allowed.
-                        attempt["over_budget"] = True
-                    transfer_bytes += event.transfer_bytes
-                    decoded_bytes += event.decoded_bytes
-                    if (
-                        transfer_bytes
-                        + unknown_count * self.plan.limits.max_page_transfer_bytes
-                        > self.plan.limits.max_transfer_bytes
-                        or decoded_bytes
-                        + unknown_count * self.plan.limits.max_page_decoded_bytes
-                        > self.plan.limits.max_decoded_bytes
-                    ):
-                        attempt["over_budget"] = True
-                    attempt["status"] = event.status
-                    attempt["state"] = (
-                        "responded"
-                        if event.status == 200
-                        else "failed"
-                        if event.status == 429 or 500 <= event.status < 600
-                        else "nonretryable"
-                    )
-                elif event.kind == "outcome_unknown":
-                    if state not in ("reserved", "sent"):
-                        raise HttpContractError("unknown_outcome_order_invalid")
-                    attempt["state"] = "unknown"
-                    unknown_count += 1
-                elif event.kind == "body_saved":
-                    if state != "responded" or attempt["status"] != 200:
-                        raise HttpContractError("body_save_order_invalid")
-                    if event.saved_bytes > self.plan.limits.max_page_saved_bytes:
-                        attempt["over_budget"] = True
-                    attempt["state"] = "body_saved"
-                    attempt["body_sha256"] = event.body_sha256
-                    attempt["saved_bytes"] = event.saved_bytes
-                    previous_size = saved_bodies.get(event.body_sha256)
-                    if previous_size is not None and previous_size != event.saved_bytes:
-                        raise HttpContractError("body_hash_size_mismatch")
-                    saved_bodies[event.body_sha256] = event.saved_bytes
-                    if sum(saved_bodies.values()) > self.plan.limits.max_saved_bytes:
-                        attempt["over_budget"] = True
-                else:
-                    if state != "body_saved":
-                        raise HttpContractError("page_completion_order_invalid")
-                    page = attempt["page"]
-                    query_pages = pages.setdefault(page.query.query_id, {})
-                    if page.page_index in query_pages:
-                        raise HttpContractError("duplicate_completed_page")
-                    if event.next_key is not None and event.next_key in {
-                        p.pagination_key for p, _ in query_pages.values()
-                    } | {page.pagination_key}:
-                        raise HttpContractError("pagination_key_loop")
-                    query_pages[page.page_index] = (page, event.next_key)
-                    if sum(map(len, pages.values())) > self.plan.limits.max_pages_total:
-                        raise HttpContractError("page_budget_exhausted")
-                    attempt["state"] = "page_completed"
-            elif event.kind == "run_completed":
-                if (
-                    first is not None
-                    and (at - first).total_seconds()
-                    >= self.plan.limits.max_elapsed_seconds
-                ):
-                    raise HttpContractError("run_completed_after_cumulative_deadline")
-                for query in self.plan.queries:
-                    query_pages = pages.get(query.query_id, {})
-                    if not query_pages or query_pages[max(query_pages)][1] is not None:
-                        raise HttpContractError("run_completed_with_missing_page")
-                if any(a.get("over_budget") for a in attempts.values()):
-                    raise HttpContractError("run_completed_after_budget_overrun")
-                if any(
-                    a["state"] in ("reserved", "sent", "responded", "body_saved")
-                    for a in attempts.values()
-                ):
-                    raise HttpContractError("run_completed_with_unsettled_attempt")
-                completed = True
-            else:
-                terminal_stop = bool(event.terminal)
-
-    @property
-    def completed(self) -> bool:
-        return bool(self.events and self.events[-1].kind == "run_completed")
+        return new
 
 
 @dataclass(frozen=True)
 class BodyFileEvidence:
-    """A *declared* disk footprint; actual file verification belongs to the next PR."""
+    """A *declared* file; actual file verification belongs to the next PR.
+
+    ``body_sha256`` and ``size`` describe the file's current bytes in every
+    state: ``committed`` (body of a completed page), ``orphan`` (complete body
+    no completed page references) or ``partial`` (incomplete bytes; their hash
+    is not a page hash).
+    """
 
     object_id: str
     size: int
     state: str
-    body_sha256: str | None = None
+    body_sha256: str
 
     def __post_init__(self) -> None:
         _text(self.object_id, "body_object_id")
         _nonnegative_int(self.size, "body_file_size")
         if self.state not in ("committed", "orphan", "partial"):
             raise HttpContractError("unknown_body_file_state")
-        if self.state == "partial":
-            if self.body_sha256 is not None:
-                raise HttpContractError("partial_body_cannot_claim_final_hash")
-        else:
-            _hex(self.body_sha256, "body_sha256")
-            if self.size == 0:
-                raise HttpContractError("complete_body_must_be_nonempty")
+        _hex(self.body_sha256, "body_sha256")
+        if self.state != "partial" and self.size == 0:
+            raise HttpContractError("complete_body_must_be_nonempty")
 
 
 @dataclass(frozen=True)
@@ -951,8 +1219,8 @@ class BodyInventory:
             raise HttpContractError("body_inventory_must_be_tuple_of_evidence")
         if len({item.object_id for item in self.files}) != len(self.files):
             raise HttpContractError("duplicate_body_object_id")
-        digests = [item.body_sha256 for item in self.files if item.body_sha256]
-        if len(set(digests)) != len(digests):
+        # One content may not be counted twice, not even under different states.
+        if len({item.body_sha256 for item in self.files}) != len(self.files):
             raise HttpContractError("duplicate_stored_body")
 
     @property
@@ -961,44 +1229,39 @@ class BodyInventory:
 
     @property
     def body_set_sha256(self) -> str:
+        """Identifies every declared file: id, state, size and hash."""
+
         return _digest(
-            sorted(
-                (
-                    {"sha256": item.body_sha256, "bytes": item.size}
-                    for item in self.files
-                    if item.body_sha256
-                ),
-                key=lambda item: item["sha256"],
-            )
+            {
+                "schema": BODY_SET_SCHEMA,
+                "files": [
+                    {
+                        "object_id": item.object_id,
+                        "state": item.state,
+                        "bytes": item.size,
+                        "sha256": item.body_sha256,
+                    }
+                    for item in sorted(self.files, key=lambda item: item.object_id)
+                ],
+            }
         )
 
 
 def _check_body_links(journal: EvidenceJournal, inventory: BodyInventory) -> None:
-    recorded: dict[str, tuple[int, bool]] = {}
-    completed_attempts = {
-        e.attempt_id for e in journal.events if e.kind == "page_completed"
-    }
-    for event in journal.events:
-        if event.kind == "body_saved":
-            old = recorded.get(event.body_sha256)
-            new = (event.saved_bytes, event.attempt_id in completed_attempts)
-            if old is not None and old[0] != new[0]:
-                raise HttpContractError("body_hash_size_mismatch")
-            recorded[event.body_sha256] = (
-                event.saved_bytes,
-                new[1] or (old[1] if old else False),
-            )
-    inventory_by_sha = {
-        item.body_sha256: item for item in inventory.files if item.body_sha256
-    }
-    for digest, (size, completed) in recorded.items():
-        item = inventory_by_sha.get(digest)
+    state = journal._state
+    items = {item.body_sha256: item for item in inventory.files}
+    for digest, size in state.saved_bodies.items():
+        item = items.get(digest)
         if item is None or item.size != size:
             raise HttpContractError("saved_body_missing_or_size_mismatch")
-        if completed and item.state != "committed":
+        if item.state == "partial":
+            raise HttpContractError("recorded_body_declared_partial")
+        if state.completed_bodies[digest] and item.state != "committed":
             raise HttpContractError("completed_page_body_not_committed")
+        if not state.completed_bodies[digest] and item.state == "committed":
+            raise HttpContractError("committed_body_without_completed_page")
     for item in inventory.files:
-        if item.state == "committed" and item.body_sha256 not in recorded:
+        if item.state == "committed" and item.body_sha256 not in state.saved_bodies:
             raise HttpContractError("unrecorded_committed_body")
 
 
@@ -1023,88 +1286,104 @@ class BudgetSnapshot:
     remaining_saved_bytes: int
     can_reserve_next_attempt: bool
     status: str
+    earliest_next_attempt_at: datetime
+    next_page: PageRequest | None
+    next_attempt_number: int | None
+    next_allowed_transfer_bytes: int
+    next_allowed_decoded_bytes: int
+    next_allowed_saved_bytes: int
+    blocking_reasons: tuple[str, ...]
 
 
 def budget_snapshot(
     journal: EvidenceJournal, inventory: BodyInventory, *, now: datetime
 ) -> BudgetSnapshot:
-    """Reconstruct counters from an existing journal; resume never starts at zero."""
+    """Reconstruct counters from an existing journal; resume never starts at zero.
+
+    ``can_reserve_next_attempt`` is true only when ``blocking_reasons`` is
+    empty. A runner must still re-check the plan, approval and rate rules at
+    send time (the journal enforces this on ``attempt_sent``).
+    """
 
     if type(journal) is not EvidenceJournal or type(inventory) is not BodyInventory:
         raise HttpContractError("journal_and_body_inventory_required")
     _check_body_links(journal, inventory)
     current = datetime.fromisoformat(_utc(now, "now"))
-    if journal.events and current < journal.events[-1].at.astimezone(UTC):
+    state, plan, limits = journal._state, journal.plan, journal.plan.limits
+    if state.last_event_at is not None and current < state.last_event_at:
         raise HttpContractError("resume_clock_regressed")
-    events = journal.events
-    reserved = [e for e in events if e.kind == "attempt_reserved"]
-    sent = [e for e in events if e.kind == "attempt_sent"]
-    responses = [e for e in events if e.kind == "response_received"]
-    completed = [e for e in events if e.kind == "page_completed"]
-    unknown = [e for e in events if e.kind == "outcome_unknown"]
-    last_by_attempt = {e.attempt_id: e for e in events if e.attempt_id is not None}
-    unsettled = sum(
-        event.kind in ("attempt_reserved", "attempt_sent", "body_saved")
-        or (event.kind == "response_received" and event.status == 200)
-        for event in last_by_attempt.values()
-    )
-    first = reserved[0].at.astimezone(UTC) if reserved else None
+    first = state.first_reserved_at
     elapsed = max(0.0, (current - first).total_seconds()) if first else 0.0
-    limits = journal.plan.limits
-    remaining_attempts = max(0, limits.max_attempts - len(reserved))
-    remaining_pages = max(0, limits.max_pages_total - len(completed))
+    remaining_attempts = max(0, limits.max_attempts - state.reserved)
+    remaining_pages = max(0, limits.max_pages_total - state.completed_pages)
     remaining_seconds = max(0.0, limits.max_elapsed_seconds - elapsed)
-    # A lost reply may have consumed a full page. Reserve that worst-case amount
-    # until the next PR can reconcile the actual transport/file evidence.
+    # A lost reply may have consumed a full page: reserve that worst case.
     remaining_transfer = max(
         0,
         limits.max_transfer_bytes
-        - sum(e.transfer_bytes for e in responses)
-        - len(unknown) * limits.max_page_transfer_bytes,
+        - state.transfer_bytes
+        - state.unknown * limits.max_page_transfer_bytes,
     )
     remaining_decoded = max(
         0,
         limits.max_decoded_bytes
-        - sum(e.decoded_bytes for e in responses)
-        - len(unknown) * limits.max_page_decoded_bytes,
+        - state.decoded_bytes
+        - state.unknown * limits.max_page_decoded_bytes,
     )
     remaining_saved = max(0, limits.max_saved_bytes - inventory.saved_bytes)
     status = (
         "completed"
-        if journal.completed
+        if state.completed
         else "terminal_stop"
-        if events and events[-1].kind == "run_stopped" and events[-1].terminal
+        if state.terminal_stop
         else "open"
     )
-    can_reserve = (
-        status == "open"
-        and current >= journal.plan.not_before
-        and current < journal.plan.expires_at
-        and unsettled == 0
-        and not any(item.state in ("orphan", "partial") for item in inventory.files)
-        and all(
-            number > 0
-            for number in (
-                remaining_attempts,
-                remaining_pages,
-                remaining_seconds,
-                remaining_transfer,
-                remaining_decoded,
-                remaining_saved,
-            )
-        )
-    )
+    next_page, next_number, page_problem = state.next_page()
+    earliest = state.earliest_next_attempt_at()
+    approval = journal.approval
+    if status == "completed":
+        reasons = ["run_completed"]
+    elif status == "terminal_stop":
+        reasons = ["terminal_stop_recorded"]
+    else:
+        checks = (
+            (approval is None, "approval_claim_missing"),
+            (current < plan.not_before, "before_plan_validity"),
+            (current >= plan.expires_at, "plan_expired"),
+            (approval is not None and current < approval.valid_from,
+             "before_approval_validity"),
+            (approval is not None and current >= approval.valid_until,
+             "approval_expired"),
+            (state.open_attempt is not None, "unsettled_attempt"),
+            (state.over_budget, "budget_overrun_recorded"),
+            (any(item.state != "committed" for item in inventory.files),
+             "orphan_or_partial_body_present"),
+            (remaining_attempts == 0, "attempt_budget_exhausted"),
+            (remaining_pages == 0, "page_budget_exhausted"),
+            (remaining_seconds == 0, "time_budget_exhausted"),
+            (remaining_transfer == 0, "transfer_budget_exhausted"),
+            (remaining_decoded == 0, "decoded_budget_exhausted"),
+            (remaining_saved == 0, "saved_budget_exhausted"),
+            (page_problem is not None, page_problem),
+            (current < earliest, "rate_limit_wait"),
+            (state.deadline() is not None and earliest >= state.deadline(),
+             "deadline_before_next_allowed_attempt"),
+            (earliest >= plan.expires_at, "plan_expires_before_next_allowed_attempt"),
+            (approval is not None and earliest >= approval.valid_until,
+             "approval_expires_before_next_allowed_attempt"),
+        )  # fmt: skip
+        reasons = [reason for blocked, reason in checks if blocked]
     return BudgetSnapshot(
-        reserved_attempts=len(reserved),
-        sent_attempts=len(sent),
-        received_responses=len(responses),
-        completed_pages=len(completed),
-        retry_attempts=sum(e.attempt_number > 1 for e in reserved),
-        http_429_responses=sum(e.status == 429 for e in responses),
-        unknown_outcomes=len(unknown),
-        unsettled_attempts=unsettled,
-        orphan_files=sum(e.state == "orphan" for e in inventory.files),
-        partial_files=sum(e.state == "partial" for e in inventory.files),
+        reserved_attempts=state.reserved,
+        sent_attempts=state.sent,
+        received_responses=state.responses,
+        completed_pages=state.completed_pages,
+        retry_attempts=state.retries,
+        http_429_responses=state.http_429,
+        unknown_outcomes=state.unknown,
+        unsettled_attempts=int(state.open_attempt is not None),
+        orphan_files=sum(item.state == "orphan" for item in inventory.files),
+        partial_files=sum(item.state == "partial" for item in inventory.files),
         elapsed_seconds=elapsed,
         remaining_attempts=remaining_attempts,
         remaining_pages=remaining_pages,
@@ -1112,8 +1391,19 @@ def budget_snapshot(
         remaining_transfer_bytes=remaining_transfer,
         remaining_decoded_bytes=remaining_decoded,
         remaining_saved_bytes=remaining_saved,
-        can_reserve_next_attempt=can_reserve,
+        can_reserve_next_attempt=not reasons,
         status=status,
+        earliest_next_attempt_at=earliest,
+        next_page=next_page,
+        next_attempt_number=next_number,
+        next_allowed_transfer_bytes=min(
+            limits.max_page_transfer_bytes, remaining_transfer
+        ),
+        next_allowed_decoded_bytes=min(
+            limits.max_page_decoded_bytes, remaining_decoded
+        ),
+        next_allowed_saved_bytes=min(limits.max_page_saved_bytes, remaining_saved),
+        blocking_reasons=tuple(reasons),
     )
 
 
@@ -1123,6 +1413,8 @@ class ExternalReceiptClaim:
 
     artifact_id: str
     plan_sha256: str
+    approval_sha256: str
+    approval_event_id: str
     ledger_event_count: int
     ledger_bytes: int
     ledger_head_sha256: str
@@ -1133,9 +1425,20 @@ class ExternalReceiptClaim:
     external_reference: str
 
     def __post_init__(self) -> None:
-        for name in ("artifact_id", "issuer_id", "receipt_id", "external_reference"):
+        for name in (
+            "artifact_id",
+            "approval_event_id",
+            "issuer_id",
+            "receipt_id",
+            "external_reference",
+        ):
             _text(getattr(self, name), name)
-        for name in ("plan_sha256", "ledger_head_sha256", "body_set_sha256"):
+        for name in (
+            "plan_sha256",
+            "approval_sha256",
+            "ledger_head_sha256",
+            "body_set_sha256",
+        ):
             _hex(getattr(self, name), name)
         for name in ("ledger_event_count", "ledger_bytes"):
             _nonnegative_int(getattr(self, name), name)
@@ -1146,6 +1449,8 @@ class ExternalReceiptClaim:
             "schema": RECEIPT_SCHEMA,
             "artifact_id": self.artifact_id,
             "plan_sha256": self.plan_sha256,
+            "approval_sha256": self.approval_sha256,
+            "approval_event_id": self.approval_event_id,
             "ledger_event_count": self.ledger_event_count,
             "ledger_bytes": self.ledger_bytes,
             "ledger_head_sha256": self.ledger_head_sha256,
@@ -1160,8 +1465,10 @@ class ExternalReceiptClaim:
 
 @dataclass(frozen=True)
 class ReceiptAlignment:
+    """Informational result; never an authorization token for any entry point."""
+
     content_matches: bool
-    independent_custody_verified: bool = False
+    independent_custody_verified: bool = field(default=False, init=False)
 
 
 def check_receipt_alignment(
@@ -1169,12 +1476,18 @@ def check_receipt_alignment(
     inventory: BodyInventory,
     receipt: ExternalReceiptClaim,
 ) -> ReceiptAlignment:
+    if type(journal) is not EvidenceJournal or type(inventory) is not BodyInventory:
+        raise HttpContractError("journal_and_body_inventory_required")
     if type(receipt) is not ExternalReceiptClaim:
         raise HttpContractError("external_receipt_claim_required")
+    if journal.approval is None:
+        raise HttpContractError("receipt_requires_approval_claim")
     _check_body_links(journal, inventory)
     expected = {
         "artifact_id": journal.plan.artifact_id,
         "plan_sha256": journal.plan.sha256,
+        "approval_sha256": journal.approval.sha256,
+        "approval_event_id": journal.approval.approval_event_id,
         "ledger_event_count": journal.event_count,
         "ledger_bytes": journal.byte_count,
         "ledger_head_sha256": journal.head_hash,
@@ -1188,10 +1501,182 @@ def check_receipt_alignment(
     return ReceiptAlignment(content_matches=True)
 
 
+# ------------------------------------------------------------- calendar anchor
+
+
+def calendar_anchor_reference(discovery_artifact_id: str) -> str:
+    """The only accepted ``calendar_source_reference`` of an anchored plan."""
+
+    return f"calendar-discovery:{discovery_artifact_id}"
+
+
+@dataclass(frozen=True)
+class CalendarDiscoveryEvidence:
+    """Raw inputs from a completed ``calendar_discovery`` artifact (not a verdict)."""
+
+    plan: HttpAcquisitionPlan
+    approval: OwnerApprovalClaim
+    journal_data: bytes
+    inventory: BodyInventory
+    receipt: ExternalReceiptClaim
+    bodies: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class CalendarAnchor:
+    """Derived from verified content; informational, never an authorization token."""
+
+    discovery_artifact_id: str
+    discovery_plan_sha256: str
+    calendar_start: str
+    calendar_end: str
+    sessions: tuple[str, ...]
+    anchor_sha256: str
+    independent_custody_verified: bool = field(default=False, init=False)
+
+
+def _calendar_rows(journal: EvidenceJournal, bodies: tuple[bytes, ...]) -> list:
+    if type(bodies) is not tuple or any(type(body) is not bytes for body in bodies):
+        raise HttpContractError("calendar_bodies_must_be_bytes")
+    by_digest = {hashlib.sha256(body).hexdigest(): body for body in bodies}
+    pages = journal._state.pages[journal.plan.queries[0].query_id]
+    if len(by_digest) != len(bodies) or set(by_digest) != {p[2] for p in pages}:
+        raise HttpContractError("calendar_body_set_mismatch")
+    rows = []
+    for _, next_key, digest in pages:
+        body = by_digest[digest]
+        if len(body) != journal._state.saved_bodies[digest]:
+            raise HttpContractError("calendar_body_size_mismatch")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise HttpContractError("calendar_body_invalid_json") from None
+        if type(payload) is not dict or type(payload.get("data")) is not list:
+            raise HttpContractError("calendar_body_schema_invalid")
+        if payload.get("pagination_key") != next_key:
+            raise HttpContractError("calendar_body_pagination_mismatch")
+        rows.extend(payload["data"])
+    return rows
+
+
+def derive_calendar_anchor(evidence: CalendarDiscoveryEvidence) -> CalendarAnchor:
+    """Verify a completed calendar_discovery artifact and derive its session set.
+
+    Checks the journal (with its approval claim), the receipt content, that the
+    supplied bodies are exactly the completed pages' bodies, and that every
+    calendar day in the fixed range appears once. It never creates or widens a
+    Daily plan; custody of the receipt is still unverified.
+    """
+
+    from .census import SESSION_HOLIDAY_DIVISIONS  # one session rule for the project
+
+    if type(evidence) is not CalendarDiscoveryEvidence:
+        raise HttpContractError("calendar_evidence_required")
+    plan = evidence.plan
+    if type(plan) is not HttpAcquisitionPlan or plan.kind != "calendar_discovery":
+        raise HttpContractError("calendar_evidence_plan_not_discovery")
+    journal = EvidenceJournal(plan, evidence.journal_data, approval=evidence.approval)
+    if not journal.completed:
+        raise HttpContractError("calendar_evidence_run_incomplete")
+    check_receipt_alignment(journal, evidence.inventory, evidence.receipt)
+    days: dict[str, str] = {}
+    for row in _calendar_rows(journal, evidence.bodies):
+        if type(row) is not dict or type(row.get("HolDiv")) is not str:
+            raise HttpContractError("calendar_row_invalid")
+        try:
+            day = _iso_day(row.get("Date"), "calendar_row_date")
+        except HttpContractError:
+            raise HttpContractError("calendar_row_invalid") from None
+        if row["HolDiv"] not in HOLIDAY_DIVISIONS:
+            raise HttpContractError("calendar_row_invalid")
+        if not plan.calendar_start <= day <= plan.calendar_end:
+            raise HttpContractError("calendar_row_outside_range")
+        if day in days:
+            raise HttpContractError("calendar_row_duplicate")
+        days[day] = row["HolDiv"]
+    first = date.fromisoformat(plan.calendar_start)
+    span = (date.fromisoformat(plan.calendar_end) - first).days + 1
+    if set(days) != {(first + timedelta(days=i)).isoformat() for i in range(span)}:
+        raise HttpContractError("calendar_rows_incomplete")
+    sessions = tuple(
+        sorted(d for d, div in days.items() if div in SESSION_HOLIDAY_DIVISIONS)
+    )
+    anchor = _digest(
+        {
+            "schema": ANCHOR_SCHEMA,
+            "discovery_artifact_id": plan.artifact_id,
+            "discovery_plan_sha256": plan.sha256,
+            "ledger_head_sha256": journal.head_hash,
+            "body_set_sha256": evidence.inventory.body_set_sha256,
+            "calendar_start": plan.calendar_start,
+            "calendar_end": plan.calendar_end,
+            "sessions": list(sessions),
+        }
+    )
+    return CalendarAnchor(
+        discovery_artifact_id=plan.artifact_id,
+        discovery_plan_sha256=plan.sha256,
+        calendar_start=plan.calendar_start,
+        calendar_end=plan.calendar_end,
+        sessions=sessions,
+        anchor_sha256=anchor,
+    )
+
+
+def verify_calendar_anchor(
+    plan: HttpAcquisitionPlan, evidence: CalendarDiscoveryEvidence
+) -> CalendarAnchor:
+    """Check an anchored Daily plan against re-derived calendar evidence."""
+
+    if type(plan) is not HttpAcquisitionPlan or plan.kind != "calendar_anchored_daily":
+        raise HttpContractError("anchored_daily_plan_required")
+    anchor = derive_calendar_anchor(evidence)
+    if plan.artifact_id == anchor.discovery_artifact_id:
+        raise HttpContractError("anchored_plan_reuses_discovery_artifact")
+    if plan.calendar_source_reference != calendar_anchor_reference(
+        anchor.discovery_artifact_id
+    ):
+        raise HttpContractError("calendar_anchor_reference_mismatch")
+    if plan.calendar_source_sha256 != anchor.anchor_sha256:
+        raise HttpContractError("calendar_anchor_hash_mismatch")
+    if not (
+        anchor.calendar_start <= plan.calendar_start
+        and plan.calendar_end <= anchor.calendar_end
+    ):
+        raise HttpContractError("anchored_window_outside_calendar_evidence")
+    sessions = set(anchor.sessions)
+    if plan.reference_date not in sessions:
+        raise HttpContractError("reference_date_not_a_session")
+    if not set(plan.daily_dates) <= sessions:
+        raise HttpContractError("daily_dates_include_non_sessions")
+    return anchor
+
+
+# ------------------------------------------------------------------ live gate
+
+
 @dataclass(frozen=True)
 class LiveAcquisitionGate:
-    permitted: bool
+    """Informational assessment; the gate is closed and ``permitted`` cannot be set.
+
+    No entry point may accept this object (or any other result object) as
+    evidence of permission; see ``require_live_acquisition_permission``.
+    """
+
     reasons: tuple[str, ...]
+    permitted: bool = field(default=False, init=False)
+
+
+class LiveAcquisitionClosed(HttpContractError):
+    """Raised by the contract entry point; ``reasons`` is machine-readable."""
+
+    def __init__(self, reasons: tuple[str, ...]) -> None:
+        super().__init__("live_acquisition_gate_closed")
+        self.reasons = reasons
+
+
+def _code(error: HttpContractError) -> str:
+    return str(error)
 
 
 def assess_live_acquisition_gate(
@@ -1202,26 +1687,63 @@ def assess_live_acquisition_gate(
     receipt: ExternalReceiptClaim | None,
     *,
     now: datetime,
+    calendar_evidence: CalendarDiscoveryEvidence | None = None,
 ) -> LiveAcquisitionGate:
-    """Never authorizes I/O: trusted approval/anchor and HTTP entry do not exist."""
+    """Never authorizes I/O: trusted approval/anchor and HTTP entry do not exist.
 
+    Every input is re-evaluated here from raw evidence (the journal is re-opened
+    from its bytes under the given plan and approval); earlier result objects
+    are never consulted. Inconsistent evidence yields reasons, not exceptions.
+    """
+
+    if type(plan) is not HttpAcquisitionPlan:
+        raise HttpContractError("plan_required")
     reasons = []
     if approval is None:
         reasons.append("owner_approval_missing")
     else:
         try:
             check_approval_scope(plan, approval, now=now)
-        except HttpContractError:
-            reasons.append("owner_approval_scope_or_validity_invalid")
-    if receipt is None:
-        reasons.append("external_receipt_missing")
+        except HttpContractError as error:
+            reasons.append(f"owner_approval_scope_or_validity_invalid:{_code(error)}")
+    verified = None
+    if type(journal) is not EvidenceJournal:
+        reasons.append("journal_required")
     else:
         try:
-            check_receipt_alignment(journal, inventory, receipt)
-        except HttpContractError:
-            reasons.append("external_receipt_content_invalid")
-    if not budget_snapshot(journal, inventory, now=now).can_reserve_next_attempt:
-        reasons.append("cumulative_budget_unavailable")
+            verified = EvidenceJournal(
+                plan,
+                journal.data,
+                approval=approval if type(approval) is OwnerApprovalClaim else None,
+            )
+        except HttpContractError as error:
+            reasons.append(f"journal_invalid:{_code(error)}")
+    if receipt is None:
+        reasons.append("external_receipt_missing")
+    elif verified is not None:
+        try:
+            check_receipt_alignment(verified, inventory, receipt)
+        except HttpContractError as error:
+            reasons.append(f"external_receipt_content_invalid:{_code(error)}")
+    if verified is not None:
+        try:
+            snapshot = budget_snapshot(verified, inventory, now=now)
+        except HttpContractError as error:
+            reasons.append(f"budget_state_invalid:{_code(error)}")
+        else:
+            if not snapshot.can_reserve_next_attempt:
+                reasons.append("cumulative_budget_unavailable")
+                reasons.extend(f"budget_blocked:{r}" for r in snapshot.blocking_reasons)
+    if plan.kind == "calendar_anchored_daily":
+        if calendar_evidence is None:
+            reasons.append("calendar_anchor_declared_unverified")
+        else:
+            try:
+                verify_calendar_anchor(plan, calendar_evidence)
+            except HttpContractError as error:
+                reasons.append(f"calendar_anchor_invalid:{_code(error)}")
+    elif plan.kind == "predeclared_daily":
+        reasons.append("calendar_source_declared_unverified")
     reasons.extend(
         (
             "owner_approval_authenticity_unverified",
@@ -1229,4 +1751,50 @@ def assess_live_acquisition_gate(
             "http_transport_not_implemented",
         )
     )
-    return LiveAcquisitionGate(permitted=False, reasons=tuple(reasons))
+    return LiveAcquisitionGate(reasons=tuple(reasons))
+
+
+def require_live_acquisition_permission(
+    plan: HttpAcquisitionPlan,
+    approval: OwnerApprovalClaim | None,
+    journal: EvidenceJournal,
+    inventory: BodyInventory,
+    receipt: ExternalReceiptClaim | None,
+    *,
+    now: datetime,
+    calendar_evidence: CalendarDiscoveryEvidence | None = None,
+) -> NoReturn:
+    """The only contract entry a future HTTP runner may call before reserving.
+
+    It accepts raw evidence of the exact expected types and evaluates it
+    itself; a result object (``LiveAcquisitionGate``, ``ApprovalScopeCheck``,
+    ``ReceiptAlignment``, ``CalendarAnchor``) is refused wherever evidence is
+    expected. In this contract PR it always raises ``LiveAcquisitionClosed``.
+    Code running in the same process can still monkeypatch anything; this is a
+    contract boundary, not a sandbox.
+    """
+
+    for value, expected in (
+        (plan, HttpAcquisitionPlan),
+        (journal, EvidenceJournal),
+        (inventory, BodyInventory),
+    ):
+        if type(value) is not expected:
+            raise HttpContractError("raw_evidence_required")
+    for value, expected in (
+        (approval, OwnerApprovalClaim),
+        (receipt, ExternalReceiptClaim),
+        (calendar_evidence, CalendarDiscoveryEvidence),
+    ):
+        if value is not None and type(value) is not expected:
+            raise HttpContractError("raw_evidence_required")
+    gate = assess_live_acquisition_gate(
+        plan,
+        approval,
+        journal,
+        inventory,
+        receipt,
+        now=now,
+        calendar_evidence=calendar_evidence,
+    )
+    raise LiveAcquisitionClosed(gate.reasons)

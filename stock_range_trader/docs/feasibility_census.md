@@ -188,49 +188,117 @@ hash鎖は台帳の外に固定点を持たないため、完全な行単位で�
 ## 後続の事前実測HTTP取得に向けた契約（通信機能ではない）
 
 `feasibility/http_contract.py` は **historical_feasibility 専用の純粋な値・検証契約**を定義する。
-取得plan、承認の範囲照合、台帳イベントの状態遷移、累積予算、原本一覧と外部receiptの内容照合を
-人工データだけで扱う。HTTP client、認証情報の読込み、ファイル保存・外部固定点への送信、実取得入口はない。
+取得plan、承認の範囲照合と台帳への束縛、台帳イベントの状態遷移、待機・累積予算・試行ごとの許容量、
+原本一覧と外部receiptの内容照合、Calendar anchorの照合を人工データだけで扱う。
+HTTP client、認証情報の読込み、ファイル保存・外部固定点への送信、実取得入口はない
+（ファイルシステムへのアクセスは、plan・承認の構築時に出力パスの各要素をlstatすることだけ）。
 既存 `run_offline_fixture_acquisition` の具象Transport型検査は変えていない。
 
-### 固定planとCalendarの2方式
+### 固定planとCalendarの3方式
 
 - `calendar_discovery`: Calendarだけを対象とする独立plan。後続のDaily日付や予算を自動生成・拡張しない。
+  Calendar出典の欄は `None` だけを受け付ける（空文字列は拒否し、同じ意味の別hashを作らない）。
 - `predeclared_daily`: 取得前に出典hash付きの営業日集合を固定し、Calendar・Master・Dailyを対象とする。
-- `calendar_anchored_daily`: 別途固定されたCalendar証拠hashから営業日集合を**新planとして**固定し、Master・Dailyを対象とする。
+  出典は**申告値・未検証**（Gate理由 `calendar_source_declared_unverified`）。
+- `calendar_anchored_daily`: 完了済みの `calendar_discovery` 成果物から導いたanchorで営業日集合を
+  **新planとして**固定し、Master・Dailyを対象とする。anchorの状態は次の2つを区別する。
+  - 申告のみ（証拠未提示）: `calendar_anchor_declared_unverified`。
+  - 内容照合済み: `verify_calendar_anchor()` が、Calendar planの台帳（承認込み）の完了、receiptの内容一致、
+    渡された原本が完了ページの原本と過不足なく一致すること、全暦日が1回ずつあること、ページ送りキーの一致を確認し、
+    営業日集合（HolDiv 1・2、`census` と同じ規則）からanchor hashを再計算する。Daily planの
+    `calendar_source_sha256` がanchor hashと、`calendar_source_reference` が
+    `calendar-discovery:<Calendarの成果物ID>` と一致し、対象窓がCalendar範囲内、Rと全Daily日付が営業日であることを要求する。
+    別成果物・別plan・未完了・改変Calendar・非営業日を含むDaily planは拒否する。
+  Calendarの取得結果から既存Daily planの対象日・予算を自動生成・拡張する関数はない。
 
 各planはR、対象日付、Calendar出典の参照先とhash、endpoint、逐次ページ送り、最大試行・ページ・時間、転送／展開／保存容量、
 1ページ上限、Retry規則、専用出力先、成果物ID、有効期間を正規化JSONのSHA-256で固定する。
 重複日付・不正な型・曖昧なtimezone・指定root外を拒否する。日付順序や同じ瞬間のtimezone表記差は
 同じhashとなる。出力識別子はこのcheckoutの `outputs/feasibility/http/<artifact_id>` に限定するが、
-これは**契約時のパス照合だけ**であり、ファイルの安全な作成は次PRの課題である。
+これは**契約時のパス照合だけ**であり、ファイルの安全な作成は次PRの課題である（plan hashにはこのcheckoutの
+絶対パスが入るため、別checkoutでは別hashになる）。
 6月試験worktree、`.delayed_replay`、既存DB・台帳・承認ファイルは今回の出力対象にならない。
 
-### 承認・予算・証拠の保証範囲
+### 承認の識別と台帳・receiptへの束縛
 
-`OwnerApprovalClaim` はplan hash・範囲・endpoint・予算・出力先・期間と、承認者・イベント・証拠参照の
-**自己申告メタデータ**を照合する。既存コードに独立した所有者署名／承認台帳の検証基盤は確認できず、
-`check_approval_scope()` は真正性を `False` のまま返す。任意の承認者名や `approved=true`、環境変数だけで
-実取得の許可は成立しない。今回、所有者承認資料は作成していない。
+`OwnerApprovalClaim` はplan hash・範囲・endpoint・予算・出力先・期間と、承認者・承認イベントID・証拠参照の
+**自己申告メタデータ**である。`OwnerApprovalClaim.sha256` は正規化した内容のhash、`approval_event_id` は
+承認イベントの識別子で、どちらも**誰が承認したかの証明ではない**。既存コードに独立した所有者署名／承認台帳の
+検証基盤はなく、`check_approval_scope()` は真正性を `False` のまま返す。今回、所有者承認資料は作成していない。
 
-`EvidenceJournal` は、送信前の予約、送信、応答、結果不明、原本保存、ページ完了を順序付きhash鎖の
-**バイト列契約**として検査する。予約時点で試行数を消費し、429・Retry・結果不明も累積数に残す。
-結果不明の転送／展開量は、次PRで実体を照合するまで1ページ上限分を保守的に仮計上する。
-`BodyInventory` は孤児・途中ファイルを保存容量へ含めるための申告値で、実ディスクを検査しない。
-孤児・途中ファイルが残る間は、容量に余裕があっても次の試行を予約可能と表示しない。
-resumeは既存台帳から予算を再構成し、別plan hashを拒否する。完了済みplanは新試行を受け付けない。
+- 台帳（`EvidenceJournal(plan, data, approval=...)`）は承認claimと一緒に開く。各 `attempt_reserved` は
+  `approval_sha256` を必須とし、開いた承認のhashと一致しなければ拒否する（差替え検出）。
+  承認なしで予約を含む台帳は開けない。承認識別子を持たない旧形式（journal v1）の台帳は受け付けず、
+  承認を推測で補完しない。
+- 予約時刻は plan と承認の両方の有効期間内（開始を含み、終了を含まない）でなければならない。
+  送信（`attempt_sent`）時にも、plan・承認の期間と累積deadlineを再検査する。
+- `ExternalReceiptClaim` は `approval_sha256` と `approval_event_id` を必須とし、台帳を開いた承認と一致しなければ拒否する。
+  承認期限外の試行を含む台帳は開く段階で拒否されるため、正常な証拠として照合されない。
 
-`ExternalReceiptClaim` は成果物ID、plan hash、台帳の行数・バイト数・head hash、原本集合hash、
-固定時刻・発行主体の**内容一致**を検査する。外部保管先の独立性・署名の真正性は検証しない。
-台帳の完全な末尾削除は、独立して固定されたreceiptがなければ検出できない。
-`assess_live_acquisition_gate()` は承認・receiptの真正性とHTTP入口が未実装のため常に閉じる。
+### 待機規則（rate limit）
+
+予約は、直前の試行の応答受信または結果不明の記録時刻（送信開始時刻の上界）から、planに固定した待機を
+経過していなければ拒否する（`attempt_before_rate_limit_wait`）。待機は
+`max(min_interval_seconds, 種類別の待機, 応答のRetry-After秒)` で、種類別の待機は429・5xx・結果不明（ネットワーク失敗扱い）
+それぞれの規則を使う。サーバーのRetry-Afterは待機を長くするだけで、短くはしない。結果不明の試行も試行数・待機規則から除外しない。
+応答はplanの `timeout_seconds` 以内、かつ累積deadline以内でなければ記録できない（それを超えたら結果不明として記録する）。
+
+`budget_snapshot()` は `earliest_next_attempt_at`、次に予約すべきページと試行番号、試行ごとの許容量、
+機械可読な `blocking_reasons` を返す。`can_reserve_next_attempt` は理由が空のときだけ真で、評価時刻が
+`earliest_next_attempt_at` より前なら `rate_limit_wait` となる。待機明けの時刻がplan・承認の期限や累積deadline以降なら
+それぞれ `*_before_next_allowed_attempt` を返す。時計の逆行・timezoneなしの時刻は拒否する。
+
+実HTTP送信では、契約上の予約に加えて**送信直前にも**これらの制限を検査する必要がある（台帳は `attempt_sent`
+で期間とdeadlineを再検査する）。ローカルの間隔制御は、同一アカウントを使う別プロセス・別端末の要求数を
+制御できない。アカウントの排他運用は所有者の運用判断として別に確定する。
+
+### 試行ごとの許容量と累積予算
+
+予約時に、転送・展開後本文・保存の各予算について「1ページ上限と残り総予算の小さい方」を計算し、
+`allowed_*_bytes` として台帳に固定する（申告値が計算値と異なれば拒否）。残量が0以下なら予約できない。
+許容量を超えた応答は超過として記録できるが、その試行の本文保存・ページ完了・以後の予約・run完了はできない。
+保存量が許容量を超える `body_saved` は拒否する。結果不明の試行は、転送・展開について1ページ上限分を
+保守的に仮計上し続ける。孤児・途中ファイルは保存容量に含め、残る間は次の試行を予約可能と表示しない。
+resumeは既存台帳から予算・待機・deadlineを再構成し、別plan hashを拒否する。完了済みplanは新試行を受け付けない。
+**今回実装したのは容量の契約であり、実HTTP本文の逐次読込み中に許容量で打ち切る処理は次PRの対象である。**
+
+### 原本一覧とreceipt
+
+`BodyInventory` は**申告値**で、実ディスクを検査しない。各ファイルは状態（`committed`／`orphan`／`partial`）に
+かかわらず、現在のバイト列のサイズとhashを持つ。`body_set_sha256` は全ファイルの object_id・状態・サイズ・hashから計算するため、
+途中ファイルの追加、状態の変更、原本の追加・削除・改変はreceiptとの照合で検出される。
+`committed` は台帳にページ完了がある本文だけに認め、ページ完了のない保存本文は `orphan` として申告しなければならない。
+同じ内容を複数のファイル・状態で二重に計上できない。同じqueryの別ページで同じ本文hashが保存された場合はループとして拒否する
+（別queryどうしの同一本文は1ファイルとして共有する）。
+
+receipt照合が示すのは、入力された台帳・原本一覧・承認claim・receipt間の**内容の整合**だけで、
+外部保管先の独立性・署名の真正性は検証しない。台帳の完全な末尾削除は、独立して固定されたreceiptがなければ検出できない。
+
+### Gateと結果オブジェクトの信頼境界
+
+`assess_live_acquisition_gate()` は、承認・receiptの真正性、Calendar出典の検証、HTTP入口が未実装のため常に閉じる。
+台帳は渡されたbytesをplanと承認で開き直して評価し、不整合な証拠は例外ではなく機械可読な理由
+（例: `budget_state_invalid:<code>`、`journal_invalid:<code>`）として返す。
+
+`LiveAcquisitionGate.permitted`、`ApprovalScopeCheck.authenticity_verified`、`ReceiptAlignment.independent_custody_verified`、
+`CalendarAnchor.independent_custody_verified` は呼出側が設定できない（常に `False`）。将来のHTTP実行入口は
+`require_live_acquisition_permission()` だけを予約前に呼び、生の証拠（plan、承認claim、台帳、原本一覧、receipt、Calendar証拠）を
+渡して、その場で評価させなければならない。結果オブジェクトを許可の証拠として受け取らない（型が違えば
+`raw_evidence_required`）。この入口は今回常に `LiveAcquisitionClosed` を送出する。同一プロセス内のmonkeypatch等は防がない。
+
+### 台帳の処理時間
+
+台帳を開く・resumeするときは全行を検証し、`append` は検証済みの状態の複製に新しいイベントだけを適用する
+（両者が同じbytes・状態になることをテストで確認）。人工測定（2510イベント・約2 MB）で、append全体0.15秒、
+全件検証0.07秒。5010イベントで0.41秒・0.14秒。appendは状態の複製とタプル連結のため件数に比例してわずかに遅くなる。
 
 ### 次PRと所有者判断
 
-HTTP・保存PRで、実通信の総deadline、全HTTP試行の逐次rate limit、429の待機、暗黙Retry無効化、
-本文の逐次・圧縮前後容量、実ファイルと台帳の照合、fd相対I/O、クラッシュ後の安全な再開を実装・検証する。
+HTTP・保存PRで、実通信の総deadline、送信直前の制限の再検査、暗黙Retry無効化、本文の逐次・圧縮前後容量と
+許容量での打切り、実ファイルと台帳の照合、fd相対I/O、クラッシュ後の安全な再開、Calendar原本の実取得と保存を実装・検証する。
 J-Quantsの公式レート制限はFree 5回／分のsliding windowで、429には通常 `Retry-After` が付かず、
 公式は少なくとも1分（確実性のため約2分）の待機を案内する。契約値としては13秒間隔と429後120秒を
-下限にしたが、**今回のコードは待機・timeoutを実行しない**。
+下限にしたが、**今回のコードは待機・timeoutを実行しない**（台帳が時刻の規則を検査するだけ）。
 
 所有者はR・対象営業日集合・各予算、承認の独立した真正性検証方式、外部receiptの保管先・署名方式・
 固定頻度、実出力rootの運用、同一アカウントの排他運用を別途確定する必要がある。

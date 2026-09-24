@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
@@ -15,28 +16,49 @@ from feasibility.acquisition import (
 )
 from feasibility.http_contract import (
     HTTP_OUTPUT_ROOT,
+    JOURNAL_SCHEMA,
+    ApprovalScopeCheck,
     BodyFileEvidence,
     BodyInventory,
+    CalendarAnchor,
+    CalendarDiscoveryEvidence,
     EvidenceJournal,
     ExternalReceiptClaim,
     HttpAcquisitionPlan,
     HttpContractError,
     HttpLimits,
     JournalEvent,
+    LiveAcquisitionClosed,
+    LiveAcquisitionGate,
     OwnerApprovalClaim,
     PageRequest,
+    ReceiptAlignment,
     RetryRules,
     assess_live_acquisition_gate,
     budget_snapshot,
+    calendar_anchor_reference,
     check_approval_scope,
     check_receipt_alignment,
+    derive_calendar_anchor,
     make_attempt_id,
+    require_live_acquisition_permission,
     validate_page_request,
+    verify_calendar_anchor,
 )
 
 NOW = datetime(2026, 9, 24, 12, tzinfo=UTC)
 DIGEST = "a" * 64
 BODY_DIGEST = "b" * 64
+MICRO = timedelta(microseconds=1)
+CLOSED_TAIL = (
+    "owner_approval_authenticity_unverified",
+    "independent_receipt_custody_unconfigured",
+    "http_transport_not_implemented",
+)
+
+
+def seconds(value: float) -> timedelta:
+    return timedelta(seconds=value)
 
 
 def limits(**changes) -> HttpLimits:
@@ -118,52 +140,95 @@ def page(fixed: HttpAcquisitionPlan, index: int = 0) -> PageRequest:
     return PageRequest(fixed.queries[index], 0)
 
 
-def reserve(
-    fixed: HttpAcquisitionPlan,
-    request: PageRequest,
-    attempt_number: int,
-    at: datetime = NOW,
-) -> JournalEvent:
-    return JournalEvent(
-        "attempt_reserved",
-        at,
-        attempt_id=make_attempt_id(fixed, request, attempt_number),
+def journal_for(fixed, claim=None, data: bytes = b"") -> EvidenceJournal:
+    return EvidenceJournal(fixed, data, approval=claim or approval(fixed))
+
+
+def reserve(journal, request, number, at=NOW, **overrides) -> JournalEvent:
+    transfer, decoded, saved = journal.next_reservation_allowances
+    values = dict(
+        attempt_id=make_attempt_id(journal.plan, request, number),
         page=request,
-        attempt_number=attempt_number,
+        attempt_number=number,
+        approval_sha256=journal.approval.sha256,
+        allowed_transfer_bytes=transfer,
+        allowed_decoded_bytes=decoded,
+        allowed_saved_bytes=saved,
     )
+    values.update(overrides)
+    return JournalEvent("attempt_reserved", at, **values)
 
 
-def response(
-    journal: EvidenceJournal, request: PageRequest, *, status: int = 200
+def exchange(
+    journal,
+    request,
+    number,
+    at=NOW,
+    *,
+    status=200,
+    transfer=10,
+    decoded=20,
+    retry_after=None,
+    sent_at=None,
+    received_at=None,
 ) -> EvidenceJournal:
-    number = 1 + sum(
-        event.kind == "attempt_reserved" and event.page == request
-        for event in journal.events
-    )
-    fixed = journal.plan
-    attempt = reserve(fixed, request, number, NOW + timedelta(seconds=number))
-    journal = journal.append(attempt)
+    event = reserve(journal, request, number, at)
+    journal = journal.append(event)
+    sent_at = sent_at or at
     journal = journal.append(
-        JournalEvent("attempt_sent", attempt.at, attempt_id=attempt.attempt_id)
+        JournalEvent("attempt_sent", sent_at, attempt_id=event.attempt_id)
     )
     return journal.append(
         JournalEvent(
             "response_received",
-            attempt.at,
-            attempt_id=attempt.attempt_id,
+            received_at or sent_at,
+            attempt_id=event.attempt_id,
             status=status,
-            transfer_bytes=10,
-            decoded_bytes=20,
+            transfer_bytes=transfer,
+            decoded_bytes=decoded,
+            retry_after_seconds=retry_after,
         )
     )
 
 
-def receipt(
-    journal: EvidenceJournal, inventory: BodyInventory, **changes
-) -> ExternalReceiptClaim:
+def last_attempt_id(journal) -> str:
+    return [e for e in journal.events if e.kind == "attempt_reserved"][-1].attempt_id
+
+
+def finish_page(journal, at=NOW, *, digest, saved=20, next_key=None):
+    attempt_id = last_attempt_id(journal)
+    journal = journal.append(
+        JournalEvent(
+            "body_saved",
+            at,
+            attempt_id=attempt_id,
+            body_sha256=digest,
+            saved_bytes=saved,
+        )
+    )
+    return journal.append(
+        JournalEvent("page_completed", at, attempt_id=attempt_id, next_key=next_key)
+    )
+
+
+def complete_pages(fixed, claim=None, *, start=NOW, spacing=13):
+    journal = journal_for(fixed, claim)
+    files, at = [], start
+    for index, query in enumerate(fixed.queries):
+        digest = f"{index + 1:064x}"
+        journal = exchange(journal, PageRequest(query, 0), 1, at)
+        journal = finish_page(journal, at, digest=digest)
+        files.append(BodyFileEvidence(f"body-{index}", 20, "committed", digest))
+        at += seconds(spacing)
+    return journal, BodyInventory(tuple(files)), at
+
+
+def receipt(journal, inventory, **changes) -> ExternalReceiptClaim:
     values = dict(
         artifact_id=journal.plan.artifact_id,
         plan_sha256=journal.plan.sha256,
+        approval_sha256=journal.approval.sha256,
+        approval_event_id=journal.approval.approval_event_id,
         ledger_event_count=journal.event_count,
         ledger_bytes=journal.byte_count,
         ledger_head_sha256=journal.head_hash,
@@ -175,6 +240,38 @@ def receipt(
     )
     values.update(changes)
     return ExternalReceiptClaim(**values)
+
+
+def canonical(value) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def forge(fixed, data: bytes, event: dict, *, schema: str = JOURNAL_SCHEMA) -> bytes:
+    """Append a well-chained record *without* contract validation (tamper tests)."""
+
+    lines = data.split(b"\n")[:-1]
+    head = json.loads(lines[-1])["event_id"] if lines else "0" * 64
+    content = {
+        "schema": schema,
+        "sequence": len(lines),
+        "previous_hash": head,
+        "plan_sha256": fixed.sha256,
+        "event": event,
+    }
+    record = {
+        **content,
+        "event_id": hashlib.sha256(canonical(content).encode()).hexdigest(),
+    }
+    return data + (canonical(record) + "\n").encode()
+
+
+# ------------------------------------------------------------------ fixed plan
 
 
 def test_plan_canonical_hash_order_timezone_and_semantic_changes():
@@ -235,13 +332,12 @@ def test_integer_budget_rejects_bool_float_nan_and_nonpositive(bad):
         limits(max_attempts=bad)
 
 
+CALENDAR_ONLY = dict(kind="calendar_discovery", master_date=None, daily_dates=())
+
+
 def test_calendar_methods_have_separate_fixed_scope():
     discovery = plan(
-        kind="calendar_discovery",
-        master_date=None,
-        daily_dates=(),
-        calendar_source_sha256=None,
-        calendar_source_reference=None,
+        **CALENDAR_ONLY, calendar_source_sha256=None, calendar_source_reference=None
     )
     anchored = plan(kind="calendar_anchored_daily")
     assert discovery.allowed_endpoints == ("/markets/calendar",)
@@ -256,6 +352,18 @@ def test_calendar_methods_have_separate_fixed_scope():
             replace(approval(discovery), allowed_endpoints=anchored.allowed_endpoints),
             now=NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "source", [{"calendar_source_sha256": ""}, {"calendar_source_reference": ""}]
+)
+def test_calendar_discovery_rejects_empty_text_instead_of_a_second_hash(source):
+    other = {"calendar_source_sha256": None, "calendar_source_reference": None}
+    with pytest.raises(HttpContractError, match="calendar_discovery_must_be_calendar"):
+        plan(**CALENDAR_ONLY, **{**other, **source})
+
+
+# ---------------------------------------------------- High 1: approval binding
 
 
 @pytest.mark.parametrize(
@@ -274,38 +382,352 @@ def test_approval_mismatch_or_expiry_rejected(change, reason):
         check_approval_scope(fixed, approval(fixed, **change), now=NOW)
 
 
+def test_approval_daily_dates_with_mixed_types_are_a_contract_error():
+    with pytest.raises(HttpContractError, match="approval_daily_date_must_be_text"):
+        approval(plan(), daily_dates=("2025-03-03", 1))
+
+
+def test_approval_content_hash_is_identity_not_authenticity():
+    fixed = plan()
+    claim = approval(fixed)
+    assert claim.sha256 == approval(fixed).sha256
+    assert approval(fixed, approval_event_id="other-event").sha256 != claim.sha256
+    assert approval(fixed, approver_id="someone-else").sha256 != claim.sha256
+    check = check_approval_scope(fixed, claim, now=NOW)
+    assert (check.approval_sha256, check.authenticity_verified) == (claim.sha256, False)
+    with pytest.raises(TypeError):
+        ApprovalScopeCheck(True, claim.sha256, authenticity_verified=True)
+
+
+def test_every_reservation_records_and_requires_the_bound_approval():
+    fixed = plan()
+    claim = approval(fixed)
+    other = approval(fixed, approval_event_id="substituted-event")
+    journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=429)
+    assert journal.events[0].approval_sha256 == claim.sha256
+    assert journal.approval_sha256 == claim.sha256
+    with pytest.raises(HttpContractError, match="attempt_requires_approval_claim"):
+        EvidenceJournal(fixed, journal.data)  # never inferred from the journal
+    with pytest.raises(HttpContractError, match="attempt_approval_mismatch"):
+        EvidenceJournal(fixed, journal.data, approval=other)
+    with pytest.raises(HttpContractError, match="attempt_approval_mismatch"):
+        journal.append(
+            reserve(
+                journal,
+                page(fixed),
+                2,
+                NOW + seconds(120),
+                approval_sha256=other.sha256,
+            )
+        )
+    with pytest.raises(HttpContractError, match="attempt_requires_approval_claim"):
+        EvidenceJournal(fixed).append(reserve(journal, page(fixed), 1))
+    with pytest.raises(HttpContractError, match="approval_plan_sha256_mismatch"):
+        EvidenceJournal(fixed, approval=approval(plan(limits=limits(max_attempts=9))))
+
+
+@pytest.mark.parametrize(
+    "at,allowed",
+    [
+        (NOW - MICRO, False),  # before valid_from
+        (NOW, True),  # valid_from is inclusive
+        (NOW + seconds(60) - MICRO, True),
+        (NOW + seconds(60), False),  # valid_until is exclusive
+    ],
+)
+def test_reservation_must_lie_inside_the_approval_window(at, allowed):
+    fixed = plan()
+    claim = approval(fixed, valid_from=NOW, valid_until=NOW + seconds(60))
+    journal = journal_for(fixed, claim)
+    event = reserve(journal, page(fixed), 1, at)
+    if allowed:
+        assert journal.append(event).event_count == 1
+    else:
+        with pytest.raises(
+            HttpContractError, match="attempt_outside_approval_validity"
+        ):
+            journal.append(event)
+
+
+def test_send_is_rechecked_against_approval_expiry():
+    fixed = plan()
+    claim = approval(fixed, valid_from=NOW, valid_until=NOW + seconds(60))
+    journal = journal_for(fixed, claim).append(
+        reserve(journal_for(fixed, claim), page(fixed), 1, NOW + seconds(59))
+    )
+    with pytest.raises(HttpContractError, match="send_outside_approval_validity"):
+        journal.append(
+            JournalEvent(
+                "attempt_sent", NOW + seconds(60), attempt_id=last_attempt_id(journal)
+            )
+        )
+
+
+def test_resume_after_approval_expiry_cannot_reserve():
+    fixed = plan()
+    claim = approval(fixed, valid_until=NOW + seconds(200))
+    journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=503)
+    resumed = EvidenceJournal(fixed, journal.data, approval=claim)
+    state = budget_snapshot(resumed, BodyInventory(()), now=NOW + seconds(250))
+    assert not state.can_reserve_next_attempt
+    assert "approval_expired" in state.blocking_reasons
+    with pytest.raises(HttpContractError, match="attempt_outside_approval_validity"):
+        resumed.append(reserve(resumed, page(fixed), 2, NOW + seconds(250)))
+
+
+def test_forged_journal_with_attempt_outside_the_approval_is_refused():
+    fixed = plan()
+    claim = approval(fixed)
+    late = NOW + timedelta(minutes=40)  # inside the plan, after the approval
+    event = reserve(journal_for(fixed, claim), page(fixed), 1, late)
+    data = forge(fixed, b"", event.to_dict())
+    with pytest.raises(HttpContractError, match="attempt_outside_approval_validity"):
+        EvidenceJournal(fixed, data, approval=claim)
+
+
+def test_journal_without_approval_identifiers_is_not_upgraded():
+    fixed = plan()
+    event = reserve(journal_for(fixed), page(fixed), 1).to_dict()
+    legacy = {
+        k: v
+        for k, v in event.items()
+        if k
+        not in (
+            "approval_sha256",
+            "allowed_transfer_bytes",
+            "allowed_decoded_bytes",
+            "allowed_saved_bytes",
+            "retry_after_seconds",
+        )
+    }
+    with pytest.raises(HttpContractError, match="journal_chain_or_plan_mismatch"):
+        EvidenceJournal(
+            fixed,
+            forge(fixed, b"", legacy, schema="historical-feasibility-journal-v1"),
+            approval=approval(fixed),
+        )
+    with pytest.raises(HttpContractError, match="journal_event_schema_invalid"):
+        EvidenceJournal(fixed, forge(fixed, b"", legacy), approval=approval(fixed))
+
+
+def test_receipt_binds_the_approval_and_rejects_missing_or_other_approvals():
+    fixed = plan()
+    claim = approval(fixed)
+    journal, inventory, _ = complete_pages(fixed, claim)
+    claim_receipt = receipt(journal, inventory)
+    assert check_receipt_alignment(journal, inventory, claim_receipt).content_matches
+    other = approval(fixed, approval_event_id="substituted-event")
+    with pytest.raises(HttpContractError, match="receipt_approval_sha256_mismatch"):
+        check_receipt_alignment(
+            journal, inventory, replace(claim_receipt, approval_sha256=other.sha256)
+        )
+    with pytest.raises(HttpContractError, match="receipt_approval_event_id_mismatch"):
+        check_receipt_alignment(
+            journal, inventory, replace(claim_receipt, approval_event_id="other")
+        )
+    with pytest.raises(HttpContractError, match="approval_sha256_must_be_sha256"):
+        replace(claim_receipt, approval_sha256="")
+    with pytest.raises(TypeError):
+        ExternalReceiptClaim(
+            **{k: v for k, v in vars(claim_receipt).items() if k != "approval_sha256"}
+        )
+    with pytest.raises(HttpContractError, match="receipt_requires_approval_claim"):
+        check_receipt_alignment(
+            EvidenceJournal(fixed), BodyInventory(()), claim_receipt
+        )
+
+
 def test_claim_metadata_never_proves_authenticity_or_opens_gate():
     fixed = plan()
     claim = approval(fixed)
-    journal = EvidenceJournal(fixed)
+    journal = journal_for(fixed, claim)
     inventory = BodyInventory(())
     assert check_approval_scope(fixed, claim, now=NOW).authenticity_verified is False
     assert OwnerApprovalClaim.__dataclass_fields__.get("approved") is None
-    assert assess_live_acquisition_gate(
+    gate = assess_live_acquisition_gate(
         fixed, claim, journal, inventory, receipt(journal, inventory), now=NOW
-    ).reasons[-3:] == (
-        "owner_approval_authenticity_unverified",
-        "independent_receipt_custody_unconfigured",
-        "http_transport_not_implemented",
     )
+    assert gate.reasons[-3:] == CLOSED_TAIL
+    assert not gate.permitted
     assert not assess_live_acquisition_gate(
         fixed, None, journal, inventory, None, now=NOW
     ).permitted
 
 
+# ------------------------------------------------ High 2: rate limit and waits
+
+
+def after_response(status: int, *, retry_after=None, **retry_changes):
+    fixed = plan(retry=retry(**retry_changes))
+    journal = exchange(
+        journal_for(fixed), page(fixed), 1, NOW, status=status, retry_after=retry_after
+    )
+    if status == 200:
+        journal = finish_page(journal, NOW, digest=BODY_DIGEST)
+    return fixed, journal
+
+
+@pytest.mark.parametrize(
+    "status,retry_after,changes,wait",
+    [
+        (200, None, {}, 13),  # plain interval
+        (429, None, {}, 120),  # 429 wait
+        (503, None, {"min_wait_after_5xx_seconds": 30}, 30),
+        (429, 300, {}, 300),  # a longer server hint wins
+        (429, 5, {}, 120),  # a shorter server hint never shortens the local wait
+    ],
+)
+def test_reservation_respects_the_plan_wait_to_the_microsecond(
+    status, retry_after, changes, wait
+):
+    fixed, journal = after_response(status, retry_after=retry_after, **changes)
+    next_page = page(fixed, 1) if status == 200 else page(fixed)
+    number = 1 if status == 200 else 2
+    with pytest.raises(HttpContractError, match="attempt_before_rate_limit_wait"):
+        journal.append(reserve(journal, next_page, number, NOW + seconds(wait) - MICRO))
+    assert journal.append(reserve(journal, next_page, number, NOW + seconds(wait)))
+    early = budget_snapshot(
+        journal, inventory_of(journal), now=NOW + seconds(wait) - MICRO
+    )
+    assert early.earliest_next_attempt_at == NOW + seconds(wait)
+    assert not early.can_reserve_next_attempt
+    assert early.blocking_reasons == ("rate_limit_wait",)
+    on_time = budget_snapshot(journal, inventory_of(journal), now=NOW + seconds(wait))
+    assert on_time.can_reserve_next_attempt and on_time.blocking_reasons == ()
+    assert (on_time.next_page, on_time.next_attempt_number) == (next_page, number)
+
+
+def inventory_of(journal) -> BodyInventory:
+    """Committed files exactly matching the journal's completed bodies."""
+
+    files = []
+    for event in journal.events:
+        if event.kind == "body_saved":
+            files.append(
+                BodyFileEvidence(
+                    f"body-{len(files)}",
+                    event.saved_bytes,
+                    "committed",
+                    event.body_sha256,
+                )
+            )
+    return BodyInventory(tuple(files))
+
+
+def test_unknown_outcome_counts_and_waits_like_a_network_failure():
+    fixed = plan(retry=retry(min_wait_after_network_error_seconds=60))
+    journal = journal_for(fixed)
+    first = reserve(journal, page(fixed), 1, NOW)
+    journal = journal.append(first).append(
+        JournalEvent("outcome_unknown", NOW + seconds(5), attempt_id=first.attempt_id)
+    )
+    with pytest.raises(HttpContractError, match="attempt_before_rate_limit_wait"):
+        journal.append(reserve(journal, page(fixed), 2, NOW + seconds(65) - MICRO))
+    state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(6))
+    assert (state.reserved_attempts, state.unknown_outcomes) == (1, 1)
+    assert state.earliest_next_attempt_at == NOW + seconds(65)
+    assert state.remaining_attempts == fixed.limits.max_attempts - 1
+
+
+def test_resume_keeps_the_earliest_next_attempt_time():
+    fixed, journal = after_response(429)
+    resumed = EvidenceJournal(fixed, journal.data, approval=approval(fixed))
+    state = budget_snapshot(resumed, BodyInventory(()), now=NOW + seconds(30))
+    assert state.earliest_next_attempt_at == NOW + seconds(120)
+    assert "rate_limit_wait" in state.blocking_reasons
+
+
+@pytest.mark.parametrize(
+    "plan_changes,claim_changes,reason",
+    [
+        ({}, {"valid_until": NOW + seconds(100)},
+         "approval_expires_before_next_allowed_attempt"),
+        ({"expires_at": NOW + seconds(110)}, {"valid_until": NOW + seconds(100)},
+         "plan_expires_before_next_allowed_attempt"),
+        ({"limits": limits(max_elapsed_seconds=100)}, {},
+         "deadline_before_next_allowed_attempt"),
+    ],
+)  # fmt: skip
+def test_expiry_during_a_retry_wait_blocks_the_next_attempt(
+    plan_changes, claim_changes, reason
+):
+    fixed = plan(**plan_changes)
+    claim = approval(fixed, **claim_changes)
+    journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=429)
+    state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(1))
+    assert reason in state.blocking_reasons and not state.can_reserve_next_attempt
+
+
+def test_clock_anomalies_are_rejected():
+    fixed = plan()
+    journal = journal_for(fixed).append(reserve(journal_for(fixed), page(fixed), 1))
+    with pytest.raises(HttpContractError, match="journal_clock_regressed"):
+        journal.append(
+            JournalEvent(
+                "attempt_sent", NOW - MICRO, attempt_id=last_attempt_id(journal)
+            )
+        )
+    with pytest.raises(HttpContractError, match="resume_clock_regressed"):
+        budget_snapshot(journal, BodyInventory(()), now=NOW - MICRO)
+    with pytest.raises(HttpContractError, match="now_must_be_aware_datetime"):
+        budget_snapshot(journal, BodyInventory(()), now=NOW.replace(tzinfo=None))
+    with pytest.raises(HttpContractError, match="event_at_must_be_aware_datetime"):
+        JournalEvent("run_completed", NOW.replace(tzinfo=None))
+
+
+def test_send_and_response_are_bounded_by_deadline_and_timeout():
+    fixed = plan(limits=limits(max_elapsed_seconds=20))
+    journal = journal_for(fixed).append(reserve(journal_for(fixed), page(fixed), 1))
+    attempt_id = last_attempt_id(journal)
+    with pytest.raises(HttpContractError, match="send_after_cumulative_deadline"):
+        journal.append(
+            JournalEvent("attempt_sent", NOW + seconds(20), attempt_id=attempt_id)
+        )
+    sent = journal.append(
+        JournalEvent("attempt_sent", NOW + seconds(19), attempt_id=attempt_id)
+    )
+
+    def respond(at):
+        return JournalEvent(
+            "response_received",
+            at,
+            attempt_id=attempt_id,
+            status=200,
+            transfer_bytes=10,
+            decoded_bytes=20,
+        )
+
+    with pytest.raises(HttpContractError, match="response_after_cumulative_deadline"):
+        sent.append(respond(NOW + seconds(20) + MICRO))
+    assert sent.append(respond(NOW + seconds(20)))
+    slow = plan(retry=retry(timeout_seconds=30))
+    journal = journal_for(slow).append(reserve(journal_for(slow), page(slow), 1))
+    journal = journal.append(
+        JournalEvent("attempt_sent", NOW, attempt_id=last_attempt_id(journal))
+    )
+    with pytest.raises(HttpContractError, match="response_after_timeout"):
+        journal.append(
+            replace(
+                respond(NOW + seconds(30) + MICRO), attempt_id=last_attempt_id(journal)
+            )
+        )
+
+
 def test_journal_reserved_sent_429_retry_unknown_counts_survive_resume():
     fixed = plan()
+    claim = approval(fixed)
     request = page(fixed)
-    journal = response(EvidenceJournal(fixed), request, status=429)
-    second = reserve(fixed, request, 2, NOW + timedelta(seconds=13))
+    journal = exchange(journal_for(fixed, claim), request, 1, NOW, status=429)
+    retry_at = NOW + seconds(120)
+    second = reserve(journal, request, 2, retry_at)
     journal = journal.append(second).append(
-        JournalEvent("attempt_sent", second.at, attempt_id=second.attempt_id)
+        JournalEvent("attempt_sent", retry_at, attempt_id=second.attempt_id)
     )
     journal = journal.append(
-        JournalEvent("outcome_unknown", second.at, attempt_id=second.attempt_id)
+        JournalEvent("outcome_unknown", retry_at, attempt_id=second.attempt_id)
     )
-    resumed = EvidenceJournal(fixed, journal.data)
-    state = budget_snapshot(resumed, BodyInventory(()), now=NOW + timedelta(seconds=20))
+    resumed = EvidenceJournal(fixed, journal.data, approval=claim)
+    state = budget_snapshot(resumed, BodyInventory(()), now=retry_at + seconds(13))
     assert (state.reserved_attempts, state.sent_attempts, state.received_responses) == (
         2,
         2,
@@ -319,8 +741,9 @@ def test_journal_reserved_sent_429_retry_unknown_counts_survive_resume():
     assert state.remaining_attempts == fixed.limits.max_attempts - 2
     assert state.remaining_transfer_bytes == fixed.limits.max_transfer_bytes - 510
     assert state.remaining_decoded_bytes == fixed.limits.max_decoded_bytes - 620
-    assert state.elapsed_seconds == 19
+    assert state.elapsed_seconds == 133
     assert state.can_reserve_next_attempt
+    assert (state.next_page, state.next_attempt_number) == (request, 3)
     with pytest.raises(HttpContractError, match="journal_chain_or_plan_mismatch"):
         EvidenceJournal(plan(limits=limits(max_attempts=9)), journal.data)
 
@@ -328,192 +751,35 @@ def test_journal_reserved_sent_429_retry_unknown_counts_survive_resume():
 def test_unsettled_or_unknown_attempt_consumes_budget_and_deadline_is_fixed():
     fixed = plan(limits=limits(max_elapsed_seconds=20))
     request = page(fixed)
-    first = reserve(fixed, request, 1)
-    journal = EvidenceJournal(fixed).append(first)
-    state = budget_snapshot(journal, BodyInventory(()), now=NOW + timedelta(seconds=5))
+    first = reserve(journal_for(fixed), request, 1)
+    journal = journal_for(fixed).append(first)
+    state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(5))
     assert state.unsettled_attempts == 1
-    assert not state.can_reserve_next_attempt
+    assert "unsettled_attempt" in state.blocking_reasons
     journal = journal.append(
         JournalEvent("outcome_unknown", NOW, attempt_id=first.attempt_id)
     )
     assert (
         budget_snapshot(
-            journal, BodyInventory(()), now=NOW + timedelta(seconds=19)
+            journal, BodyInventory(()), now=NOW + seconds(19)
         ).remaining_seconds
         == 1
     )
-    assert not budget_snapshot(
-        journal, BodyInventory(()), now=NOW + timedelta(seconds=20)
-    ).can_reserve_next_attempt
+    late = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(20))
+    assert "time_budget_exhausted" in late.blocking_reasons
     with pytest.raises(HttpContractError, match="attempt_after_cumulative_deadline"):
-        journal.append(reserve(fixed, request, 2, NOW + timedelta(seconds=20)))
-
-
-def test_body_inventory_counts_orphan_and_partial_without_reset():
-    fixed = plan(limits=limits(max_saved_bytes=25, max_page_saved_bytes=25))
-    inventory = BodyInventory(
-        (
-            BodyFileEvidence("orphan-1", 20, "orphan", BODY_DIGEST),
-            BodyFileEvidence("partial-1", 5, "partial"),
-        )
-    )
-    state = budget_snapshot(EvidenceJournal(fixed), inventory, now=NOW)
-    assert state.orphan_files == state.partial_files == 1
-    assert state.remaining_saved_bytes == 0
-    assert not state.can_reserve_next_attempt
-    under_budget = budget_snapshot(
-        EvidenceJournal(plan()),
-        BodyInventory((BodyFileEvidence("orphan-only", 1, "orphan", BODY_DIGEST),)),
-        now=NOW,
-    )
-    assert under_budget.remaining_saved_bytes > 0
-    assert not under_budget.can_reserve_next_attempt
-
-
-def test_completed_page_body_and_receipt_alignment_then_tamper_rejection():
-    fixed = plan()
-    request = page(fixed)
-    journal = response(EvidenceJournal(fixed), request)
-    attempt_id = journal.events[0].attempt_id
-    journal = journal.append(
-        JournalEvent(
-            "body_saved",
-            NOW + timedelta(seconds=2),
-            attempt_id=attempt_id,
-            body_sha256=BODY_DIGEST,
-            saved_bytes=20,
-        )
-    )
-    journal = journal.append(
-        JournalEvent(
-            "page_completed", NOW + timedelta(seconds=2), attempt_id=attempt_id
-        )
-    )
-    inventory = BodyInventory(
-        (BodyFileEvidence("body-1", 20, "committed", BODY_DIGEST),)
-    )
-    assert (
-        budget_snapshot(
-            journal, inventory, now=NOW + timedelta(seconds=10)
-        ).completed_pages
-        == 1
-    )
-    claim = receipt(journal, inventory)
-    assert check_receipt_alignment(journal, inventory, claim).content_matches
-    assert not check_receipt_alignment(
-        journal, inventory, claim
-    ).independent_custody_verified
-    with pytest.raises(HttpContractError, match="receipt_ledger_head_sha256_mismatch"):
-        check_receipt_alignment(
-            journal, inventory, replace(claim, ledger_head_sha256=DIGEST)
-        )
-    with pytest.raises(HttpContractError, match="receipt_body_set_sha256_mismatch"):
-        check_receipt_alignment(
-            journal, inventory, replace(claim, body_set_sha256=DIGEST)
-        )
-    with pytest.raises(HttpContractError, match="completed_page_body_not_committed"):
-        budget_snapshot(
-            journal,
-            BodyInventory((BodyFileEvidence("body-1", 20, "orphan", BODY_DIGEST),)),
-            now=NOW,
-        )
-
-
-def test_journal_detects_line_deletion_and_noncanonical_or_modified_record():
-    fixed = plan()
-    journal = response(EvidenceJournal(fixed), page(fixed), status=429)
-    with pytest.raises(HttpContractError, match="journal_incomplete_final_line"):
-        EvidenceJournal(fixed, journal.data[:-1])
-    lines = journal.data.splitlines(keepends=True)
-    with pytest.raises(HttpContractError, match="journal_chain_or_plan_mismatch"):
-        EvidenceJournal(fixed, b"".join(lines[1:]))
-    record = json.loads(lines[0])
-    record["event"]["status"] = 200
-    with pytest.raises(
-        HttpContractError, match="journal_record_noncanonical|journal_chain"
-    ):
-        EvidenceJournal(
-            fixed, (json.dumps(record) + "\n").encode() + b"".join(lines[1:])
-        )
-    # A cleanly removed *tail* cannot be detected without an independently fixed receipt.
-    truncated = EvidenceJournal(fixed, b"".join(lines[:-1]))
-    assert truncated.event_count == journal.event_count - 1
-    with pytest.raises(HttpContractError, match="receipt_ledger_event_count_mismatch"):
-        check_receipt_alignment(
-            truncated, BodyInventory(()), receipt(journal, BodyInventory(()))
-        )
-
-
-def test_journal_rejects_nonfinite_json_as_contract_error():
-    fixed = plan()
-    journal = EvidenceJournal(fixed).append(reserve(fixed, page(fixed), 1))
-    record = json.loads(journal.data)
-    record["event"]["status"] = float("nan")
-    malformed = (json.dumps(record) + "\n").encode("utf-8")
-    with pytest.raises(HttpContractError, match="journal_record_noncanonical"):
-        EvidenceJournal(fixed, malformed)
-
-
-def test_complete_journal_is_idempotent_and_rejects_a_second_attempt():
-    fixed = plan()
-    journal = EvidenceJournal(fixed)
-    files = []
-    for index, query in enumerate(fixed.queries):
-        request = PageRequest(query, 0)
-        at = NOW + timedelta(seconds=13 * index)
-        attempt = reserve(fixed, request, 1, at)
-        digest = f"{index + 1:064x}"
-        journal = journal.append(attempt)
-        journal = journal.append(
-            JournalEvent("attempt_sent", at, attempt_id=attempt.attempt_id)
-        )
-        journal = journal.append(
-            JournalEvent(
-                "response_received",
-                at,
-                attempt_id=attempt.attempt_id,
-                status=200,
-                transfer_bytes=10,
-                decoded_bytes=20,
-            )
-        )
-        journal = journal.append(
-            JournalEvent(
-                "body_saved",
-                at,
-                attempt_id=attempt.attempt_id,
-                body_sha256=digest,
-                saved_bytes=20,
-            )
-        )
-        journal = journal.append(
-            JournalEvent("page_completed", at, attempt_id=attempt.attempt_id)
-        )
-        files.append(BodyFileEvidence(f"body-{index}", 20, "committed", digest))
-    journal = journal.append(JournalEvent("run_completed", NOW + timedelta(seconds=60)))
-    resumed = EvidenceJournal(fixed, journal.data)
-    state = budget_snapshot(
-        resumed, BodyInventory(tuple(files)), now=NOW + timedelta(seconds=61)
-    )
-    assert resumed.completed
-    assert state.status == "completed"
-    assert state.completed_pages == len(fixed.queries)
-    assert not state.can_reserve_next_attempt
-    with pytest.raises(HttpContractError, match="journal_event_after_terminal_state"):
-        resumed.append(reserve(fixed, page(fixed), 2, NOW + timedelta(seconds=62)))
+        journal.append(reserve(journal, request, 2, NOW + seconds(20)))
 
 
 def test_global_sequential_query_and_nonretryable_response_contract():
     fixed = plan()
     first_page = page(fixed)
     second_query_page = page(fixed, 1)
-    journal = EvidenceJournal(fixed)
-    first = reserve(fixed, first_page, 1)
+    journal = journal_for(fixed)
+    first = reserve(journal, first_page, 1)
     journal = journal.append(first)
     with pytest.raises(HttpContractError, match="prior_attempt_unsettled"):
-        journal.append(
-            reserve(fixed, second_query_page, 1, NOW + timedelta(seconds=13))
-        )
+        journal.append(reserve(journal, second_query_page, 1, NOW + seconds(13)))
     journal = journal.append(
         JournalEvent("attempt_sent", NOW, attempt_id=first.attempt_id)
     )
@@ -528,152 +794,613 @@ def test_global_sequential_query_and_nonretryable_response_contract():
         )
     )
     with pytest.raises(HttpContractError, match="previous_attempt_not_retryable"):
-        journal.append(reserve(fixed, first_page, 2, NOW + timedelta(seconds=13)))
+        journal.append(reserve(journal, first_page, 2, NOW + seconds(13)))
     with pytest.raises(HttpContractError, match="prior_query_incomplete"):
-        journal.append(
-            reserve(fixed, second_query_page, 1, NOW + timedelta(seconds=13))
+        journal.append(reserve(journal, second_query_page, 1, NOW + seconds(13)))
+    state = budget_snapshot(journal, BodyInventory(()), now=NOW + seconds(13))
+    assert "previous_attempt_not_retryable" in state.blocking_reasons
+
+
+# --------------------------------------------- Medium 4: per-attempt allowances
+
+
+def byte_plan(**changes) -> HttpAcquisitionPlan:
+    values = dict(
+        max_transfer_bytes=1000,
+        max_page_transfer_bytes=500,
+        max_decoded_bytes=10000,
+        max_page_decoded_bytes=5000,
+        max_saved_bytes=10000,
+        max_page_saved_bytes=5000,
+    )
+    values.update(changes)
+    return plan(limits=limits(**values))
+
+
+def pages_with(fixed, transfers, *, saved=20, decoded=20):
+    journal, at = journal_for(fixed), NOW
+    for index, transfer in enumerate(transfers):
+        journal = exchange(
+            journal, page(fixed, index), 1, at, transfer=transfer, decoded=decoded
         )
+        journal = finish_page(journal, at, digest=f"{index + 1:064x}", saved=saved)
+        at += seconds(13)
+    return journal, at
+
+
+def test_allowance_is_the_smaller_of_page_cap_and_remaining_budget():
+    fixed = byte_plan()
+    journal, at = pages_with(fixed, [500, 499])  # 1 byte of transfer budget left
+    assert journal.next_reservation_allowances[0] == 1
+    state = budget_snapshot(journal, inventory_of(journal), now=at)
+    assert state.next_allowed_transfer_bytes == 1 and state.can_reserve_next_attempt
+    with pytest.raises(HttpContractError, match="reserved_allowance_invalid"):
+        journal.append(
+            reserve(journal, page(fixed, 2), 1, at, allowed_transfer_bytes=500)
+        )
+    over = exchange(journal, page(fixed, 2), 1, at, transfer=2)  # beyond the 1 byte
+    with pytest.raises(HttpContractError, match="body_save_order_invalid"):
+        finish_page(over, at, digest=DIGEST)
+    blocked = budget_snapshot(over, inventory_of(over), now=at + seconds(13))
+    assert "budget_overrun_recorded" in blocked.blocking_reasons
+    assert over.next_reservation_allowances[0] < 0  # the overrun is on record
+    with pytest.raises(HttpContractError, match="previous_page_budget_overrun"):
+        over.append(
+            reserve(over, page(fixed, 2), 2, at + seconds(13), allowed_transfer_bytes=1)
+        )
+
+
+def test_remaining_below_page_cap_exact_fill_and_zero():
+    fixed = byte_plan()
+    journal, at = pages_with(fixed, [500, 200])  # 300 left, page cap 500
+    assert journal.next_reservation_allowances[0] == 300
+    journal = exchange(journal, page(fixed, 2), 1, at, transfer=300)  # exactly the cap
+    journal = finish_page(journal, at, digest=DIGEST)
+    assert journal.next_reservation_allowances[0] == 0
+    state = budget_snapshot(journal, inventory_of(journal), now=at + seconds(13))
+    assert state.next_allowed_transfer_bytes == 0
+    assert "transfer_budget_exhausted" in state.blocking_reasons
+    with pytest.raises(HttpContractError, match="transfer_budget_exhausted"):
+        journal.append(
+            reserve(
+                journal,
+                page(fixed, 3),
+                1,
+                at + seconds(13),
+                allowed_transfer_bytes=1,
+            )
+        )
+
+
+def test_decoded_and_saved_allowances_are_separate_budgets():
+    decoded_plan = byte_plan(max_decoded_bytes=100, max_page_decoded_bytes=60)
+    journal, at = pages_with(decoded_plan, [10], decoded=60)
+    assert journal.next_reservation_allowances[1] == 40
+    over = exchange(journal, page(decoded_plan, 1), 1, at, transfer=10, decoded=41)
+    assert budget_snapshot(over, inventory_of(over), now=at).blocking_reasons[:1] == (
+        "budget_overrun_recorded",
+    )
+    saved_plan = byte_plan(max_saved_bytes=50, max_page_saved_bytes=40)
+    journal, at = pages_with(saved_plan, [10], saved=40)
+    assert journal.next_reservation_allowances[2] == 10
+    journal = exchange(journal, page(saved_plan, 1), 1, at)
+    with pytest.raises(
+        HttpContractError, match="saved_bytes_exceed_reserved_allowance"
+    ):
+        finish_page(journal, at, digest=DIGEST, saved=11)
+    assert finish_page(journal, at, digest=DIGEST, saved=10)
+
+
+def test_unknown_outcomes_keep_reserving_a_full_page():
+    fixed = byte_plan()
+    journal = journal_for(fixed)
+    at = NOW
+    for number in (1, 2):
+        event = reserve(journal, page(fixed), number, at)
+        assert event.allowed_transfer_bytes == 500
+        journal = journal.append(event).append(
+            JournalEvent("outcome_unknown", at, attempt_id=event.attempt_id)
+        )
+        at += seconds(13)
+    assert journal.next_reservation_allowances[0] == 0
+    state = budget_snapshot(journal, BodyInventory(()), now=at)
+    assert state.remaining_transfer_bytes == 0
+    assert "transfer_budget_exhausted" in state.blocking_reasons
 
 
 def test_page_size_overrun_is_recordable_but_blocks_another_attempt():
     fixed = plan(limits=limits(max_page_transfer_bytes=10))
-    request = page(fixed)
-    first = reserve(fixed, request, 1)
-    journal = EvidenceJournal(fixed).append(first)
-    journal = journal.append(
-        JournalEvent("attempt_sent", NOW, attempt_id=first.attempt_id)
-    )
-    journal = journal.append(
-        JournalEvent(
-            "response_received",
-            NOW,
-            attempt_id=first.attempt_id,
-            status=429,
-            transfer_bytes=11,
-            decoded_bytes=20,
-        )
-    )
+    journal = exchange(journal_for(fixed), page(fixed), 1, NOW, status=429, transfer=11)
     assert budget_snapshot(journal, BodyInventory(()), now=NOW).received_responses == 1
     with pytest.raises(HttpContractError, match="previous_page_budget_overrun"):
-        journal.append(reserve(fixed, request, 2, NOW + timedelta(seconds=13)))
+        journal.append(reserve(journal, page(fixed), 2, NOW + seconds(120)))
+    with pytest.raises(HttpContractError, match="run_completed_with_missing_page"):
+        journal.append(JournalEvent("run_completed", NOW + seconds(120)))
+
+
+# ------------------------------------------ Medium 5: inventory and receipt set
+
+
+def completed_evidence():
+    fixed = plan()
+    journal, inventory, at = complete_pages(fixed)
+    return fixed, journal, inventory, at
+
+
+def test_normal_completed_body_set_aligns_with_the_receipt():
+    fixed, journal, inventory, at = completed_evidence()
+    claim = receipt(journal, inventory)
+    alignment = check_receipt_alignment(journal, inventory, claim)
+    assert alignment.content_matches and not alignment.independent_custody_verified
+    with pytest.raises(TypeError):
+        ReceiptAlignment(True, independent_custody_verified=True)
+    assert budget_snapshot(journal, inventory, now=at).completed_pages == 4
 
 
 @pytest.mark.parametrize(
-    "limit_override",
-    [
-        {"max_transfer_bytes": 35, "max_page_transfer_bytes": 10},
-        {"max_decoded_bytes": 75, "max_page_decoded_bytes": 20},
-        {"max_saved_bytes": 75, "max_page_saved_bytes": 20},
-    ],
+    "change",
+    ["add_partial", "add_orphan", "committed_to_orphan", "remove", "resize", "rehash"],
 )
-def test_cumulative_byte_overrun_cannot_be_recorded_as_completed(limit_override):
-    fixed = plan(limits=limits(**limit_override))
-    journal = EvidenceJournal(fixed)
-    files = []
-    for index, query in enumerate(fixed.queries):
-        request = PageRequest(query, 0)
-        at = NOW + timedelta(seconds=13 * index)
-        attempt = reserve(fixed, request, 1, at)
-        digest = f"{index + 1:064x}"
-        journal = journal.append(attempt)
-        journal = journal.append(
-            JournalEvent("attempt_sent", at, attempt_id=attempt.attempt_id)
-        )
-        journal = journal.append(
-            JournalEvent(
-                "response_received",
-                at,
-                attempt_id=attempt.attempt_id,
-                status=200,
-                transfer_bytes=10,
-                decoded_bytes=20,
-            )
-        )
-        journal = journal.append(
-            JournalEvent(
-                "body_saved",
-                at,
-                attempt_id=attempt.attempt_id,
-                body_sha256=digest,
-                saved_bytes=20,
-            )
-        )
-        journal = journal.append(
-            JournalEvent("page_completed", at, attempt_id=attempt.attempt_id)
-        )
-        files.append(BodyFileEvidence(f"body-{index}", 20, "committed", digest))
-    assert not budget_snapshot(
-        journal, BodyInventory(tuple(files)), now=NOW + timedelta(seconds=50)
-    ).can_reserve_next_attempt
-    with pytest.raises(HttpContractError, match="run_completed_after_budget_overrun"):
-        journal.append(JournalEvent("run_completed", NOW + timedelta(seconds=60)))
+def test_inventory_changes_are_detected_against_receipt_and_journal(change):
+    fixed, journal, inventory, _ = completed_evidence()
+    claim = receipt(journal, inventory)
+    files = list(inventory.files)
+    if change == "add_partial":
+        files.append(BodyFileEvidence("tmp-1", 7, "partial", "c" * 64))
+    elif change == "add_orphan":
+        files.append(BodyFileEvidence("stray-1", 7, "orphan", "c" * 64))
+    elif change == "committed_to_orphan":
+        files[0] = replace(files[0], state="orphan")
+    elif change == "remove":
+        files.pop()
+    elif change == "resize":
+        files[0] = replace(files[0], size=21)
+    else:
+        files[0] = replace(files[0], body_sha256="c" * 64)
+    changed = BodyInventory(tuple(files))
+    assert changed.body_set_sha256 != inventory.body_set_sha256
+    with pytest.raises(HttpContractError):
+        check_receipt_alignment(journal, changed, claim)
 
 
-def test_page_continuation_requires_exact_key_and_rejects_loop():
+def test_body_state_rules_against_the_journal():
+    fixed, journal, inventory, _ = completed_evidence()
+    first = inventory.files[0]
+    with pytest.raises(HttpContractError, match="completed_page_body_not_committed"):
+        budget_snapshot(
+            journal,
+            BodyInventory((replace(first, state="orphan"), *inventory.files[1:])),
+            now=NOW + seconds(60),
+        )
+    with pytest.raises(HttpContractError, match="recorded_body_declared_partial"):
+        budget_snapshot(
+            journal,
+            BodyInventory((replace(first, state="partial"), *inventory.files[1:])),
+            now=NOW + seconds(60),
+        )
+    with pytest.raises(HttpContractError, match="duplicate_stored_body"):
+        BodyInventory((first, replace(first, object_id="copy", state="orphan")))
+    with pytest.raises(HttpContractError, match="unrecorded_committed_body"):
+        budget_snapshot(
+            journal,
+            BodyInventory(
+                (*inventory.files, BodyFileEvidence("x", 5, "committed", DIGEST))
+            ),
+            now=NOW + seconds(60),
+        )
+
+
+def test_saved_body_without_page_completion_cannot_be_declared_committed():
     fixed = plan()
-    request = page(fixed)
-    journal = response(EvidenceJournal(fixed), request)
-    attempt_id = journal.events[0].attempt_id
+    journal = exchange(journal_for(fixed), page(fixed), 1, NOW)
     journal = journal.append(
         JournalEvent(
             "body_saved",
-            NOW + timedelta(seconds=2),
-            attempt_id=attempt_id,
+            NOW,
+            attempt_id=last_attempt_id(journal),
             body_sha256=BODY_DIGEST,
             saved_bytes=20,
         )
     )
-    journal = journal.append(
-        JournalEvent(
-            "page_completed",
-            NOW + timedelta(seconds=2),
-            attempt_id=attempt_id,
-            next_key="page-two",
+    committed = BodyInventory((BodyFileEvidence("b", 20, "committed", BODY_DIGEST),))
+    with pytest.raises(
+        HttpContractError, match="committed_body_without_completed_page"
+    ):
+        check_receipt_alignment(journal, committed, receipt(journal, committed))
+    orphan = BodyInventory((BodyFileEvidence("b", 20, "orphan", BODY_DIGEST),))
+    state = budget_snapshot(journal, orphan, now=NOW + seconds(1))
+    assert {"unsettled_attempt", "orphan_or_partial_body_present"} <= set(
+        state.blocking_reasons
+    )
+
+
+def test_body_inventory_counts_orphan_and_partial_without_reset():
+    fixed = plan(limits=limits(max_saved_bytes=25, max_page_saved_bytes=25))
+    inventory = BodyInventory(
+        (
+            BodyFileEvidence("orphan-1", 20, "orphan", BODY_DIGEST),
+            BodyFileEvidence("partial-1", 5, "partial", DIGEST),
         )
     )
+    state = budget_snapshot(journal_for(fixed), inventory, now=NOW)
+    assert state.orphan_files == state.partial_files == 1
+    assert state.remaining_saved_bytes == 0
+    assert not state.can_reserve_next_attempt
+    under_budget = budget_snapshot(
+        journal_for(plan()),
+        BodyInventory((BodyFileEvidence("orphan-only", 1, "orphan", BODY_DIGEST),)),
+        now=NOW,
+    )
+    assert under_budget.remaining_saved_bytes > 0
+    assert "orphan_or_partial_body_present" in under_budget.blocking_reasons
+
+
+def test_completed_page_body_and_receipt_tamper_rejection():
+    fixed, journal, inventory, _ = completed_evidence()
+    claim = receipt(journal, inventory)
+    with pytest.raises(HttpContractError, match="receipt_ledger_head_sha256_mismatch"):
+        check_receipt_alignment(
+            journal, inventory, replace(claim, ledger_head_sha256=DIGEST)
+        )
+    with pytest.raises(HttpContractError, match="receipt_body_set_sha256_mismatch"):
+        check_receipt_alignment(
+            journal, inventory, replace(claim, body_set_sha256=DIGEST)
+        )
+    with pytest.raises(HttpContractError, match="receipt_plan_sha256_mismatch"):
+        check_receipt_alignment(journal, inventory, replace(claim, plan_sha256=DIGEST))
+
+
+# ------------------------------------------------ journal integrity and bookkeeping
+
+
+def test_journal_detects_line_deletion_and_noncanonical_or_modified_record():
+    fixed = plan()
+    claim = approval(fixed)
+    journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=429)
+    with pytest.raises(HttpContractError, match="journal_incomplete_final_line"):
+        EvidenceJournal(fixed, journal.data[:-1], approval=claim)
+    lines = journal.data.splitlines(keepends=True)
+    with pytest.raises(HttpContractError, match="journal_chain_or_plan_mismatch"):
+        EvidenceJournal(fixed, b"".join(lines[1:]), approval=claim)
+    record = json.loads(lines[0])
+    record["event"]["attempt_number"] = 2
+    with pytest.raises(
+        HttpContractError, match="journal_record_noncanonical|journal_chain"
+    ):
+        EvidenceJournal(
+            fixed,
+            (json.dumps(record) + "\n").encode() + b"".join(lines[1:]),
+            approval=claim,
+        )
+    # A cleanly removed *tail* cannot be detected without an independently fixed receipt.
+    truncated = EvidenceJournal(fixed, b"".join(lines[:-1]), approval=claim)
+    assert truncated.event_count == journal.event_count - 1
+    with pytest.raises(HttpContractError, match="receipt_ledger_event_count_mismatch"):
+        check_receipt_alignment(
+            truncated, BodyInventory(()), receipt(journal, BodyInventory(()))
+        )
+
+
+def test_journal_rejects_nonfinite_json_as_contract_error():
+    fixed = plan()
+    journal = journal_for(fixed).append(reserve(journal_for(fixed), page(fixed), 1))
+    record = json.loads(journal.data)
+    record["event"]["status"] = float("nan")
+    malformed = (json.dumps(record) + "\n").encode("utf-8")
+    with pytest.raises(HttpContractError, match="journal_record_noncanonical"):
+        EvidenceJournal(fixed, malformed, approval=approval(fixed))
+
+
+def test_complete_journal_is_idempotent_and_rejects_a_second_attempt():
+    fixed = plan()
+    claim = approval(fixed)
+    journal, inventory, at = complete_pages(fixed, claim)
+    journal = journal.append(JournalEvent("run_completed", at))
+    resumed = EvidenceJournal(fixed, journal.data, approval=claim)
+    state = budget_snapshot(resumed, inventory, now=at + seconds(1))
+    assert resumed.completed
+    assert state.status == "completed"
+    assert state.blocking_reasons == ("run_completed",)
+    assert state.completed_pages == len(fixed.queries)
+    assert not state.can_reserve_next_attempt
+    with pytest.raises(HttpContractError, match="journal_event_after_terminal_state"):
+        resumed.append(reserve(resumed, page(fixed), 2, at + seconds(62)))
+
+
+def test_completion_may_be_recorded_after_the_deadline_but_attempts_may_not():
+    fixed = plan(limits=limits(max_elapsed_seconds=60))
+    journal, inventory, at = complete_pages(fixed)  # last reservation at +39s
+    finished = journal.append(JournalEvent("run_completed", NOW + seconds(100)))
+    assert finished.completed
+    incomplete = journal_for(fixed)
+    incomplete = exchange(incomplete, page(fixed), 1, NOW, status=503)
+    with pytest.raises(HttpContractError, match="attempt_after_cumulative_deadline"):
+        incomplete.append(reserve(incomplete, page(fixed), 2, NOW + seconds(60)))
+
+
+def test_page_continuation_requires_exact_key_and_rejects_loop_or_repeated_body():
+    fixed = plan()
+    request = page(fixed)
+    journal = exchange(journal_for(fixed), request, 1, NOW)
+    journal = finish_page(journal, NOW, digest=BODY_DIGEST, next_key="page-two")
     with pytest.raises(HttpContractError, match="pagination_chain_invalid"):
         journal.append(
             reserve(
-                fixed,
+                journal,
                 PageRequest(request.query, 1, "wrong-key"),
                 1,
-                NOW + timedelta(seconds=13),
+                NOW + seconds(13),
             )
         )
     second = PageRequest(request.query, 1, "page-two")
-    journal = journal.append(reserve(fixed, second, 1, NOW + timedelta(seconds=13)))
-    second_id = journal.events[-1].attempt_id
-    journal = journal.append(
-        JournalEvent("attempt_sent", NOW + timedelta(seconds=13), attempt_id=second_id)
-    )
-    journal = journal.append(
-        JournalEvent(
-            "response_received",
-            NOW + timedelta(seconds=13),
-            attempt_id=second_id,
-            status=200,
-            transfer_bytes=10,
-            decoded_bytes=20,
-        )
-    )
-    journal = journal.append(
-        JournalEvent(
-            "body_saved",
-            NOW + timedelta(seconds=13),
-            attempt_id=second_id,
-            body_sha256=DIGEST,
-            saved_bytes=20,
-        )
-    )
+    journal = exchange(journal, second, 1, NOW + seconds(13))
+    with pytest.raises(HttpContractError, match="repeated_page_body"):
+        finish_page(journal, NOW + seconds(13), digest=BODY_DIGEST)
     with pytest.raises(HttpContractError, match="pagination_key_loop"):
-        journal.append(
-            JournalEvent(
-                "page_completed",
-                NOW + timedelta(seconds=13),
-                attempt_id=second_id,
-                next_key="page-two",
-            )
+        finish_page(journal, NOW + seconds(13), digest=DIGEST, next_key="page-two")
+
+
+def test_identical_bodies_of_different_queries_are_stored_once():
+    fixed = plan()
+    journal = exchange(journal_for(fixed), page(fixed), 1, NOW)
+    journal = finish_page(journal, NOW, digest=BODY_DIGEST)
+    journal = exchange(journal, page(fixed, 1), 1, NOW + seconds(13))
+    journal = finish_page(journal, NOW + seconds(13), digest=BODY_DIGEST)
+    inventory = BodyInventory((BodyFileEvidence("b", 20, "committed", BODY_DIGEST),))
+    state = budget_snapshot(journal, inventory, now=NOW + seconds(26))
+    assert state.completed_pages == 2 and state.remaining_saved_bytes == 880
+
+
+def test_incremental_append_equals_full_reopen():
+    fixed = plan()
+    claim = approval(fixed)
+    journal = exchange(journal_for(fixed, claim), page(fixed), 1, NOW, status=429)
+    second = reserve(journal, page(fixed), 2, NOW + seconds(120))
+    journal = journal.append(second).append(
+        JournalEvent(
+            "outcome_unknown", NOW + seconds(121), attempt_id=second.attempt_id
         )
+    )
+    journal = exchange(journal, page(fixed), 3, NOW + seconds(134))
+    journal = finish_page(journal, NOW + seconds(134), digest=BODY_DIGEST)
+    reopened = EvidenceJournal(fixed, journal.data, approval=claim)
+    inventory = inventory_of(journal)
+    later = NOW + seconds(200)
+    assert reopened.data == journal.data
+    assert reopened.head_hash == journal.head_hash
+    assert reopened.byte_count == journal.byte_count == len(journal.data)
+    assert reopened.events == journal.events
+    assert budget_snapshot(reopened, inventory, now=later) == budget_snapshot(
+        journal, inventory, now=later
+    )
+
+
+# --------------------------------------------- Medium 3: calendar anchor evidence
+
+CAL_START, CAL_END = "2025-02-24", "2025-03-04"  # Monday .. Tuesday
+
+
+def calendar_body(*, drop=None, holiday=None) -> bytes:
+    rows, day = [], date(2025, 2, 24)
+    while day <= date(2025, 3, 4):
+        text = day.isoformat()
+        if text != drop:
+            session = day.weekday() < 5 and text != holiday
+            rows.append({"Date": text, "HolDiv": "1" if session else "0"})
+        day += timedelta(days=1)
+    return json.dumps({"data": rows}).encode()
+
+
+def discovery_evidence(
+    body=None, *, complete=True, artifact="artificial-calendar", bodies=None
+) -> CalendarDiscoveryEvidence:
+    fixed = plan(
+        **CALENDAR_ONLY,
+        artifact_id=artifact,
+        calendar_start=CAL_START,
+        calendar_end=CAL_END,
+        calendar_source_sha256=None,
+        calendar_source_reference=None,
+        output_dir=str(HTTP_OUTPUT_ROOT / artifact),
+        limits=limits(
+            max_transfer_bytes=5000,
+            max_page_transfer_bytes=2000,
+            max_decoded_bytes=5000,
+            max_page_decoded_bytes=2000,
+            max_saved_bytes=5000,
+            max_page_saved_bytes=2000,
+        ),
+    )
+    claim = approval(fixed)
+    body = body or calendar_body()
+    digest = hashlib.sha256(body).hexdigest()
+    journal = exchange(
+        journal_for(fixed, claim),
+        page(fixed),
+        1,
+        NOW,
+        transfer=len(body),
+        decoded=len(body),
+    )
+    journal = finish_page(journal, NOW, digest=digest, saved=len(body))
+    if complete:
+        journal = journal.append(JournalEvent("run_completed", NOW))
+    inventory = BodyInventory(
+        (BodyFileEvidence("calendar-0", len(body), "committed", digest),)
+    )
+    return CalendarDiscoveryEvidence(
+        fixed,
+        claim,
+        journal.data,
+        inventory,
+        receipt(journal, inventory),
+        bodies if bodies is not None else (body,),
+    )
+
+
+def anchored_plan(evidence, **changes) -> HttpAcquisitionPlan:
+    values = dict(
+        artifact_id="artificial-daily",
+        kind="calendar_anchored_daily",
+        calendar_start="2025-03-03",
+        calendar_end="2025-03-04",
+        daily_dates=("2025-03-03", "2025-03-04"),
+        calendar_source_sha256=derive_calendar_anchor(evidence).anchor_sha256,
+        calendar_source_reference=calendar_anchor_reference("artificial-calendar"),
+        output_dir=str(HTTP_OUTPUT_ROOT / "artificial-daily"),
+    )
+    values.update(changes)
+    return plan(**values)
+
+
+def test_anchor_is_derived_from_a_completed_discovery_and_verified():
+    evidence = discovery_evidence()
+    anchor = derive_calendar_anchor(evidence)
+    assert anchor.sessions == (
+        "2025-02-24", "2025-02-25", "2025-02-26", "2025-02-27", "2025-02-28",
+        "2025-03-03", "2025-03-04",
+    )  # fmt: skip
+    daily = anchored_plan(evidence)
+    assert verify_calendar_anchor(daily, evidence) == anchor
+    assert not anchor.independent_custody_verified
+    with pytest.raises(TypeError):
+        CalendarAnchor("a", DIGEST, CAL_START, CAL_END, (), DIGEST, True)
+    claim = approval(daily)
+    journal = journal_for(daily, claim)
+    inventory = BodyInventory(())
+    verified = assess_live_acquisition_gate(
+        daily, claim, journal, inventory, receipt(journal, inventory), now=NOW,
+        calendar_evidence=evidence,
+    )  # fmt: skip
+    declared = assess_live_acquisition_gate(
+        daily, claim, journal, inventory, receipt(journal, inventory), now=NOW
+    )
+    assert not any(r.startswith("calendar_anchor") for r in verified.reasons)
+    assert "calendar_anchor_declared_unverified" in declared.reasons
+    assert not verified.permitted and not declared.permitted
+
+
+@pytest.mark.parametrize(
+    "build,reason",
+    [
+        (lambda ev: anchored_plan(ev, calendar_source_sha256=DIGEST),
+         "calendar_anchor_hash_mismatch"),
+        (lambda ev: anchored_plan(ev, calendar_source_reference="anything"),
+         "calendar_anchor_reference_mismatch"),
+        (lambda ev: anchored_plan(ev, calendar_start="2025-03-01",
+                                  daily_dates=("2025-03-01", "2025-03-04")),
+         "daily_dates_include_non_sessions"),
+        (lambda ev: anchored_plan(ev, reference_date="2025-03-02", master_date="2025-03-02",
+                                  calendar_start="2025-03-01", calendar_end="2025-03-02",
+                                  daily_dates=("2025-03-02",)),
+         "reference_date_not_a_session"),
+        (lambda ev: anchored_plan(ev, calendar_start="2025-02-20"),
+         "anchored_window_outside_calendar_evidence"),
+        (lambda ev: anchored_plan(ev, artifact_id="artificial-calendar",
+                                  output_dir=str(HTTP_OUTPUT_ROOT / "artificial-calendar")),
+         "anchored_plan_reuses_discovery_artifact"),
+    ],
+)  # fmt: skip
+def test_anchored_plan_mismatches_are_rejected(build, reason):
+    evidence = discovery_evidence()
+    with pytest.raises(HttpContractError, match=reason):
+        verify_calendar_anchor(build(evidence), evidence)
+
+
+def test_anchor_from_another_or_altered_calendar_is_rejected():
+    daily = anchored_plan(discovery_evidence())
+    with pytest.raises(HttpContractError, match="calendar_anchor_hash_mismatch"):
+        verify_calendar_anchor(
+            daily, discovery_evidence(calendar_body(holiday="2025-03-03"))
+        )
+    with pytest.raises(HttpContractError, match="calendar_anchor_reference_mismatch"):
+        verify_calendar_anchor(
+            daily, discovery_evidence(artifact="artificial-calendar-b")
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence,reason",
+    [
+        (lambda: discovery_evidence(complete=False), "calendar_evidence_run_incomplete"),
+        (lambda: discovery_evidence(bodies=(calendar_body(holiday="2025-03-03"),)),
+         "calendar_body_set_mismatch"),
+        (lambda: discovery_evidence(bodies=()), "calendar_body_set_mismatch"),
+        (lambda: discovery_evidence(calendar_body(drop="2025-03-01")),
+         "calendar_rows_incomplete"),
+        (lambda: replace(discovery_evidence(), plan=plan()),
+         "calendar_evidence_plan_not_discovery"),
+    ],
+)  # fmt: skip
+def test_incomplete_tampered_or_foreign_calendar_evidence_is_rejected(evidence, reason):
+    with pytest.raises(HttpContractError, match=reason):
+        derive_calendar_anchor(evidence())
+
+
+def test_predeclared_source_stays_declared_and_unverified():
+    fixed = plan()
+    claim = approval(fixed)
+    journal = journal_for(fixed, claim)
+    gate = assess_live_acquisition_gate(
+        fixed, claim, journal, BodyInventory(()), None, now=NOW
+    )
+    assert "calendar_source_declared_unverified" in gate.reasons
+
+
+# ------------------------------------------ gate result objects and entry point
+
+
+def test_gate_reports_inconsistent_evidence_as_reasons_not_exceptions():
+    fixed, journal, inventory, at = completed_evidence()
+    claim = journal.approval
+    gate = assess_live_acquisition_gate(
+        fixed, claim, journal, BodyInventory(()), receipt(journal, inventory), now=at
+    )
+    assert "budget_state_invalid:saved_body_missing_or_size_mismatch" in gate.reasons
+    assert (
+        "external_receipt_content_invalid:saved_body_missing_or_size_mismatch"
+        in gate.reasons
+    )
+    other = approval(fixed, approval_event_id="substituted-event")
+    swapped = assess_live_acquisition_gate(
+        fixed, other, journal, inventory, None, now=at
+    )
+    assert "journal_invalid:attempt_approval_mismatch" in swapped.reasons
+    assert gate.reasons[-3:] == swapped.reasons[-3:] == CLOSED_TAIL
+
+
+def test_result_objects_cannot_be_constructed_as_permission():
+    with pytest.raises(TypeError):
+        LiveAcquisitionGate(reasons=(), permitted=True)
+    assert LiveAcquisitionGate(reasons=()).permitted is False
+
+
+def test_entry_point_takes_raw_evidence_and_always_closes():
+    fixed = plan()
+    claim = approval(fixed)
+    journal = journal_for(fixed, claim)
+    inventory = BodyInventory(())
+    fake_permission = LiveAcquisitionGate(reasons=())
+    for bad in (
+        dict(approval=fake_permission),
+        dict(approval=check_approval_scope(fixed, claim, now=NOW)),
+        dict(receipt=ReceiptAlignment(True)),
+    ):
+        arguments = dict(approval=claim, receipt=receipt(journal, inventory)) | bad
+        with pytest.raises(HttpContractError, match="raw_evidence_required"):
+            require_live_acquisition_permission(
+                fixed,
+                arguments["approval"],
+                journal,
+                inventory,
+                arguments["receipt"],
+                now=NOW,
+            )
+    with pytest.raises(LiveAcquisitionClosed) as closed:
+        require_live_acquisition_permission(
+            fixed, claim, journal, inventory, receipt(journal, inventory), now=NOW
+        )
+    assert closed.value.reasons[-3:] == CLOSED_TAIL
 
 
 def test_offline_entry_still_rejects_nonfixture_before_creating_store(tmp_path):
