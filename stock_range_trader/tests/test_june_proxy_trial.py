@@ -4,6 +4,7 @@ import copy
 import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 
 import pytest
 from delayed_replay_e2e_helpers import network_guard as network_guard
@@ -14,22 +15,39 @@ from delayed_replay.input_artifacts import InputArtifactStore
 from delayed_replay.selected_trial.acquisition import AcquisitionStopped, Receipt
 from delayed_replay.selected_trial.service import SelectedService, generated_rows
 from delayed_replay.selected_trial.workflow import write_once
-from delayed_replay.serialization import JsonObject
+from delayed_replay.serialization import JsonObject, parse_time
 from examples.june_proxy_trial import main
 from examples.validate_limited_proxy import compare
 
 pytestmark = pytest.mark.usefixtures("network_guard")
 
 
+def prepare_with_clock(root, may, clock, monkeypatch):
+    """Run june.prepare with one artificial clock for every recorded timestamp.
+
+    prepare() takes a single ``now`` value for the lot review but opens the
+    acquisition receipt with Receipt's default clock (the real UTC clock), so
+    its first event would carry the real time and a later resume under the
+    artificial clock would correctly fail with acquisition_clock_regressed.
+    The fixture passes its clock through Receipt's existing ``now`` parameter
+    for this one call. Production code (and the trial implementation hash)
+    is unchanged, and the regression check itself is not relaxed.
+    """
+
+    with monkeypatch.context() as patch:
+        patch.setattr(june, "Receipt", partial(Receipt, now=clock.now))
+        return june.prepare(
+            root, may, "artificial-review-only-not-owner-approval", now=clock.now()
+        )
+
+
 @pytest.fixture
-def prepared(tmp_path):
+def prepared(tmp_path, monkeypatch):
     may, root = tmp_path / "may", tmp_path / "june"
     _, parent, auth, clock, *_ = artifacts(may)
     write_once(may / "trial_plan.json", parent.payload.to_dict())
     clock.value = datetime(2026, 9, 25, tzinfo=UTC)
-    plan = june.prepare(
-        root, may, "artificial-review-only-not-owner-approval", now=clock.now()
-    )
+    plan = prepare_with_clock(root, may, clock, monkeypatch)
     _, bundle, cal = june.load_context(root, may)
     return root, may, plan, parent, auth, clock, bundle, cal
 
@@ -434,3 +452,62 @@ def test_may_artificial_financial_golden_unchanged(prepared, tmp_path):
             "filled",
         ),
     ]
+
+
+# ---------------------------------------------- deterministic artificial clock
+
+
+def first_receipt_event(root, plan, clock_now):
+    receipt = Receipt(root / "acquisition.sqlite", plan, now=clock_now)
+    try:
+        return receipt.events()[0], receipt.remaining()
+    finally:
+        receipt.close()
+
+
+def test_prepared_receipt_records_only_the_artificial_clock(prepared):
+    root, _, plan, _, _, clock, *_ = prepared
+    event, remaining = first_receipt_event(root, plan, clock.now)
+    assert event["kind"] == "plan"
+    assert parse_time(event["at"]) == datetime(2026, 9, 25, tzinfo=UTC)
+    assert remaining == 1200.0  # budget not started, no regression
+
+
+@pytest.mark.parametrize(
+    "artificial",
+    [datetime(2026, 9, 25, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC)],
+    ids=["before_today", "after_today"],
+)
+def test_one_artificial_clock_is_consistent_on_any_real_date(
+    tmp_path, monkeypatch, artificial
+):
+    may, root = tmp_path / "may", tmp_path / "june"
+    _, parent, _, clock, *_ = artifacts(may)
+    write_once(may / "trial_plan.json", parent.payload.to_dict())
+    clock.value = artificial
+    plan = prepare_with_clock(root, may, clock, monkeypatch)
+    event, remaining = first_receipt_event(root, plan, clock.now)
+    assert parse_time(event["at"]) == artificial
+    assert remaining == 1200.0
+
+
+def test_a_real_backwards_step_is_still_refused(prepared):
+    root, _, plan, _, _, clock, *_ = prepared
+    clock.value = datetime(2026, 9, 25, tzinfo=UTC) - timedelta(microseconds=1)
+    receipt = Receipt(root / "acquisition.sqlite", plan, now=clock.now)
+    try:
+        with pytest.raises(AcquisitionStopped, match="acquisition_clock_regressed"):
+            receipt.remaining()
+    finally:
+        receipt.close()
+
+
+def test_production_prepare_still_records_the_real_utc_clock(tmp_path):
+    may, root = tmp_path / "may", tmp_path / "june"
+    _, parent, *_ = artifacts(may)
+    write_once(may / "trial_plan.json", parent.payload.to_dict())
+    before = datetime.now(UTC)
+    plan = june.prepare(root, may, "artificial-review-only-not-owner-approval")
+    after = datetime.now(UTC)
+    event, _ = first_receipt_event(root, plan, lambda: after)
+    assert before <= parse_time(event["at"]) <= after
