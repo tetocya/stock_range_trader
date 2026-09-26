@@ -5,8 +5,8 @@ import hashlib
 import json
 import os
 import sqlite3
-import subprocess
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -15,13 +15,13 @@ from delayed_replay.audit_models import StreamIdentity
 from delayed_replay.event_store import EventStore
 from delayed_replay.serialization import JsonObject, digest
 from research_tools.account_html import (
-    SCRIPT,
     AccountHtmlWriter,
     _json_script,
     chart_segments,
 )
 from research_tools.account_view import AccountReadModel, AccountViewBuilder, main
 from research_tools.reader import EvidenceFiles, ObservationError, read_account
+from tests.browser_session import browser_session
 from tests.test_order_audit import fingerprint, make_trial, no_execution  # noqa: F401
 
 
@@ -294,69 +294,123 @@ def test_script_end_and_long_reason_safe(tmp_path):
 @pytest.mark.parametrize(
     "kind", ["rejected", "empty", "filled", "holding", "waiting", "missing"]
 )
-def test_local_browser_interactions(tmp_path, monkeypatch, kind):
+def test_local_browser_interactions(tmp_path, request, kind):
     browser = os.environ.get("ACCOUNT_VIEW_TEST_BROWSER")
-    if not browser or not Path(browser).is_file():
+    if not browser:
         pytest.skip("Explicit local headless browser not configured")
-    import research_tools.account_html as ui
-
+    assert Path(browser).is_file(), "Configured browser must exist; not a skip"
+    assert os.name == "posix", "Browser pipe harness requires POSIX"
     source = make_view_trial(tmp_path / "input", kind)
-    checks = r"""
-function check(value) { if(!value) throw new Error('UI assertion failed'); }
-try {
- const before=JSON.stringify(data);
- check(document.querySelectorAll('#orders tbody tr').length===data.orders.length);
- check(document.querySelectorAll('#positions tbody tr').length===data.positions.length);
- check(document.querySelectorAll('#history tbody tr').length===data.history.length);
- const values=['10','2','1','9007199254740993.02','9007199254740993.01','-2','0'];
- check(JSON.stringify(values.slice().sort(compareDecimal))===JSON.stringify(
- ['-2','0','1','2','10','9007199254740993.01','9007199254740993.02']));
- const f=document.getElementById('date-filter');f.value='1900-01-01';
- f.dispatchEvent(new Event('input'));check(document.querySelectorAll('tbody tr').length===0);
- f.value=''; f.dispatchEvent(new Event('input'));
- if(data.orders.length) {
-  const st=document.getElementById('status-filter');st.value=data.orders[0].saved_status;
-  st.dispatchEvent(new Event('change'));check(document.querySelectorAll('#orders tbody tr').length===1);
-  st.value='';st.dispatchEvent(new Event('change'));
-  const sym=document.getElementById('symbol-filter');sym.value=data.orders[0].symbol;
-  sym.dispatchEvent(new Event('change'));check(document.querySelectorAll('#orders tbody tr').length===1);
-  const detail=document.querySelector('details');detail.open=true;check(detail.open);
- }
- document.querySelector('#history button[data-sort="equity"]').click();
- const amounts=[...document.querySelectorAll('#history td[data-field="equity"]')].map(x=>x.textContent);
- check(amounts.length===data.history.length);
- if(data.history.some(r=>r.equity===null)) check(amounts.at(-1)==='未評価／不明');
- check(JSON.stringify(data)===before);check(Object.isFrozen(data.orders));
- check(performance.getEntriesByType('resource').length===0);
- document.body.setAttribute('data-ui-test','passed');
-} catch(e) {document.body.setAttribute('data-ui-test','failed');}
-"""
-    monkeypatch.setattr(ui, "SCRIPT", SCRIPT + checks)
-    report = AccountHtmlWriter().write(read(source), tmp_path / "report")
-    result = subprocess.run(
-        [
-            browser,
-            "--headless",
-            "--disable-gpu",
-            "--disable-background-networking",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-sync",
-            "--disable-extensions",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--no-proxy-server",
-            "--host-resolver-rules=MAP * ~NOTFOUND",
-            "--user-data-dir=" + str(tmp_path / "browser-profile"),
-            "--dump-dom",
-            (report / "account_view.html").as_uri(),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert result.returncode == 0, result.stderr[-1000:]
-    assert 'data-ui-test="passed"' in result.stdout
+    request.getfixturevalue("no_execution")
+    before = fingerprint(source.root)
+    model = read(source)
+    head = model.audit.metadata.to_dict()["read_head"]
+    expected = AccountViewBuilder().build(model).to_dict()
+    report = AccountHtmlWriter().write(model, tmp_path / "report")
+    with browser_session(browser, tmp_path / "browser") as ui:
+        # Separate blank-page loading from the account's unmodified production JS.
+        ui.load("about:blank", "blank_load")
+        assert ui.evaluate("document.body.textContent") == ""
+        ui.load((report / "account_view.html").as_uri(), "account_load")
+        original = ui.evaluate("JSON.stringify(data)")
+        ui.stage("interaction")
+        for table in ("orders", "positions", "history"):
+            assert ui.evaluate(
+                f"document.querySelectorAll('#{table} tbody tr').length"
+            ) == len(expected[table])
+        assert ui.evaluate(
+            "['10','2','1','9007199254740993.02','9007199254740993.01','-2','0'].sort(compareDecimal)"
+        ) == ["-2", "0", "1", "2", "10", "9007199254740993.01", "9007199254740993.02"]
+        # Native mouse/key events exercise handlers; no injected success marker.
+        ui.evaluate(
+            "window.testInputs=[]; ['input','change','click'].forEach(t=>document.addEventListener(t,e=>window.testInputs.push({type:t,trusted:e.isTrusted})))"
+        )
+        ui.click("#date-filter")
+        for _ in range(4):
+            ui.key("ArrowLeft", "ArrowLeft", 37)
+        for _ in range(3):
+            ui.key("ArrowUp", "ArrowUp", 38)
+            ui.key("ArrowRight", "ArrowRight", 39)
+        # Empty native date segments become January 1, outside every May fixture,
+        # regardless of the host year or year/month/day field display order.
+        assert ui.evaluate("document.getElementById('date-filter').value").endswith(
+            "-01-01"
+        )
+        assert ui.evaluate("document.querySelectorAll('tbody tr').length") == 0
+        # Clear all native date segments, not the underlying saved data.
+        for _ in range(3):
+            ui.key("Backspace", "Backspace", 8)
+            ui.key("ArrowLeft", "ArrowLeft", 37)
+        ui.key("Tab", "Tab", 9)
+        assert ui.evaluate("document.getElementById('date-filter').value") == ""
+        if expected["orders"]:
+            for control in ("status", "symbol"):
+                selected = expected["orders"][0][
+                    "saved_status" if control == "status" else "symbol"
+                ]
+                ui.click(f"#{control}-filter")
+                # Native type-ahead works without relying on an OS popup menu.
+                ui.character(selected[0])
+                ui.key("Escape", "Escape", 27)
+                ui.key("Tab", "Tab", 9)
+                assert (
+                    ui.evaluate(f"document.getElementById('{control}-filter').value")
+                    == selected
+                )
+                assert (
+                    ui.evaluate("document.querySelectorAll('#orders tbody tr').length")
+                    == 1
+                )
+            ui.click("#orders summary")
+            assert ui.evaluate("document.querySelector('#orders details').open") is True
+            detail = ui.evaluate(
+                "document.querySelector('#orders details pre').textContent"
+            )
+            oid = expected["orders"][0]["order_id"]
+            assert json.loads(detail) == ui.evaluate(
+                "data.order_audit[" + json.dumps(oid) + "]"
+            )
+            ui.click("#orders summary")
+            assert (
+                ui.evaluate("document.querySelector('#orders details').open") is False
+            )
+        values = [row["equity"] for row in expected["history"]]
+        finite = sorted((value for value in values if value is not None), key=Decimal)
+        for descending in (False, True):
+            ui.click('#history button[data-sort="equity"]')
+            amounts = ui.evaluate(
+                "[...document.querySelectorAll('#history td[data-field=equity]')].map(e=>e.textContent)"
+            )
+            assert amounts == (list(reversed(finite)) if descending else finite) + [
+                "未評価／不明"
+            ] * values.count(None)
+        fields = ui.evaluate(
+            "Object.fromEntries([...document.querySelectorAll('dt')].map(e=>[e.textContent,e.nextElementSibling.textContent]))"
+        )
+        assert fields["Cash"] == expected["account"]["cash"]
+        assert fields["Equity（現在評価）"] == (
+            expected["account"]["equity"] or "未評価／不明"
+        )
+        assert fields["simulated_fill数"] == str(expected["summary"]["filled_count"])
+        assert fields["徴収手数料"] == expected["summary"]["charged_commission"]
+        if kind == "missing":
+            assert fields["保有時価"] == "未評価／不明"
+            assert fields["徴収手数料"] == "0"
+        elif kind in ("rejected", "empty"):
+            assert fields["保有時価"] == "0"
+        if kind in ("missing", "waiting"):
+            assert fields["status"] == "waiting_for_input"
+        assert ui.evaluate("JSON.stringify(data)") == original
+        assert ui.evaluate("Object.isFrozen(data.orders)") is True
+        events = ui.evaluate("window.testInputs")
+        assert events and all(event["trusted"] for event in events)
+        assert {event["type"] for event in events} >= {"click", "input", "change"}
+        assert ui.evaluate("performance.getEntriesByType('resource').length") == 0
+    assert ui.report["passed"] and ui.report["returncode"] == 0
+    assert not ui.report["forced_cleanup"] and not ui.report["remaining_process_group"]
+    assert fingerprint(source.root) == before
+    assert read(source).audit.metadata.to_dict()["read_head"] == head
+    print(json.dumps(dict(case=kind, **ui.report)))
 
 
 def test_cli(saved, tmp_path, capsys):
