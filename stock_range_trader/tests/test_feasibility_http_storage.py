@@ -407,6 +407,137 @@ def test_unknown_after_reclaim_fences_old_holder_and_survives_restart(tmp_path):
     assert retry.generation > token.generation
 
 
+def _exit_with_open_slot(path, artifact, sent):
+    import os
+
+    plan = fixed(artifact)
+    claim = approval(plan)
+    store = AccountLedgerStore(path, ACCOUNT)
+    token = reserve(store, plan, claim)
+    if sent:
+        store.mark_sent(
+            token,
+            plan,
+            claim,
+            at=later(1),
+            inventory=lambda _journal: BodyInventory(()),
+        )
+    os._exit(0)
+
+
+@pytest.mark.parametrize("sent", [False, True])
+def test_public_recovery_inspects_and_reclaims_crashed_process(tmp_path, sent):
+    store, plan, claim = prepared(tmp_path)
+    child = get_context("spawn").Process(
+        target=_exit_with_open_slot,
+        args=(str(store.path), plan.artifact_id, sent),
+    )
+    child.start()
+    child.join(timeout=10)
+    if child.is_alive():
+        child.kill()
+        child.join(timeout=10)
+        pytest.fail("artificial child did not exit")
+    assert child.exitcode == 0
+
+    reopened = AccountLedgerStore(store.path, ACCOUNT)
+    inspected = reopened.inspect_open_slot(plan, claim)
+    assert inspected is not None
+    assert inspected.account_ref == ACCOUNT
+    assert inspected.plan_sha256 == plan.sha256
+    assert inspected.attempt_id == inspected.token.attempt_id
+    assert inspected.holder_id == "holder-a"
+    assert inspected.generation == 1
+    assert inspected.reserved_at == NOW
+    assert inspected.sent_at == (later(1) if sent else None)
+    assert inspected.lease_expires_at == later(60)
+    assert inspected.state == ("sent" if sent else "reserved")
+    before_account = reopened.load().head_hash
+    before_plan = reopened.load_journal(plan, claim).head_hash
+    with pytest.raises(
+        HttpContractError, match="account_slot_reclaim_before_lease_expiry"
+    ):
+        reopened.reclaim_open_slot(
+            inspected, plan, claim, at=later(59), new_holder_id="holder-b"
+        )
+    assert reopened.load().head_hash == before_account
+    assert reopened.load_journal(plan, claim).head_hash == before_plan
+
+    other_connection = AccountLedgerStore(store.path, ACCOUNT)
+    other_connection.reclaim_open_slot(
+        inspected, plan, claim, at=later(60), new_holder_id="holder-b"
+    )
+    assert reopened.inspect_open_slot(plan, claim) is None
+    slot = reopened.load()._state.slots[inspected.attempt_id]
+    assert slot.outcome == "unknown"
+    assert slot.effective_wait == 120
+    assert reopened.load_journal(plan, claim)._state.unknown == 1
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        reopened.mark_sent(
+            inspected.token,
+            plan,
+            claim,
+            at=later(61),
+            inventory=lambda _journal: BodyInventory(()),
+        )
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        reopened.settle_unknown(
+            inspected.token,
+            plan,
+            claim,
+            at=later(61),
+            effective_wait_seconds=120,
+        )
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        reopened.commit_body(
+            inspected.token,
+            plan,
+            claim,
+            at=later(61),
+            object_id=f"{inspected.attempt_id}.json",
+            body_sha256="b" * 64,
+            saved_bytes=1,
+            next_key=None,
+            finalize=lambda: pytest.fail("stale finalizer called"),
+        )
+    with pytest.raises(StorageError, match="reservation_blocked"):
+        reserve(reopened, plan, claim, at=later(179), holder="holder-c")
+    retry = reserve(reopened, plan, claim, at=later(180), holder="holder-c")
+    assert retry.generation > inspected.generation
+
+
+def test_recovery_rejects_stale_inspection_and_wrong_holder(tmp_path):
+    store, plan, claim = prepared(tmp_path)
+    reserve(store, plan, claim)
+    inspected = store.inspect_open_slot(plan, claim)
+    assert inspected is not None
+    with pytest.raises(StorageError, match="open_slot_inspection_mismatch"):
+        store.reclaim_open_slot(
+            replace(inspected, holder_id="forged-holder"),
+            plan,
+            claim,
+            at=later(60),
+            new_holder_id="holder-b",
+        )
+    AccountLedgerStore(store.path, ACCOUNT).mark_sent(
+        inspected.token,
+        plan,
+        claim,
+        at=later(1),
+        inventory=lambda _journal: BodyInventory(()),
+    )
+    with pytest.raises(StorageError, match="account_compare_and_append_stale"):
+        store.reclaim_open_slot(
+            inspected, plan, claim, at=later(60), new_holder_id="holder-b"
+        )
+    current = store.inspect_open_slot(plan, claim)
+    assert current.state == "sent"
+    with pytest.raises(HttpContractError, match="account_reclaim_by_the_holder_itself"):
+        store.reclaim_open_slot(
+            current, plan, claim, at=later(60), new_holder_id="holder-a"
+        )
+
+
 def test_429_with_unrepresentable_hint_quarantines_atomically(tmp_path):
     store, plan, claim = prepared(tmp_path)
     token = reserve(store, plan, claim)

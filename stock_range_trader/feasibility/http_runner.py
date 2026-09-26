@@ -15,9 +15,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .acquisition import REQUIRED_FIELDS, ROW_KEYS, AcquisitionStopped, _validate_row
-from .http_bodies import RawBodyStorageError, RawBodyStore
+from .http_bodies import QuarantineRecord, RawBodyStorageError, RawBodyStore
 from .http_contract import (
     AccountRatePolicy,
+    BodyFileEvidence,
     EvidenceJournal,
     HttpAcquisitionPlan,
     HttpContractError,
@@ -27,7 +28,11 @@ from .http_contract import (
     budget_snapshot,
     check_approval_scope,
 )
-from .http_storage import AccountLedgerStore, StorageError
+from .http_storage import (
+    AccountLedgerStore,
+    OpenSlotInspection,
+    StorageError,
+)
 from .http_transport import (
     HttpTransportError,
     LocalhostHttpTransport,
@@ -51,6 +56,98 @@ class ArtificialAttemptResult:
     completed: bool
     plan_head: str
     account_head: str
+
+
+class LocalhostRecoverySession:
+    """Explicit, network-free maintenance for an interrupted artificial run."""
+
+    def __init__(
+        self,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+        account: AccountLedgerStore,
+        bodies: RawBodyStore,
+        *,
+        clock: Callable[[], datetime],
+    ) -> None:
+        if (
+            type(plan) is not HttpAcquisitionPlan
+            or type(approval) is not OwnerApprovalClaim
+            or type(account) is not AccountLedgerStore
+            or type(bodies) is not RawBodyStore
+            or account.account_ref != plan.account_ref
+            or bodies.plan_sha256 != plan.sha256
+            or bodies.approval_sha256 != approval.sha256
+            or not callable(clock)
+        ):
+            raise LocalhostTrialStopped("recovery_binding_invalid", terminal=True)
+        self.plan = plan
+        self.approval = approval
+        self.account = account
+        self.bodies = bodies
+        self.clock = clock
+
+    @classmethod
+    def open(
+        cls,
+        root: str | Path,
+        account_db: str | Path,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+        *,
+        clock: Callable[[], datetime],
+    ) -> LocalhostRecoverySession:
+        """Open unresolved evidence without silently deciding it is usable."""
+
+        if (
+            type(plan) is not HttpAcquisitionPlan
+            or type(approval) is not OwnerApprovalClaim
+            or not callable(clock)
+        ):
+            raise LocalhostTrialStopped("recovery_binding_invalid", terminal=True)
+        account = AccountLedgerStore(account_db, plan.account_ref)
+        account.load()
+        account.load_journal(plan, approval)
+        bodies = RawBodyStore.open(
+            root, plan_sha256=plan.sha256, approval_sha256=approval.sha256
+        )
+        return cls(plan, approval, account, bodies, clock=clock)
+
+    def _now(self) -> datetime:
+        return LocalhostAcquisitionRunner._read_clock(self.clock)
+
+    def inspect_open_slot(self) -> OpenSlotInspection | None:
+        return self.account.inspect_open_slot(self.plan, self.approval)
+
+    def inspect_uncommitted(self) -> tuple[BodyFileEvidence, ...]:
+        journal = self.account.load_journal(self.plan, self.approval)
+        return self.bodies.uncommitted_files(journal)
+
+    def reclaim_expired_slot(
+        self, inspection: OpenSlotInspection, *, new_holder_id: str
+    ) -> None:
+        self.account.reclaim_open_slot(
+            inspection,
+            self.plan,
+            self.approval,
+            at=self._now(),
+            new_holder_id=new_holder_id,
+        )
+
+    def quarantine_uncommitted(
+        self, object_id: str, *, reason: str
+    ) -> QuarantineRecord:
+        return self.account.quarantine_uncommitted_body(
+            self.plan,
+            self.approval,
+            self.bodies,
+            object_id,
+            reason=reason,
+            at=self._now(),
+        )
+
+    def quarantine_records(self) -> tuple[QuarantineRecord, ...]:
+        return self.bodies.quarantine_records()
 
 
 class LocalhostAcquisitionRunner:

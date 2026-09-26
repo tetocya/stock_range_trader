@@ -455,6 +455,9 @@ J-Quantsのホスト、HTTPS実認証、APIキーには接続しない。localho
 Transportは固定plan内のGETとページ指定を照合し、内部Retry・redirect・接続再利用を行わない。
 connect/read/total timeoutを個別に受け取り、試行中のtotal deadlineと、転送・展開後・保存の許容量を逐次検査する。
 `Content-Length`だけを予算の根拠にせず、実際に読んだentity-body byte、展開後byte、保存byteを分けて記録する。
+有効な `Content-Length` がある場合は、そのbyte数を受信した時点で本文を完了し、keep-aliveのEOFを待たずに
+response／socketを閉じる。短い本文、重複・不正な長さ、chunkedとの併用は拒否する。宣言長を超えて後から
+届くbyteは本文として保存・再利用しない。EOFを待たない以上、遅れて届く余分なbyteの存在までは証明できない。
 entity-bodyの転送量にはHTTPヘッダとchunk framingを含めない。本文のSHA-256は保存した展開後byteに対する値である。
 429の `Retry-After` は観測値として扱い、実効待機とは分離する。Transport単体は台帳の予約・確定や
 Live Gateの許可を行わず、呼出側が最新のplan・台帳・送信枠・予算を再検査する必要がある。
@@ -478,9 +481,24 @@ plan／承認の識別hash、試行ID、送信枠のgeneration、観測HTTP stat
 認証済みJ-Quantsアカウントとの一致を証明しない。台帳hash鎖にも独立した外部固定点はない。
 
 クラッシュ後は永続台帳と実ファイルのinventoryを再読込し、結果不明を成功へ推測変換しない。
-破損したSQLite・台帳、整合しない原本、未解決の片側更新、残存する孤児本文は自動補修の対象外で、
+`LocalhostRecoverySession.open()` は未解決の証拠も閲覧できる送信機能なしの保守入口である。
+`inspect_open_slot()` は現在のslot・保持者・generation・予約／送信／lease時刻と照合済みtokenを返す。
+lease満了後、operatorがその証拠を指定して `reclaim_expired_slot()` を呼ぶと、両台帳へ結果不明を原子的に記録し、
+generationを進めて旧tokenを拒否する。待機はunknownの保守的規則を維持する。
+`inspect_uncommitted()` はpartial／orphanのobject ID・size・hash・stateを列挙する。
+`quarantine_uncommitted(object_id, reason=...)` はpartial／orphanだけをactive body rootから隔離し、root相対の
+元path・移動先・object ID・size・SHA-256・元state・理由・時刻・journal headを正規化したreceiptへ保存する。
+`quarantine_records()` と次回openは、receiptと実ファイルを再照合する。隔離本文をcommittedへ昇格させる入口はない。
+保守後も通常の `LocalhostAcquisitionRunner.open()` と明示的な `run_one()` による再開が必要で、保守APIはHTTPを送らない。
+人工試験の復旧手順は、保存済みrootとDBから `LocalhostRecoverySession.open(root, db, plan, approval, clock=...)`
+を開き、slotと未確定ファイルを点検し、lease満了と原因確認後にslotをreclaimし、必要なファイルだけを理由付きで
+隔離し、receiptを再読込する順序とする。通常Runnerを改めてopenし、待機・予算等の契約判定が通る場合に限り、
+operatorが別途 `run_one()` を呼ぶ。保守処理だけで再送は発生しない。
+破損したSQLite・台帳、整合しない原本、未解決の片側更新は自動補修の対象外で、
 安全に判定できないときは停止して証拠を調査する。fencingは古い実行の成果物commitを拒否するが、
 古いsocketの送信そのものや、他のアプリ／端末の要求を停止できない。
+隔離の途中で再び停止し、未receiptのファイルやactive／隔離側の二重リンクが残った場合も、自動的に成功とはせず
+手動調査までfail-closedとする。隔離receiptはローカル証拠であり、外部署名・独立保管ではない。
 ファイルパスの再検査と排他的作成は誤操作の防護であり、同時に祖先ディレクトリを差し替える攻撃に対する
 fd相対I/Oの保証ではない。今回の人工試験で保証できる範囲を実HTTP送信や正式Real OOSへ拡張しない。
 

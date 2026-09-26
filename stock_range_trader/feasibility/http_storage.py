@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypeVar
 
+from .http_bodies import QuarantineRecord, RawBodyStore
 from .http_contract import (
     AccountRateEvent,
     AccountRateLedger,
@@ -60,6 +61,24 @@ class SlotToken:
     allowed_transfer_bytes: int
     allowed_decoded_bytes: int
     allowed_saved_bytes: int
+
+
+@dataclass(frozen=True)
+class OpenSlotInspection:
+    """Verified current slot evidence for an explicit recovery decision."""
+
+    account_ref: str
+    plan_sha256: str
+    attempt_id: str
+    holder_id: str
+    generation: int
+    reserved_at: datetime
+    sent_at: datetime | None
+    lease_expires_at: datetime
+    state: str
+    account_head: str
+    plan_head: str
+    token: SlotToken
 
 
 @dataclass(frozen=True)
@@ -662,6 +681,125 @@ class AccountLedgerStore:
                 raise StorageError("account_quarantined:" + row["hold_reason"])
             self._current(ledger, row, token, require_open=require_open)
 
+    def inspect_open_slot(
+        self, plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim
+    ) -> OpenSlotInspection | None:
+        """Return a typed recovery token without exposing SQLite internals.
+
+        An account has at most one open slot. A slot belonging to another plan
+        is an explicit mismatch, not an empty result.
+        """
+
+        with self._transaction() as db:
+            ledger, row = self._read_account(db)
+            slot_id = ledger._state.open_slot
+            if slot_id is None:
+                return None
+            slot = ledger._state.slots[slot_id]
+            if plan.account_ref != self.account_ref or slot.plan_sha256 != plan.sha256:
+                raise StorageError("open_slot_plan_mismatch")
+            journal = self._read_plan(db, plan, approval)
+            attempt = journal._state.attempts.get(slot_id)
+            if (
+                attempt is None
+                or journal._state.open_attempt != slot_id
+                or attempt.state not in ("reserved", "sent")
+                or attempt.sent_at != slot.sent_at
+            ):
+                raise StorageError("open_slot_plan_evidence_mismatch")
+            reconciliation = reconcile_account_and_plan(ledger, journal)
+            if reconciliation.status != "pending" or reconciliation.issues != (
+                "pending_settlement_on_both_ledgers",
+            ):
+                raise StorageError("open_slot_reconciliation_failed")
+            token = SlotToken(
+                self.account_ref,
+                plan.sha256,
+                slot_id,
+                slot.holder_id,
+                row["generation"],
+                attempt.page,
+                *attempt.allowed,
+            )
+            return OpenSlotInspection(
+                self.account_ref,
+                plan.sha256,
+                slot_id,
+                slot.holder_id,
+                row["generation"],
+                slot.reserved_at,
+                slot.sent_at,
+                ledger._state.lease_end(slot),
+                attempt.state,
+                ledger.head_hash,
+                journal.head_hash,
+                token,
+            )
+
+    def reclaim_open_slot(
+        self,
+        inspection: OpenSlotInspection,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+        *,
+        at: datetime,
+        new_holder_id: str,
+    ) -> None:
+        """Reclaim verified abandoned evidence as unknown, never as success."""
+
+        if type(inspection) is not OpenSlotInspection or (
+            inspection.account_ref != self.account_ref
+            or inspection.plan_sha256 != plan.sha256
+            or inspection.attempt_id != inspection.token.attempt_id
+            or inspection.generation != inspection.token.generation
+            or inspection.holder_id != inspection.token.holder_id
+        ):
+            raise StorageError("open_slot_inspection_mismatch")
+        ledger = self.load()
+        wait = max(
+            ledger.policy.wait_after("unknown"),
+            plan.retry.min_interval_seconds,
+            plan.retry.min_wait_after_network_error_seconds,
+            plan.retry.min_wait_after_429_seconds,
+        )
+        self.reclaim(
+            inspection.token,
+            plan,
+            approval,
+            at=at,
+            new_holder_id=new_holder_id,
+            effective_wait_seconds=wait,
+            expected_account_head=inspection.account_head,
+            expected_plan_head=inspection.plan_head,
+        )
+
+    def quarantine_uncommitted_body(
+        self,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+        bodies: RawBodyStore,
+        object_id: str,
+        *,
+        reason: str,
+        at: datetime,
+    ) -> QuarantineRecord:
+        """Keep account writers excluded while moving uncommitted evidence."""
+
+        if (
+            type(bodies) is not RawBodyStore
+            or bodies.plan_sha256 != plan.sha256
+            or bodies.approval_sha256 != approval.sha256
+        ):
+            raise StorageError("body_store_binding_mismatch")
+        with self._transaction() as db:
+            ledger, _ = self._read_account(db)
+            if ledger._state.open_slot is not None:
+                raise StorageError("open_slot_reclaim_required_before_quarantine")
+            journal = self._read_plan(db, plan, approval)
+            return bodies.quarantine_uncommitted(
+                journal, object_id, reason=reason, at=at
+            )
+
     def mark_sent(
         self,
         token: SlotToken,
@@ -902,13 +1040,25 @@ class AccountLedgerStore:
         at: datetime,
         new_holder_id: str,
         effective_wait_seconds: int,
+        expected_account_head: str | None = None,
+        expected_plan_head: str | None = None,
     ) -> None:
         """Reclaim an expired open slot as unknown and advance the fence."""
 
         with self._transaction() as db:
             ledger, row = self._read_account(db)
+            if (
+                expected_account_head is not None
+                and ledger.head_hash != expected_account_head
+            ):
+                raise StorageError("account_compare_and_append_stale")
             self._current(ledger, row, token, require_open=True)
             journal = self._read_plan(db, plan, approval)
+            if (
+                expected_plan_head is not None
+                and journal.head_hash != expected_plan_head
+            ):
+                raise StorageError("plan_compare_and_append_stale")
             if token.plan_sha256 != plan.sha256:
                 raise StorageError("slot_plan_mismatch")
             self._check_token_plan(token, journal)

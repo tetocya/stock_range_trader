@@ -216,6 +216,7 @@ class LocalhostHttpTransport:
         transferred = decoded_total = persisted = 0
         digest = hashlib.sha256()
         connection: http.client.HTTPConnection | None = None
+        response: http.client.HTTPResponse | None = None
         watchdog: threading.Timer | None = None
         deadline_fired = threading.Event()
 
@@ -362,12 +363,20 @@ class LocalhostHttpTransport:
             if response.fp is None:
                 raise failure("body_stream_missing")
             while True:
+                # Content-Length is the HTTP framing boundary. Never wait for
+                # EOF on a keep-alive connection after these bytes arrive, and
+                # never consume bytes beyond it as part of this response.
+                if declared_length is not None and transferred == declared_length:
+                    break
                 active_socket.settimeout(min(read_timeout, remaining()))
-                # For non-chunked close-delimited local responses read the
-                # underlying stream, not HTTPResponse.read1(): the latter stops
-                # at a falsely small Content-Length and would undercount bytes.
+                # Read from the underlying stream so close-delimited responses
+                # still use actual EOF. For length-delimited responses the
+                # requested read is capped by the remaining declared bytes.
                 stream = response if response.chunked else response.fp
-                raw = stream.read1(min(65_536, caps[0] - transferred + 1))
+                read_size = min(65_536, caps[0] - transferred + 1)
+                if declared_length is not None:
+                    read_size = min(read_size, declared_length - transferred)
+                raw = stream.read1(read_size)
                 if raw == b"":
                     break
                 transferred += len(raw)
@@ -434,5 +443,7 @@ class LocalhostHttpTransport:
             if watchdog is not None:
                 watchdog.cancel()
                 watchdog.join()
+            if response is not None:
+                response.close()
             if connection is not None:
                 connection.close()

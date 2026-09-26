@@ -233,12 +233,24 @@ def test_unsupported_transfer_encoding_is_rejected_with_known_status():
     assert caught.value.status_code == 200
 
 
-@pytest.mark.parametrize("declared", [1, 100])
-def test_false_content_length_is_rejected_from_measured_bytes(declared):
+def test_content_length_shorter_than_sent_bytes_stops_at_framing_boundary():
     body = b"1234567890"
     with _server(
+        lambda handler: _respond(handler, body, headers=(("Content-Length", "1"),))
+    ) as url:
+        sink = io.BytesIO()
+        result = _fetch(url, sink=sink)
+    # Bytes beyond the declared response are never persisted or reused. With
+    # keep-alive there is no reliable way to distinguish delayed extra bytes
+    # from a subsequent response without waiting for EOF.
+    assert result.transfer_bytes == result.persisted_bytes == 1
+    assert sink.getvalue() == b"1"
+
+
+def test_content_length_longer_than_sent_bytes_is_rejected():
+    with _server(
         lambda handler: _respond(
-            handler, body, headers=(("Content-Length", str(declared)),)
+            handler, b"1234567890", headers=(("Content-Length", "100"),)
         )
     ) as url:
         with pytest.raises(
@@ -246,7 +258,71 @@ def test_false_content_length_is_rejected_from_measured_bytes(declared):
         ) as caught:
             _fetch(url)
     assert caught.value.status_code == 200
-    assert caught.value.transfer_bytes == len(body)
+    assert caught.value.transfer_bytes == 10
+
+
+def test_exact_content_length_keep_alive_does_not_wait_for_eof():
+    body = b"length-delimited"
+
+    def reply(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+        handler.wfile.flush()
+        time.sleep(0.25)  # deliberately leave the socket open past read_timeout
+
+    with _server(reply) as url:
+        sink = io.BytesIO()
+        start = time.monotonic()
+        result = _fetch(
+            url, sink=sink, read_timeout_seconds=0.05, total_timeout_seconds=0.5
+        )
+        elapsed = time.monotonic() - start
+    assert elapsed < 0.2
+    assert result.transfer_bytes == len(body)
+    assert sink.getvalue() == body
+
+
+def test_exact_content_length_close_and_exact_transfer_cap():
+    body = b"exact-length"
+    with _server(
+        lambda handler: _respond(
+            handler, body, headers=(("Content-Length", str(len(body))),)
+        )
+    ) as url:
+        result = _fetch(url, allowed_transfer_bytes=len(body))
+    assert result.transfer_bytes == len(body)
+
+
+def test_content_length_one_above_transfer_cap_fails_closed():
+    body = b"123456"
+    with _server(
+        lambda handler: _respond(
+            handler, body, headers=(("Content-Length", str(len(body))),)
+        )
+    ) as url:
+        with pytest.raises(HttpTransportError, match="transfer_budget_exceeded"):
+            _fetch(url, allowed_transfer_bytes=len(body) - 1)
+
+
+@pytest.mark.parametrize(
+    "headers,reason",
+    [
+        ((("Content-Length", "5"), ("Content-Length", "5")), "invalid_content_length"),
+        ((("Content-Length", "5"), ("Content-Length", "6")), "invalid_content_length"),
+        ((("Content-Length", "-1"),), "invalid_content_length"),
+        ((("Content-Length", "not-a-number"),), "invalid_content_length"),
+        (
+            (("Transfer-Encoding", "chunked"), ("Content-Length", "5")),
+            "ambiguous_body_framing",
+        ),
+    ],
+)
+def test_content_length_ambiguous_or_malformed_is_rejected(headers, reason):
+    with _server(lambda handler: _respond(handler, b"hello", headers=headers)) as url:
+        with pytest.raises(HttpTransportError, match=reason):
+            _fetch(url)
 
 
 def test_giant_content_length_fails_closed_without_decimal_parser_exception():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import threading
@@ -13,17 +14,24 @@ from pathlib import Path
 import pytest
 
 from feasibility.acquisition import DAILY, MASTER, MASTER_TEXT_FIELDS
+from feasibility.http_bodies import RawBodyStorageError
 from feasibility.http_contract import (
     HTTP_OUTPUT_ROOT,
     AccountRatePolicy,
     BodyInventory,
     HttpAcquisitionPlan,
+    HttpContractError,
     HttpLimits,
     OwnerApprovalClaim,
     RetryRules,
     assess_live_acquisition_gate,
 )
-from feasibility.http_runner import LocalhostAcquisitionRunner, LocalhostTrialStopped
+from feasibility.http_runner import (
+    LocalhostAcquisitionRunner,
+    LocalhostRecoverySession,
+    LocalhostTrialStopped,
+)
+from feasibility.http_storage import StorageError
 from feasibility.http_transport import LocalhostHttpTransport
 
 NOW = datetime(2026, 9, 25, 12, tzinfo=UTC)
@@ -485,3 +493,162 @@ def test_partial_and_tampered_committed_body_fail_closed_on_resume(tmp_path):
         body.write_bytes(b"tampered")  # only this artificial fixture file
         with pytest.raises(Exception, match="saved_body_missing_or_size_mismatch"):
             resume(tmp_path, plan, transport, clock)
+
+
+def test_recovery_reclaims_partial_then_explicit_resume_without_auto_send(tmp_path):
+    clock = Clock()
+    plan = fixed()
+    response = payload([{"Date": "2025-03-03", "HolDiv": "1"}])
+    with localhost([(200, {}, response)], clock) as (transport, calls):
+        runner = create(tmp_path, plan, transport, clock)
+        token = runner.account.reserve_slot(
+            plan,
+            claim(plan),
+            at=clock.now(),
+            holder_id="crashed-holder",
+            inventory=runner.bodies.inventory,
+        )
+        partial, handle = runner.bodies.begin_partial(
+            token.attempt_id, token.generation
+        )
+        with handle:
+            handle.write(b"partial-evidence")
+        recovery = LocalhostRecoverySession.open(
+            tmp_path / plan.artifact_id,
+            tmp_path / "account-rate.sqlite3",
+            plan,
+            claim(plan),
+            clock=clock.now,
+        )
+        inspected = recovery.inspect_open_slot()
+        assert inspected is not None and inspected.state == "reserved"
+        assert inspected.attempt_id == token.attempt_id
+        assert [item.object_id for item in recovery.inspect_uncommitted()] == [
+            partial.name
+        ]
+        assert len(calls) == 0
+        with pytest.raises(
+            StorageError, match="open_slot_reclaim_required_before_quarantine"
+        ):
+            recovery.quarantine_uncommitted(
+                partial.name, reason="cannot_bypass_open_slot"
+            )
+        assert partial.read_bytes() == b"partial-evidence"
+        clock.tick(policy().slot_lease_seconds - 1)
+        with pytest.raises(
+            HttpContractError, match="account_slot_reclaim_before_lease_expiry"
+        ):
+            recovery.reclaim_expired_slot(inspected, new_holder_id="recovery-holder")
+        clock.tick(1)
+        recovery.reclaim_expired_slot(inspected, new_holder_id="recovery-holder")
+        assert recovery.inspect_open_slot() is None
+        record = recovery.quarantine_uncommitted(
+            partial.name, reason="crash_partial_reviewed"
+        )
+        assert record.state == "partial"
+        assert record.original_path == f"bodies/{partial.name}"
+        assert record.size == len(b"partial-evidence")
+        assert record.body_sha256 == hashlib.sha256(b"partial-evidence").hexdigest()
+        assert record.quarantined_at == clock.now()
+        assert recovery.quarantine_records() == (record,)
+        assert recovery.inspect_uncommitted() == ()
+        assert not partial.exists()
+        quarantined = tmp_path / plan.artifact_id / record.quarantine_path
+        assert quarantined.read_bytes() == b"partial-evidence"
+        with pytest.raises(RawBodyStorageError, match="partial_path_invalid"):
+            runner.bodies.publish_partial(
+                quarantined,
+                attempt_id=token.attempt_id,
+                expected_sha256=record.body_sha256,
+                expected_size=record.size,
+            )
+        assert len(calls) == 0
+        reopened = resume(tmp_path, plan, transport, clock)
+        with pytest.raises(LocalhostTrialStopped, match="rate_limit_wait"):
+            reopened.run_one()
+        clock.tick(120)
+        assert reopened.run_one().completed
+        assert len(calls) == 1
+        assert recovery.quarantine_records() == (record,)
+
+
+def test_orphan_quarantine_preserves_receipt_and_blocks_tampering(tmp_path):
+    clock = Clock()
+    plan = fixed()
+    with localhost([], clock) as (transport, calls):
+        runner = create(tmp_path, plan, transport, clock)
+        attempt_id = "a" * 64
+        partial, handle = runner.bodies.begin_partial(attempt_id, 1)
+        orphan_bytes = b'{"data":[]}'
+        with handle:
+            handle.write(orphan_bytes)
+        orphan = runner.bodies.publish_partial(
+            partial,
+            attempt_id=attempt_id,
+            expected_sha256=hashlib.sha256(orphan_bytes).hexdigest(),
+            expected_size=len(orphan_bytes),
+        )
+        with pytest.raises(
+            LocalhostTrialStopped, match="orphan_or_partial_body_present"
+        ):
+            runner.run_one()
+        recovery = LocalhostRecoverySession.open(
+            tmp_path / plan.artifact_id,
+            tmp_path / "account-rate.sqlite3",
+            plan,
+            claim(plan),
+            clock=clock.now,
+        )
+        assert [item.object_id for item in recovery.inspect_uncommitted()] == [
+            orphan.name
+        ]
+        record = recovery.quarantine_uncommitted(orphan.name, reason="orphan_reviewed")
+        assert record.state == "orphan"
+        assert record.size == len(orphan_bytes)
+        assert record.body_sha256 == hashlib.sha256(orphan_bytes).hexdigest()
+        assert recovery.quarantine_records() == (record,)
+        assert recovery.inspect_uncommitted() == ()
+        assert not orphan.exists()
+        assert len(calls) == 0
+        with pytest.raises(RawBodyStorageError, match="committed_body_missing"):
+            runner.bodies.read_final(attempt_id, max_bytes=100)
+        quarantined = tmp_path / plan.artifact_id / record.quarantine_path
+        quarantined.write_bytes(b"tampered artificial quarantine")
+        with pytest.raises(RawBodyStorageError, match="quarantined_body_changed"):
+            LocalhostRecoverySession.open(
+                tmp_path / plan.artifact_id,
+                tmp_path / "account-rate.sqlite3",
+                plan,
+                claim(plan),
+                clock=clock.now,
+            )
+
+
+def test_recovery_refuses_to_quarantine_committed_body(tmp_path):
+    clock = Clock()
+    plan = fixed()
+    response = payload([{"Date": "2025-03-03", "HolDiv": "1"}])
+    with localhost([(200, {}, response)], clock) as (transport, calls):
+        runner = create(tmp_path, plan, transport, clock)
+        assert runner.run_one().completed
+        committed = runner.account.body_commits()[0]
+        recovery = LocalhostRecoverySession.open(
+            tmp_path / plan.artifact_id,
+            tmp_path / "account-rate.sqlite3",
+            plan,
+            claim(plan),
+            clock=clock.now,
+        )
+        with pytest.raises(
+            RawBodyStorageError, match="committed_body_cannot_be_quarantined"
+        ):
+            recovery.quarantine_uncommitted(
+                committed.object_id, reason="must_not_promote_or_remove"
+            )
+        assert (
+            runner.bodies.read_final(
+                committed.attempt_id, max_bytes=plan.limits.max_page_saved_bytes
+            )
+            == response
+        )
+        assert len(calls) == 1
