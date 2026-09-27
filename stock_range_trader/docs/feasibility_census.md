@@ -482,13 +482,21 @@ plan／承認の識別hash、試行ID、送信枠のgeneration、観測HTTP stat
 
 クラッシュ後は永続台帳と実ファイルのinventoryを再読込し、結果不明を成功へ推測変換しない。
 `LocalhostRecoverySession.open()` は未解決の証拠も閲覧できる送信機能なしの保守入口である。
-`inspect_open_slot()` は現在のslot・保持者・generation・予約／送信／lease時刻と照合済みtokenを返す。
-lease満了後、operatorがその証拠を指定して `reclaim_expired_slot()` を呼ぶと、両台帳へ結果不明を原子的に記録し、
-generationを進めて旧tokenを拒否する。待機はunknownの保守的規則を維持する。
+`inspect_open_slot()` の `OpenSlotInspection` は、`account_ref`・plan hash・slot／attempt ID・保持者・generation・
+予約／送信／lease時刻・state・両台帳のheadを含む読み取り専用の証拠であり、完全な `SlotToken` や通常実行用capabilityを返さない。
+lease満了後、operatorがその証拠を指定して `reclaim_expired_slot()` を呼ぶと、SQLite transaction内で永続状態と
+両台帳を再読込し、inspectionの識別子・保持者・generation・時刻・state・headと再照合する。
+一致した場合だけreclaim用の内部tokenを内部で構成し、両台帳へ結果不明を原子的に記録してgenerationを進める。
+inspection取得後に状態が変わっていれば `open_slot_inspection_stale` として拒否する。
+旧tokenは拒否され、unknownの保守的な待機を維持する。
 `inspect_uncommitted()` はpartial／orphanのobject ID・size・hash・stateを列挙する。
 `quarantine_uncommitted(object_id, reason=...)` はpartial／orphanだけをactive body rootから隔離し、root相対の
 元path・移動先・object ID・size・SHA-256・元state・理由・時刻・journal headを正規化したreceiptへ保存する。
 `quarantine_records()` と次回openは、receiptと実ファイルを再照合する。隔離本文をcommittedへ昇格させる入口はない。
+RecoverySessionの公開操作はopen・inspection・reclaim・quarantineとその記録の参照に限り、通常実行用の
+`account`・`bodies`・transportを公開しない。RecoverySessionの公開APIからHTTP送信、送信記録、
+200／429／5xxや任意unknownの確定、committed body作成はできない。
+これは公開APIの権限境界であり、同一Python process内の任意コードがprivate internalsへ強制アクセスすることまで防ぐものではない。
 保守後も通常の `LocalhostAcquisitionRunner.open()` と明示的な `run_one()` による再開が必要で、保守APIはHTTPを送らない。
 人工試験の復旧手順は、保存済みrootとDBから `LocalhostRecoverySession.open(root, db, plan, approval, clock=...)`
 を開き、slotと未確定ファイルを点検し、lease満了と原因確認後にslotをreclaimし、必要なファイルだけを理由付きで
