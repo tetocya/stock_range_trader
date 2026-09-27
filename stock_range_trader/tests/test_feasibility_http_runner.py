@@ -572,6 +572,59 @@ def test_recovery_reclaims_partial_then_explicit_resume_without_auto_send(tmp_pa
         assert recovery.quarantine_records() == (record,)
 
 
+def test_recovery_session_cannot_expose_success_or_body_capabilities(tmp_path):
+    """A sent slot's inspection must not grant normal execution authority."""
+
+    clock = Clock()
+    plan = fixed()
+    with localhost([], clock) as (transport, calls):
+        runner = create(tmp_path, plan, transport, clock)
+        token = runner.account.reserve_slot(
+            plan,
+            claim(plan),
+            at=clock.now(),
+            holder_id="crashed-holder",
+            inventory=runner.bodies.inventory,
+        )
+        runner.account.mark_sent(
+            token,
+            plan,
+            claim(plan),
+            at=clock.now(),
+            inventory=runner.bodies.inventory,
+        )
+        recovery = LocalhostRecoverySession.open(
+            tmp_path / plan.artifact_id,
+            tmp_path / "account-rate.sqlite3",
+            plan,
+            claim(plan),
+            clock=clock.now,
+        )
+        inspected = recovery.inspect_open_slot()
+        assert inspected is not None and inspected.state == "sent"
+        assert not hasattr(inspected, "token")
+        assert not hasattr(recovery, "account")
+        assert not hasattr(recovery, "bodies")
+        assert not hasattr(recovery, "__dict__")
+        for operation in (
+            "reserve_slot",
+            "mark_sent",
+            "settle_response",
+            "settle_unknown",
+            "commit_body",
+            "begin_partial",
+            "publish_partial",
+            "run_one",
+        ):
+            assert not hasattr(recovery, operation)
+        assert len(calls) == 0
+        assert runner.account.load().head_hash == inspected.account_head
+        assert runner.account.load_journal(plan, claim(plan)).head_hash == (
+            inspected.plan_head
+        )
+        assert runner.account.body_commits() == ()
+
+
 def test_orphan_quarantine_preserves_receipt_and_blocks_tampering(tmp_path):
     clock = Clock()
     plan = fixed()

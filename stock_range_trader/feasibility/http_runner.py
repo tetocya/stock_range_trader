@@ -61,6 +61,8 @@ class ArtificialAttemptResult:
 class LocalhostRecoverySession:
     """Explicit, network-free maintenance for an interrupted artificial run."""
 
+    __slots__ = ("_plan", "_approval", "_account", "_bodies", "_clock")
+
     def __init__(
         self,
         plan: HttpAcquisitionPlan,
@@ -81,11 +83,11 @@ class LocalhostRecoverySession:
             or not callable(clock)
         ):
             raise LocalhostTrialStopped("recovery_binding_invalid", terminal=True)
-        self.plan = plan
-        self.approval = approval
-        self.account = account
-        self.bodies = bodies
-        self.clock = clock
+        self._plan = plan
+        self._approval = approval
+        self._account = account
+        self._bodies = bodies
+        self._clock = clock
 
     @classmethod
     def open(
@@ -114,22 +116,22 @@ class LocalhostRecoverySession:
         return cls(plan, approval, account, bodies, clock=clock)
 
     def _now(self) -> datetime:
-        return LocalhostAcquisitionRunner._read_clock(self.clock)
+        return LocalhostAcquisitionRunner._read_clock(self._clock)
 
     def inspect_open_slot(self) -> OpenSlotInspection | None:
-        return self.account.inspect_open_slot(self.plan, self.approval)
+        return self._account.inspect_open_slot(self._plan, self._approval)
 
     def inspect_uncommitted(self) -> tuple[BodyFileEvidence, ...]:
-        journal = self.account.load_journal(self.plan, self.approval)
-        return self.bodies.uncommitted_files(journal)
+        journal = self._account.load_journal(self._plan, self._approval)
+        return self._bodies.uncommitted_files(journal)
 
     def reclaim_expired_slot(
         self, inspection: OpenSlotInspection, *, new_holder_id: str
     ) -> None:
-        self.account.reclaim_open_slot(
+        self._account.reclaim_open_slot(
             inspection,
-            self.plan,
-            self.approval,
+            self._plan,
+            self._approval,
             at=self._now(),
             new_holder_id=new_holder_id,
         )
@@ -137,17 +139,17 @@ class LocalhostRecoverySession:
     def quarantine_uncommitted(
         self, object_id: str, *, reason: str
     ) -> QuarantineRecord:
-        return self.account.quarantine_uncommitted_body(
-            self.plan,
-            self.approval,
-            self.bodies,
+        return self._account.quarantine_uncommitted_body(
+            self._plan,
+            self._approval,
+            self._bodies,
             object_id,
             reason=reason,
             at=self._now(),
         )
 
     def quarantine_records(self) -> tuple[QuarantineRecord, ...]:
-        return self.bodies.quarantine_records()
+        return self._bodies.quarantine_records()
 
 
 class LocalhostAcquisitionRunner:

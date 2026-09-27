@@ -445,7 +445,7 @@ def test_public_recovery_inspects_and_reclaims_crashed_process(tmp_path, sent):
     assert inspected is not None
     assert inspected.account_ref == ACCOUNT
     assert inspected.plan_sha256 == plan.sha256
-    assert inspected.attempt_id == inspected.token.attempt_id
+    assert not hasattr(inspected, "token")
     assert inspected.holder_id == "holder-a"
     assert inspected.generation == 1
     assert inspected.reserved_at == NOW
@@ -472,33 +472,9 @@ def test_public_recovery_inspects_and_reclaims_crashed_process(tmp_path, sent):
     assert slot.outcome == "unknown"
     assert slot.effective_wait == 120
     assert reopened.load_journal(plan, claim)._state.unknown == 1
-    with pytest.raises(StorageError, match="stale_slot_generation"):
-        reopened.mark_sent(
-            inspected.token,
-            plan,
-            claim,
-            at=later(61),
-            inventory=lambda _journal: BodyInventory(()),
-        )
-    with pytest.raises(StorageError, match="stale_slot_generation"):
-        reopened.settle_unknown(
-            inspected.token,
-            plan,
-            claim,
-            at=later(61),
-            effective_wait_seconds=120,
-        )
-    with pytest.raises(StorageError, match="stale_slot_generation"):
-        reopened.commit_body(
-            inspected.token,
-            plan,
-            claim,
-            at=later(61),
-            object_id=f"{inspected.attempt_id}.json",
-            body_sha256="b" * 64,
-            saved_bytes=1,
-            next_key=None,
-            finalize=lambda: pytest.fail("stale finalizer called"),
+    with pytest.raises(StorageError, match="open_slot_inspection_stale"):
+        reopened.reclaim_open_slot(
+            inspected, plan, claim, at=later(61), new_holder_id="holder-c"
         )
     with pytest.raises(StorageError, match="reservation_blocked"):
         reserve(reopened, plan, claim, at=later(179), holder="holder-c")
@@ -508,10 +484,10 @@ def test_public_recovery_inspects_and_reclaims_crashed_process(tmp_path, sent):
 
 def test_recovery_rejects_stale_inspection_and_wrong_holder(tmp_path):
     store, plan, claim = prepared(tmp_path)
-    reserve(store, plan, claim)
+    token = reserve(store, plan, claim)
     inspected = store.inspect_open_slot(plan, claim)
     assert inspected is not None
-    with pytest.raises(StorageError, match="open_slot_inspection_mismatch"):
+    with pytest.raises(StorageError, match="open_slot_inspection_stale"):
         store.reclaim_open_slot(
             replace(inspected, holder_id="forged-holder"),
             plan,
@@ -520,13 +496,13 @@ def test_recovery_rejects_stale_inspection_and_wrong_holder(tmp_path):
             new_holder_id="holder-b",
         )
     AccountLedgerStore(store.path, ACCOUNT).mark_sent(
-        inspected.token,
+        token,
         plan,
         claim,
         at=later(1),
         inventory=lambda _journal: BodyInventory(()),
     )
-    with pytest.raises(StorageError, match="account_compare_and_append_stale"):
+    with pytest.raises(StorageError, match="open_slot_inspection_stale"):
         store.reclaim_open_slot(
             inspected, plan, claim, at=later(60), new_holder_id="holder-b"
         )
@@ -536,6 +512,52 @@ def test_recovery_rejects_stale_inspection_and_wrong_holder(tmp_path):
         store.reclaim_open_slot(
             current, plan, claim, at=later(60), new_holder_id="holder-a"
         )
+    store.reclaim_open_slot(
+        current, plan, claim, at=later(60), new_holder_id="holder-b"
+    )
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        store.mark_sent(
+            token,
+            plan,
+            claim,
+            at=later(61),
+            inventory=lambda _journal: BodyInventory(()),
+        )
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        store.settle_unknown(
+            token, plan, claim, at=later(61), effective_wait_seconds=120
+        )
+    with pytest.raises(StorageError, match="stale_slot_generation"):
+        store.commit_body(
+            token,
+            plan,
+            claim,
+            at=later(61),
+            object_id=f"{token.attempt_id}.json",
+            body_sha256="b" * 64,
+            saved_bytes=1,
+            next_key=None,
+            finalize=lambda: pytest.fail("stale finalizer called"),
+        )
+
+
+def test_recovery_rejects_inspection_after_other_connection_settles(tmp_path):
+    store, plan, claim = prepared(tmp_path)
+    token = reserve(store, plan, claim)
+    inspected = store.inspect_open_slot(plan, claim)
+    assert inspected is not None
+    other_connection = AccountLedgerStore(store.path, ACCOUNT)
+    other_connection.settle_unknown(
+        token, plan, claim, at=later(1), effective_wait_seconds=120
+    )
+    account_head = store.load().head_hash
+    plan_head = store.load_journal(plan, claim).head_hash
+    with pytest.raises(StorageError, match="open_slot_inspection_stale"):
+        store.reclaim_open_slot(
+            inspected, plan, claim, at=later(60), new_holder_id="holder-b"
+        )
+    assert store.load().head_hash == account_head
+    assert store.load_journal(plan, claim).head_hash == plan_head
 
 
 def test_429_with_unrepresentable_hint_quarantines_atomically(tmp_path):

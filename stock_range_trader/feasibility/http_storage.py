@@ -65,7 +65,7 @@ class SlotToken:
 
 @dataclass(frozen=True)
 class OpenSlotInspection:
-    """Verified current slot evidence for an explicit recovery decision."""
+    """Read-only slot evidence, not a normal-execution capability."""
 
     account_ref: str
     plan_sha256: str
@@ -78,7 +78,6 @@ class OpenSlotInspection:
     state: str
     account_head: str
     plan_head: str
-    token: SlotToken
 
 
 @dataclass(frozen=True)
@@ -684,57 +683,55 @@ class AccountLedgerStore:
     def inspect_open_slot(
         self, plan: HttpAcquisitionPlan, approval: OwnerApprovalClaim
     ) -> OpenSlotInspection | None:
-        """Return a typed recovery token without exposing SQLite internals.
+        """Return read-only recovery evidence without exposing SQLite internals.
 
         An account has at most one open slot. A slot belonging to another plan
         is an explicit mismatch, not an empty result.
         """
 
         with self._transaction() as db:
-            ledger, row = self._read_account(db)
-            slot_id = ledger._state.open_slot
-            if slot_id is None:
-                return None
-            slot = ledger._state.slots[slot_id]
-            if plan.account_ref != self.account_ref or slot.plan_sha256 != plan.sha256:
-                raise StorageError("open_slot_plan_mismatch")
-            journal = self._read_plan(db, plan, approval)
-            attempt = journal._state.attempts.get(slot_id)
-            if (
-                attempt is None
-                or journal._state.open_attempt != slot_id
-                or attempt.state not in ("reserved", "sent")
-                or attempt.sent_at != slot.sent_at
-            ):
-                raise StorageError("open_slot_plan_evidence_mismatch")
-            reconciliation = reconcile_account_and_plan(ledger, journal)
-            if reconciliation.status != "pending" or reconciliation.issues != (
-                "pending_settlement_on_both_ledgers",
-            ):
-                raise StorageError("open_slot_reconciliation_failed")
-            token = SlotToken(
-                self.account_ref,
-                plan.sha256,
-                slot_id,
-                slot.holder_id,
-                row["generation"],
-                attempt.page,
-                *attempt.allowed,
-            )
-            return OpenSlotInspection(
-                self.account_ref,
-                plan.sha256,
-                slot_id,
-                slot.holder_id,
-                row["generation"],
-                slot.reserved_at,
-                slot.sent_at,
-                ledger._state.lease_end(slot),
-                attempt.state,
-                ledger.head_hash,
-                journal.head_hash,
-                token,
-            )
+            return self._inspect_open_slot_locked(db, plan, approval)
+
+    def _inspect_open_slot_locked(
+        self,
+        db: sqlite3.Connection,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+    ) -> OpenSlotInspection | None:
+        ledger, row = self._read_account(db)
+        slot_id = ledger._state.open_slot
+        if slot_id is None:
+            return None
+        slot = ledger._state.slots[slot_id]
+        if plan.account_ref != self.account_ref or slot.plan_sha256 != plan.sha256:
+            raise StorageError("open_slot_plan_mismatch")
+        journal = self._read_plan(db, plan, approval)
+        attempt = journal._state.attempts.get(slot_id)
+        if (
+            attempt is None
+            or journal._state.open_attempt != slot_id
+            or attempt.state not in ("reserved", "sent")
+            or attempt.sent_at != slot.sent_at
+        ):
+            raise StorageError("open_slot_plan_evidence_mismatch")
+        reconciliation = reconcile_account_and_plan(ledger, journal)
+        if reconciliation.status != "pending" or reconciliation.issues != (
+            "pending_settlement_on_both_ledgers",
+        ):
+            raise StorageError("open_slot_reconciliation_failed")
+        return OpenSlotInspection(
+            self.account_ref,
+            plan.sha256,
+            slot_id,
+            slot.holder_id,
+            row["generation"],
+            slot.reserved_at,
+            slot.sent_at,
+            ledger._state.lease_end(slot),
+            attempt.state,
+            ledger.head_hash,
+            journal.head_hash,
+        )
 
     def reclaim_open_slot(
         self,
@@ -750,28 +747,41 @@ class AccountLedgerStore:
         if type(inspection) is not OpenSlotInspection or (
             inspection.account_ref != self.account_ref
             or inspection.plan_sha256 != plan.sha256
-            or inspection.attempt_id != inspection.token.attempt_id
-            or inspection.generation != inspection.token.generation
-            or inspection.holder_id != inspection.token.holder_id
         ):
             raise StorageError("open_slot_inspection_mismatch")
-        ledger = self.load()
-        wait = max(
-            ledger.policy.wait_after("unknown"),
-            plan.retry.min_interval_seconds,
-            plan.retry.min_wait_after_network_error_seconds,
-            plan.retry.min_wait_after_429_seconds,
-        )
-        self.reclaim(
-            inspection.token,
-            plan,
-            approval,
-            at=at,
-            new_holder_id=new_holder_id,
-            effective_wait_seconds=wait,
-            expected_account_head=inspection.account_head,
-            expected_plan_head=inspection.plan_head,
-        )
+        with self._transaction() as db:
+            current = self._inspect_open_slot_locked(db, plan, approval)
+            if current != inspection:
+                raise StorageError("open_slot_inspection_stale")
+            ledger, _ = self._read_account(db)
+            journal = self._read_plan(db, plan, approval)
+            attempt = journal._state.attempts[inspection.attempt_id]
+            token = SlotToken(
+                self.account_ref,
+                plan.sha256,
+                inspection.attempt_id,
+                inspection.holder_id,
+                inspection.generation,
+                attempt.page,
+                *attempt.allowed,
+            )
+            wait = max(
+                ledger.policy.wait_after("unknown"),
+                plan.retry.min_interval_seconds,
+                plan.retry.min_wait_after_network_error_seconds,
+                plan.retry.min_wait_after_429_seconds,
+            )
+            self._reclaim_locked(
+                db,
+                token,
+                plan,
+                approval,
+                at=at,
+                new_holder_id=new_holder_id,
+                effective_wait_seconds=wait,
+                expected_account_head=inspection.account_head,
+                expected_plan_head=inspection.plan_head,
+            )
 
     def quarantine_uncommitted_body(
         self,
@@ -1046,52 +1056,74 @@ class AccountLedgerStore:
         """Reclaim an expired open slot as unknown and advance the fence."""
 
         with self._transaction() as db:
-            ledger, row = self._read_account(db)
-            if (
-                expected_account_head is not None
-                and ledger.head_hash != expected_account_head
-            ):
-                raise StorageError("account_compare_and_append_stale")
-            self._current(ledger, row, token, require_open=True)
-            journal = self._read_plan(db, plan, approval)
-            if (
-                expected_plan_head is not None
-                and journal.head_hash != expected_plan_head
-            ):
-                raise StorageError("plan_compare_and_append_stale")
-            if token.plan_sha256 != plan.sha256:
-                raise StorageError("slot_plan_mismatch")
-            self._check_token_plan(token, journal)
-            slot = ledger._state.slots[token.attempt_id]
-            lease_end = ledger._state.lease_end(slot)
-            updated_plan = journal.append(
-                JournalEvent("outcome_unknown", at, attempt_id=token.attempt_id)
-            )
-            updated_account = ledger.append(
-                AccountRateEvent(
-                    "slot_reclaimed",
-                    at,
-                    slot_id=token.attempt_id,
-                    holder_id=new_holder_id,
-                    previous_holder_id=token.holder_id,
-                    lease_expired_at=lease_end,
-                    reclaim_reason="lease_expired",
-                    effective_wait_seconds=effective_wait_seconds,
-                )
-            )
-            result = reconcile_account_and_plan(updated_account, updated_plan)
-            if result.status != "consistent":
-                raise StorageError("journal_reconciliation_failed:" + result.issues[0])
-            self._write_plan(db, journal, updated_plan)
-            self._write_account(
+            self._reclaim_locked(
                 db,
-                ledger,
-                updated_account,
-                generation=row["generation"] + 1,
-                active_slot=None,
-                active_holder=None,
-                active_generation=None,
+                token,
+                plan,
+                approval,
+                at=at,
+                new_holder_id=new_holder_id,
+                effective_wait_seconds=effective_wait_seconds,
+                expected_account_head=expected_account_head,
+                expected_plan_head=expected_plan_head,
             )
+
+    def _reclaim_locked(
+        self,
+        db: sqlite3.Connection,
+        token: SlotToken,
+        plan: HttpAcquisitionPlan,
+        approval: OwnerApprovalClaim,
+        *,
+        at: datetime,
+        new_holder_id: str,
+        effective_wait_seconds: int,
+        expected_account_head: str | None,
+        expected_plan_head: str | None,
+    ) -> None:
+        ledger, row = self._read_account(db)
+        if (
+            expected_account_head is not None
+            and ledger.head_hash != expected_account_head
+        ):
+            raise StorageError("account_compare_and_append_stale")
+        self._current(ledger, row, token, require_open=True)
+        journal = self._read_plan(db, plan, approval)
+        if expected_plan_head is not None and journal.head_hash != expected_plan_head:
+            raise StorageError("plan_compare_and_append_stale")
+        if token.plan_sha256 != plan.sha256:
+            raise StorageError("slot_plan_mismatch")
+        self._check_token_plan(token, journal)
+        slot = ledger._state.slots[token.attempt_id]
+        lease_end = ledger._state.lease_end(slot)
+        updated_plan = journal.append(
+            JournalEvent("outcome_unknown", at, attempt_id=token.attempt_id)
+        )
+        updated_account = ledger.append(
+            AccountRateEvent(
+                "slot_reclaimed",
+                at,
+                slot_id=token.attempt_id,
+                holder_id=new_holder_id,
+                previous_holder_id=token.holder_id,
+                lease_expired_at=lease_end,
+                reclaim_reason="lease_expired",
+                effective_wait_seconds=effective_wait_seconds,
+            )
+        )
+        result = reconcile_account_and_plan(updated_account, updated_plan)
+        if result.status != "consistent":
+            raise StorageError("journal_reconciliation_failed:" + result.issues[0])
+        self._write_plan(db, journal, updated_plan)
+        self._write_account(
+            db,
+            ledger,
+            updated_account,
+            generation=row["generation"] + 1,
+            active_slot=None,
+            active_holder=None,
+            active_generation=None,
+        )
 
     def commit_body(
         self,
