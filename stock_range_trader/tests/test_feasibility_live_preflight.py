@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -18,11 +19,14 @@ from feasibility.http_contract import (
 from feasibility.live_preflight import (
     LIVE_ACCOUNT_IDENTITY_SCHEMA,
     LIVE_ACCOUNT_PREFLIGHT_SCHEMA,
+    LIVE_ACCOUNT_REGISTRY_SCHEMA,
     LiveAccountContractAlignment,
     LiveAccountIdentityRecord,
+    LiveAccountIdentityRegistry,
     LiveAccountOperatingPolicy,
     LiveAccountPreflightContract,
     LiveClockPolicy,
+    LiveReclaimAssessment,
     LiveReclaimEvidence,
     assess_live_reclaim,
     check_live_account_preflight,
@@ -107,12 +111,22 @@ def identity(**changes) -> LiveAccountIdentityRecord:
         record_id="owner-account-record",
         account_ref=ACCOUNT,
         credential_reference="env:JQUANTS_API_KEY",
-        canonical_store_root=LIVE_STORE_ROOT,
         registered_at=NOW - seconds(300),
         evidence_reference="urn:owner:account-identity-record",
     )
     values.update(changes)
     return LiveAccountIdentityRecord(**values)
+
+
+def registry(*records, **changes) -> LiveAccountIdentityRegistry:
+    values = dict(
+        canonical_store_root=LIVE_STORE_ROOT,
+        active_records=records or (identity(),),
+        fixed_at=NOW - seconds(60),
+        decision_reference="urn:owner:registry-decision",
+    )
+    values.update(changes)
+    return LiveAccountIdentityRegistry(**values)
 
 
 def clock(**changes) -> LiveClockPolicy:
@@ -122,11 +136,19 @@ def clock(**changes) -> LiveClockPolicy:
 
 
 def preflight(
-    fixed=None, *, account_identity=None, rate_policy=None, clock_policy=None, **changes
+    fixed=None,
+    *,
+    account_identity=None,
+    account_registry=None,
+    rate_policy=None,
+    clock_policy=None,
+    **changes,
 ) -> LiveAccountPreflightContract:
     fixed = fixed or plan()
+    selected_identity = account_identity or identity(account_ref=fixed.account_ref)
     values = dict(
-        identity=account_identity or identity(account_ref=fixed.account_ref),
+        identity=selected_identity,
+        registry=account_registry or registry(selected_identity),
         operating_policy=LiveAccountOperatingPolicy(),
         clock_policy=clock_policy or clock(),
         rate_policy=rate_policy or account_policy(),
@@ -150,18 +172,49 @@ def reclaim_evidence(**changes) -> LiveReclaimEvidence:
     return LiveReclaimEvidence(**values)
 
 
-def test_identity_derives_one_ledger_path_from_root_and_account_ref():
+def test_registry_derives_one_ledger_path_from_root_and_account_ref():
     first = identity(record_id="owner-record-a")
-    second = identity(record_id="owner-record-b")
-    assert first.canonical_ledger_path == second.canonical_ledger_path
-    assert first.canonical_ledger_path == (
+    second = identity(record_id="owner-record-b", credential_reference="env:OTHER_KEY")
+    owner_registry = registry(first)
+    first_path = owner_registry.canonical_ledger_path(first.account_ref)
+    assert first_path == (
         LIVE_STORE_ROOT + "/accounts/artificial-account/account-rate-ledger.sqlite3"
     )
-    assert identity(account_ref="other-account").canonical_ledger_path != (
-        first.canonical_ledger_path
-    )
+    assert registry(second).canonical_ledger_path(second.account_ref) == first_path
+    other = identity(account_ref="other-account")
+    assert registry(first, other).canonical_ledger_path(other.account_ref) != first_path
+    assert not hasattr(first, "canonical_store_root")
+    assert not hasattr(first, "canonical_ledger_path")
     assert not first.identity_verified and not first.secret_material_persisted
     assert {"api_key", "refresh_token", "secret"}.isdisjoint(first.to_dict())
+
+
+def test_registry_rejects_duplicate_account_and_preflight_foreign_identity():
+    first = identity()
+    with pytest.raises(HttpContractError, match="live_registry_duplicate_account_ref"):
+        registry(first, identity(record_id="second"))
+    owner_registry = registry(first)
+    with pytest.raises(
+        HttpContractError, match="live_preflight_identity_registry_mismatch"
+    ):
+        preflight(
+            account_registry=owner_registry,
+            account_identity=identity(record_id="foreign"),
+        )
+    with pytest.raises(TypeError):
+        preflight(canonical_store_root="/srv/other")
+    assert preflight(account_registry=owner_registry).canonical_ledger_path == (
+        owner_registry.canonical_ledger_path(ACCOUNT)
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["secret", "sk_live_xxx", "", "env:", "env:lower", "env:API-KEY", "env:API\nKEY"],
+)
+def test_identity_rejects_secret_or_malformed_credential_reference(reference):
+    with pytest.raises(HttpContractError, match="credential_reference_invalid"):
+        identity(credential_reference=reference)
 
 
 @pytest.mark.parametrize(
@@ -170,15 +223,36 @@ def test_identity_derives_one_ledger_path_from_root_and_account_ref():
         ("relative/store", "canonical_store_root_must_be_absolute"),
         ("/var/lib/a/../b", "canonical_store_root_must_be_absolute_canonical_path"),
         ("/", "canonical_store_root_too_broad"),
+        ("/srv/x/", "canonical_store_root_must_be_absolute_canonical_path"),
+        ("/srv//x", "canonical_store_root_must_be_absolute_canonical_path"),
+        ("/srv/./x", "canonical_store_root_must_be_absolute_canonical_path"),
+        ("//srv/x", "canonical_store_root_must_be_absolute_canonical_path"),
         (
             str(HTTP_OUTPUT_ROOT / "central-ledger"),
-            "canonical_store_root_inside_plan_output_root",
+            "canonical_store_root_inside_forbidden_root",
         ),
+        (str(HTTP_OUTPUT_ROOT.parent), "canonical_store_root_inside_forbidden_root"),
+        (
+            str(HTTP_OUTPUT_ROOT.parent / "other"),
+            "canonical_store_root_inside_forbidden_root",
+        ),
+        (
+            str(Path(__file__).resolve().parents[2]),
+            "canonical_store_root_inside_forbidden_root",
+        ),
+        (
+            str(Path(__file__).resolve().parents[1]),
+            "canonical_store_root_inside_forbidden_root",
+        ),
+        ("/tmp", "canonical_store_root_inside_forbidden_root"),
+        ("/var/tmp/live", "canonical_store_root_inside_forbidden_root"),
+        ("/private/tmp/live", "canonical_store_root_inside_forbidden_root"),
+        ("/private/var/folders/jx/live", "canonical_store_root_inside_forbidden_root"),
     ],
 )
 def test_owner_store_root_rejects_noncanonical_or_plan_output_paths(root, reason):
     with pytest.raises(HttpContractError, match=reason):
-        identity(canonical_store_root=root)
+        registry(canonical_store_root=root)
 
 
 def test_operating_policy_fixes_account_wide_exclusive_use():
@@ -201,6 +275,9 @@ def test_clock_policy_requires_strict_request_guard_inside_lease():
             clock_policy=policy,
             rate_policy=account_policy(slot_lease_seconds=45),
         )
+    preflight(rate_policy=account_policy(slot_lease_seconds=46))
+    with pytest.raises(HttpContractError, match="account_rate_policy_required"):
+        policy.validate_rate_policy("not-a-policy")
     with pytest.raises(HttpContractError, match="live_clock_policy_invalid"):
         clock(caller_event_time_policy="allowed")
 
@@ -235,9 +312,28 @@ def test_contracts_are_versioned_without_changing_v2_account_ledger():
     account_identity = identity()
     contract = preflight(account_identity=account_identity)
     assert account_identity.to_dict()["schema"] == LIVE_ACCOUNT_IDENTITY_SCHEMA
+    assert contract.registry.to_dict()["schema"] == LIVE_ACCOUNT_REGISTRY_SCHEMA
     assert contract.to_dict()["schema"] == LIVE_ACCOUNT_PREFLIGHT_SCHEMA
     assert contract.sha256 != account_identity.sha256
     assert ACCOUNT_LEDGER_SCHEMA == "historical-feasibility-account-rate-ledger-v2"
+
+
+def test_preflight_cannot_predate_registry_or_identity():
+    with pytest.raises(
+        HttpContractError, match="live_preflight_before_identity_registry"
+    ):
+        preflight(fixed_at=NOW - seconds(61))
+    later_identity = identity(registered_at=NOW + seconds(1))
+    later_registry = registry(later_identity, fixed_at=NOW + seconds(2))
+    with pytest.raises(
+        HttpContractError, match="live_preflight_before_identity_registry"
+    ):
+        preflight(account_identity=later_identity, account_registry=later_registry)
+    preflight(
+        account_identity=later_identity,
+        account_registry=later_registry,
+        fixed_at=NOW + seconds(2),
+    )
 
 
 def test_reclaim_is_never_automatic_and_requires_explicit_safe_evidence():
@@ -264,6 +360,17 @@ def test_reclaim_is_never_automatic_and_requires_explicit_safe_evidence():
     assert not missing.manual_reclaim_eligible
     assert "previous_transport_termination_unverified" in missing.reasons
     assert not missing.automatic_reclaim_permitted
+
+
+def test_reclaim_eligibility_is_derived_and_automatic_reclaim_cannot_be_set():
+    assert LiveReclaimAssessment(()).manual_reclaim_eligible
+    assert not LiveReclaimAssessment(("missing",)).manual_reclaim_eligible
+    with pytest.raises(TypeError):
+        LiveReclaimAssessment(("missing",), manual_reclaim_eligible=True)
+    with pytest.raises(TypeError):
+        LiveReclaimAssessment((), manual_reclaim_eligible=False)
+    with pytest.raises(TypeError):
+        LiveReclaimAssessment((), automatic_reclaim_permitted=True)
 
 
 def test_restart_requires_manual_review_and_transport_termination_evidence():

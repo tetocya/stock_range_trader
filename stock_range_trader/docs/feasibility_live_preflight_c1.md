@@ -24,8 +24,16 @@ M1, M4, M5, N2/N3 and the event/schema migration work are deliberately deferred 
 ## H1: account identity and canonical Store
 
 `LiveAccountIdentityRecord` is an owner-managed **claim**, not authentication proof.
-It stores an opaque `credential_reference`; API keys, refresh tokens and secret material
-must not be persisted in the contract, ledger, receipt or log.
+Its `credential_reference` must match `env:[A-Z_][A-Z0-9_]*` (for example
+`env:JQUANTS_API_KEY`). The contract never reads the environment variable. API keys,
+refresh tokens and secret material must not be persisted in the contract, ledger,
+receipt or log.
+
+`LiveAccountIdentityRegistry` is a versioned, immutable owner snapshot with one
+`canonical_store_root`, a tuple of active identity records, `fixed_at` and a decision
+reference. Duplicate active `account_ref` values are rejected. Identity records do not
+carry a root. The preflight binds the registry and its resolved identity; its `fixed_at`
+must not precede either registry fixation or identity registration.
 
 The canonical ledger location is always:
 
@@ -34,12 +42,19 @@ The canonical ledger location is always:
 ```
 
 No database path is supplied as an argument to this derivation. Different identity-record
-IDs or credential references for the same root and `account_ref` therefore resolve to the
-same ledger path. C1 rejects relative/non-normalized roots and roots inside the existing
-plan HTTP output tree.
+IDs or credential references for the same registry root and `account_ref` therefore resolve
+to the same ledger path. C1 rejects relative/non-normalized roots (including `//`, trailing
+slash, `/./` and duplicate slash), `/`, roots inside the current checkout or package, any
+part of `outputs/feasibility`, and standard `/tmp`, `/var/tmp`, `/private/tmp` and
+`/private/var/folders` temporary trees.
 
-C1 does **not** prove inode/device identity, symlink/hard-link/mount safety, permissions,
-or that another worktree cannot alias the root. Those physical guarantees belong to I1.
+C1 proves uniqueness only **within one registry snapshot**. It does not authenticate that
+snapshot or prevent a caller from constructing another purported registry. I1 must persist
+and use the owner's one authenticated/fixed registry, rejecting a second active record,
+another root or a registry swap. C1 also does **not** prove physical path custody. Before
+live use, I1 must inspect every Git worktree root and the candidate Store with realpath,
+inode/device and permission checks, and reject symlink, hard-link, mount or other aliases
+to worktrees or artificial output trees. No single known worktree is hard-coded in C1.
 
 `LiveAccountOperatingPolicy` fixes the owner operation rule:
 
@@ -78,6 +93,10 @@ slot_lease_seconds >=
   + 1
 ```
 
+I1 must measure `S` at send time and enforce
+`S - R <= max_reservation_to_send_seconds`. A reservation beyond this bound must
+**not** send HTTP. The lease inequality alone does not enforce this operational bound.
+
 This bound does not prove the old socket/process terminated. `LiveReclaimEvidence` and
 `assess_live_reclaim()` therefore only identify a **manual-reclaim candidate** when all of
 these are present:
@@ -96,11 +115,14 @@ termination evidence by itself.
 C1 introduces:
 
 - `historical-feasibility-live-account-identity-v1`;
+- `historical-feasibility-live-account-registry-v1`;
 - `historical-feasibility-live-account-preflight-v1`.
 
-It does not change `historical-feasibility-account-rate-ledger-v2`. Existing localhost
-SQLite data must not be silently migrated or reinterpreted under the live-preflight
-semantics.
+It does not change `historical-feasibility-account-rate-ledger-v2`. I1 must introduce a
+distinct versioned **live** ledger schema; the artificial v2 DB is not a production ledger.
+If such a DB exists at the proposed live canonical path, I1 must fail closed without
+automatic migration, reinterpretation or overwrite until an explicit migration procedure
+is approved. C1 creates no SQLite schema or Store.
 
 The current threat boundary remains trusted application code. C1 prevents normal API
 misconfiguration from turning an arbitrary DB path or arbitrary clock into live authority;
@@ -129,5 +151,6 @@ After independent review of C1:
 
 1. C2: partial-header/429 evidence, append-only hold/generation history and schema migration rules;
 2. C3: duplicate-body semantics, `plan.output_dir` physical binding, body/quarantine budgets;
-3. I1: implement identity registry, canonical Store, trusted Clock, path/inode enforcement,
-   manual recovery and capability hardening—still with the Live Gate closed.
+3. I1: implement the authenticated, durable single registry and versioned live canonical
+   Store, trusted Clock, send-time lease bound, physical path enforcement, manual recovery
+   and capability hardening—still with the Live Gate closed.

@@ -25,10 +25,12 @@ from .http_contract import (
 )
 
 LIVE_ACCOUNT_IDENTITY_SCHEMA = "historical-feasibility-live-account-identity-v1"
+LIVE_ACCOUNT_REGISTRY_SCHEMA = "historical-feasibility-live-account-registry-v1"
 LIVE_ACCOUNT_PREFLIGHT_SCHEMA = "historical-feasibility-live-account-preflight-v1"
 LIVE_LEDGER_FILENAME = "account-rate-ledger.sqlite3"
 
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_ENV_REFERENCE = re.compile(r"env:[A-Z_][A-Z0-9_]*\Z")
 
 
 def _canonical(value: object) -> str:
@@ -79,19 +81,26 @@ def _canonical_owner_store_root(value: object) -> str:
 
     if type(value) is not str or not value:
         raise HttpContractError("canonical_store_root_must_be_absolute")
-    raw = Path(value)
-    if not raw.is_absolute():
+    if not value.startswith("/"):
         raise HttpContractError("canonical_store_root_must_be_absolute")
-    if ".." in raw.parts or str(raw) != os.path.normpath(value):
+    if value.startswith("//") or value != os.path.normpath(value):
         raise HttpContractError("canonical_store_root_must_be_absolute_canonical_path")
+    raw = Path(value)
     if raw.parent == raw:
         raise HttpContractError("canonical_store_root_too_broad")
-    try:
-        raw.relative_to(HTTP_OUTPUT_ROOT)
-    except ValueError:
-        pass
-    else:
-        raise HttpContractError("canonical_store_root_inside_plan_output_root")
+    checkout_root = Path(os.path.abspath(__file__)).parents[2]
+    forbidden_roots = (
+        checkout_root,
+        checkout_root / "stock_range_trader",
+        HTTP_OUTPUT_ROOT.parent,
+        Path("/tmp"),
+        Path("/var/tmp"),
+        Path("/private/tmp"),
+        Path("/private/var/folders"),
+    )
+    for forbidden in forbidden_roots:
+        if raw == forbidden or raw.is_relative_to(forbidden):
+            raise HttpContractError("canonical_store_root_inside_forbidden_root")
     return value
 
 
@@ -99,14 +108,12 @@ def _canonical_owner_store_root(value: object) -> str:
 class LiveAccountIdentityRecord:
     """Owner-registered identity claim, not proof of authenticated account identity.
 
-    ``credential_reference`` is an opaque pointer to secret material. API keys,
-    refresh tokens and secrets themselves must not be serialized into this record.
+    ``credential_reference`` names an environment variable, never its value.
     """
 
     record_id: str
     account_ref: str
     credential_reference: str
-    canonical_store_root: str
     registered_at: datetime
     evidence_reference: str
     account_scope: str = "all_credentials_for_authenticated_account"
@@ -117,25 +124,16 @@ class LiveAccountIdentityRecord:
     def __post_init__(self) -> None:
         _label(self.record_id, "identity_record_id")
         _label(self.account_ref, "account_ref")
-        _text(self.credential_reference, "credential_reference")
-        _canonical_owner_store_root(self.canonical_store_root)
+        if type(self.credential_reference) is not str or not _ENV_REFERENCE.fullmatch(
+            self.credential_reference
+        ):
+            raise HttpContractError("credential_reference_invalid")
         _utc(self.registered_at, "identity_registered_at")
         _text(self.evidence_reference, "identity_evidence_reference")
         if self.account_scope != "all_credentials_for_authenticated_account":
             raise HttpContractError("live_account_scope_invalid")
         if self.store_scope != "owner_managed_outside_worktrees":
             raise HttpContractError("live_store_scope_invalid")
-
-    @property
-    def canonical_ledger_path(self) -> str:
-        """Derive one lexical ledger path from owner root + account_ref."""
-
-        return str(
-            Path(self.canonical_store_root)
-            / "accounts"
-            / self.account_ref
-            / LIVE_LEDGER_FILENAME
-        )
 
     @property
     def sha256(self) -> str:
@@ -147,14 +145,66 @@ class LiveAccountIdentityRecord:
             "record_id": self.record_id,
             "account_ref": self.account_ref,
             "credential_reference": self.credential_reference,
-            "canonical_store_root": self.canonical_store_root,
-            "canonical_ledger_path": self.canonical_ledger_path,
             "registered_at": _utc(self.registered_at, "identity_registered_at"),
             "evidence_reference": self.evidence_reference,
             "account_scope": self.account_scope,
             "store_scope": self.store_scope,
             "identity_verified": False,
             "secret_material_persisted": False,
+        }
+
+
+@dataclass(frozen=True)
+class LiveAccountIdentityRegistry:
+    """One immutable owner snapshot; authenticity remains an I1 responsibility."""
+
+    canonical_store_root: str
+    active_records: tuple[LiveAccountIdentityRecord, ...]
+    fixed_at: datetime
+    decision_reference: str
+
+    def __post_init__(self) -> None:
+        _canonical_owner_store_root(self.canonical_store_root)
+        fixed_at = _utc(self.fixed_at, "live_registry_fixed_at")
+        _text(self.decision_reference, "live_registry_decision_reference")
+        if type(self.active_records) is not tuple or not self.active_records:
+            raise HttpContractError("live_registry_active_records_required")
+        seen: set[str] = set()
+        for record in self.active_records:
+            if type(record) is not LiveAccountIdentityRecord:
+                raise HttpContractError("live_account_identity_record_required")
+            if record.account_ref in seen:
+                raise HttpContractError("live_registry_duplicate_account_ref")
+            if _utc(record.registered_at, "identity_registered_at") > fixed_at:
+                raise HttpContractError("live_registry_before_identity_registration")
+            seen.add(record.account_ref)
+
+    def resolve(self, account_ref: str) -> LiveAccountIdentityRecord:
+        for record in self.active_records:
+            if record.account_ref == account_ref:
+                return record
+        raise HttpContractError("live_registry_account_ref_not_active")
+
+    def canonical_ledger_path(self, account_ref: str) -> str:
+        self.resolve(account_ref)
+        return str(
+            Path(self.canonical_store_root)
+            / "accounts"
+            / account_ref
+            / LIVE_LEDGER_FILENAME
+        )
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.to_dict())
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": LIVE_ACCOUNT_REGISTRY_SCHEMA,
+            "canonical_store_root": self.canonical_store_root,
+            "active_records": [record.to_dict() for record in self.active_records],
+            "fixed_at": _utc(self.fixed_at, "live_registry_fixed_at"),
+            "decision_reference": self.decision_reference,
         }
 
 
@@ -225,6 +275,8 @@ class LiveClockPolicy:
         return required
 
     def validate_rate_policy(self, policy: AccountRatePolicy) -> None:
+        if type(policy) is not AccountRatePolicy:
+            raise HttpContractError("account_rate_policy_required")
         if policy.slot_lease_seconds < self.minimum_lease_seconds(policy):
             raise HttpContractError("live_slot_lease_guard_insufficient")
 
@@ -233,6 +285,7 @@ class LiveClockPolicy:
 class LiveAccountPreflightContract:
     """Versioned C1 declaration; matching content is not live authorization."""
 
+    registry: LiveAccountIdentityRegistry
     identity: LiveAccountIdentityRecord
     operating_policy: LiveAccountOperatingPolicy
     clock_policy: LiveClockPolicy
@@ -241,8 +294,12 @@ class LiveAccountPreflightContract:
     decision_reference: str
 
     def __post_init__(self) -> None:
+        if type(self.registry) is not LiveAccountIdentityRegistry:
+            raise HttpContractError("live_account_identity_registry_required")
         if type(self.identity) is not LiveAccountIdentityRecord:
             raise HttpContractError("live_account_identity_record_required")
+        if self.registry.resolve(self.identity.account_ref) != self.identity:
+            raise HttpContractError("live_preflight_identity_registry_mismatch")
         if type(self.operating_policy) is not LiveAccountOperatingPolicy:
             raise HttpContractError("live_account_operating_policy_required")
         if type(self.clock_policy) is not LiveClockPolicy:
@@ -250,12 +307,16 @@ class LiveAccountPreflightContract:
         if type(self.rate_policy) is not AccountRatePolicy:
             raise HttpContractError("account_rate_policy_required")
         self.clock_policy.validate_rate_policy(self.rate_policy)
-        _utc(self.fixed_at, "live_preflight_fixed_at")
+        fixed_at = _utc(self.fixed_at, "live_preflight_fixed_at")
+        if fixed_at < _utc(
+            self.registry.fixed_at, "live_registry_fixed_at"
+        ) or fixed_at < _utc(self.identity.registered_at, "identity_registered_at"):
+            raise HttpContractError("live_preflight_before_identity_registry")
         _text(self.decision_reference, "live_preflight_decision_reference")
 
     @property
     def canonical_ledger_path(self) -> str:
-        return self.identity.canonical_ledger_path
+        return self.registry.canonical_ledger_path(self.identity.account_ref)
 
     @property
     def sha256(self) -> str:
@@ -264,6 +325,7 @@ class LiveAccountPreflightContract:
     def to_dict(self) -> dict:
         return {
             "schema": LIVE_ACCOUNT_PREFLIGHT_SCHEMA,
+            "registry": self.registry.to_dict(),
             "identity": self.identity.to_dict(),
             "operating_policy": asdict(self.operating_policy),
             "clock_policy": asdict(self.clock_policy),
@@ -337,8 +399,17 @@ class LiveReclaimAssessment:
     """Informational only; a future entry point must re-check raw evidence."""
 
     reasons: tuple[str, ...]
-    manual_reclaim_eligible: bool
     automatic_reclaim_permitted: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.reasons) is not tuple or any(
+            type(reason) is not str for reason in self.reasons
+        ):
+            raise HttpContractError("live_reclaim_reasons_invalid")
+
+    @property
+    def manual_reclaim_eligible(self) -> bool:
+        return not self.reasons
 
 
 def assess_live_reclaim(
@@ -359,4 +430,4 @@ def assess_live_reclaim(
         reasons.append("previous_transport_termination_unverified")
     if evidence.operator_review_reference is None:
         reasons.append("manual_recovery_review_missing")
-    return LiveReclaimAssessment(tuple(reasons), not reasons)
+    return LiveReclaimAssessment(tuple(reasons))
