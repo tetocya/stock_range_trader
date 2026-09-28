@@ -33,6 +33,7 @@ from feasibility.acquisition import (
     run_offline_fixture_acquisition,
     summarize,
 )
+from feasibility.http_transport import LocalhostHttpTransport
 from feasibility.paths import (
     UnsafeOutputPath,
     create_exclusive_dir,
@@ -368,12 +369,24 @@ class SpoofedTransport:
         raise AssertionError("spoofed transport reached")
 
 
+class HttpShapedTransport:
+    kind = "localhost_artificial"
+
+    def fetch(self, endpoint, params):  # pragma: no cover - must never be called
+        raise AssertionError("HTTP-shaped transport reached the offline runner")
+
+
 class SubclassedFixture(OfflineFixtureTransport):
     __slots__ = ()
 
 
 def test_spoofed_transport_is_refused_before_store_creation(tmp_path):
-    for impostor in (SpoofedTransport(), SubclassedFixture({})):
+    for impostor in (
+        SpoofedTransport(),
+        HttpShapedTransport(),
+        LocalhostHttpTransport("http://127.0.0.1:1"),
+        SubclassedFixture({}),
+    ):
         with pytest.raises(AcquisitionStopped, match="only_offline_fixture"):
             run_offline_fixture_acquisition(
                 tmp_path / "acq",
@@ -650,7 +663,7 @@ def test_summary_is_available_for_an_empty_store(tmp_path):
     assert summarize(store).requests == 0
 
 
-def test_feasibility_package_has_no_network_client_or_order_code():
+def test_only_dedicated_http_transport_may_import_network_code():
     forbidden = {
         "aiohttp",
         "httpx",
@@ -668,7 +681,17 @@ def test_feasibility_package_has_no_network_client_or_order_code():
                 names = [a.name.split(".")[0] for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module:
                 names = [node.module.split(".")[0]]
-            assert not set(names) & forbidden, f"{path.name}: {names}"
+            if path.name != "http_transport.py":
+                assert not set(names) & forbidden, f"{path.name}: {names}"
+            if path.name == "acquisition.py":
+                # The legacy fixture runner must not acquire a network path by
+                # importing the new, separately gated transport either.
+                imported = (
+                    [a.name for a in node.names] if isinstance(node, ast.Import) else []
+                )
+                if isinstance(node, ast.ImportFrom):
+                    imported += [node.module or "", *(a.name for a in node.names)]
+                assert not any("http_transport" in name for name in imported)
             if isinstance(node, ast.FunctionDef):
                 assert node.name not in {"place_order", "send_order", "submit_order"}
 
