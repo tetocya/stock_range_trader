@@ -217,6 +217,14 @@ def test_identity_rejects_secret_or_malformed_credential_reference(reference):
         identity(credential_reference=reference)
 
 
+def test_identity_credential_reference_env_name_length_boundary():
+    assert identity(credential_reference="env:" + "A" * 64).credential_reference == (
+        "env:" + "A" * 64
+    )
+    with pytest.raises(HttpContractError, match="credential_reference_invalid"):
+        identity(credential_reference="env:" + "A" * 65)
+
+
 @pytest.mark.parametrize(
     "root,reason",
     [
@@ -246,13 +254,24 @@ def test_identity_rejects_secret_or_malformed_credential_reference(reference):
         ),
         ("/tmp", "canonical_store_root_inside_forbidden_root"),
         ("/var/tmp/live", "canonical_store_root_inside_forbidden_root"),
+        ("/var/folders", "canonical_store_root_inside_forbidden_root"),
+        (
+            "/var/folders/example/T/live",
+            "canonical_store_root_inside_forbidden_root",
+        ),
         ("/private/tmp/live", "canonical_store_root_inside_forbidden_root"),
+        ("/private/var/tmp", "canonical_store_root_inside_forbidden_root"),
+        ("/private/var/tmp/live", "canonical_store_root_inside_forbidden_root"),
         ("/private/var/folders/jx/live", "canonical_store_root_inside_forbidden_root"),
     ],
 )
 def test_owner_store_root_rejects_noncanonical_or_plan_output_paths(root, reason):
     with pytest.raises(HttpContractError, match=reason):
         registry(canonical_store_root=root)
+
+
+def test_owner_managed_non_temporary_root_remains_accepted():
+    assert registry().canonical_store_root == LIVE_STORE_ROOT
 
 
 def test_operating_policy_fixes_account_wide_exclusive_use():

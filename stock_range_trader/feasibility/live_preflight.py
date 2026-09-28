@@ -30,7 +30,7 @@ LIVE_ACCOUNT_PREFLIGHT_SCHEMA = "historical-feasibility-live-account-preflight-v
 LIVE_LEDGER_FILENAME = "account-rate-ledger.sqlite3"
 
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
-_ENV_REFERENCE = re.compile(r"env:[A-Z_][A-Z0-9_]*\Z")
+_ENV_REFERENCE = re.compile(r"env:[A-Z_][A-Z0-9_]{0,63}\Z")
 
 
 def _canonical(value: object) -> str:
@@ -95,7 +95,9 @@ def _canonical_owner_store_root(value: object) -> str:
         HTTP_OUTPUT_ROOT.parent,
         Path("/tmp"),
         Path("/var/tmp"),
+        Path("/var/folders"),
         Path("/private/tmp"),
+        Path("/private/var/tmp"),
         Path("/private/var/folders"),
     )
     for forbidden in forbidden_roots:

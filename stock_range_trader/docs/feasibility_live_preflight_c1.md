@@ -25,9 +25,10 @@ M1, M4, M5, N2/N3 and the event/schema migration work are deliberately deferred 
 
 `LiveAccountIdentityRecord` is an owner-managed **claim**, not authentication proof.
 Its `credential_reference` must match `env:[A-Z_][A-Z0-9_]*` (for example
-`env:JQUANTS_API_KEY`). The contract never reads the environment variable. API keys,
-refresh tokens and secret material must not be persisted in the contract, ledger,
-receipt or log.
+`env:JQUANTS_API_KEY`), with an environment variable name of at most 64 characters.
+Only the `env:` scheme is supported. The contract never reads or stores the environment
+variable's secret value. API keys, refresh tokens and secret material must not be
+persisted in the contract, ledger, receipt or log.
 
 `LiveAccountIdentityRegistry` is a versioned, immutable owner snapshot with one
 `canonical_store_root`, a tuple of active identity records, `fixed_at` and a decision
@@ -45,8 +46,8 @@ No database path is supplied as an argument to this derivation. Different identi
 IDs or credential references for the same registry root and `account_ref` therefore resolve
 to the same ledger path. C1 rejects relative/non-normalized roots (including `//`, trailing
 slash, `/./` and duplicate slash), `/`, roots inside the current checkout or package, any
-part of `outputs/feasibility`, and standard `/tmp`, `/var/tmp`, `/private/tmp` and
-`/private/var/folders` temporary trees.
+part of `outputs/feasibility`, and standard `/tmp`, `/var/tmp`, `/var/folders`,
+`/private/tmp`, `/private/var/tmp` and `/private/var/folders` temporary trees.
 
 C1 proves uniqueness only **within one registry snapshot**. It does not authenticate that
 snapshot or prevent a caller from constructing another purported registry. I1 must persist
