@@ -109,6 +109,22 @@ and read; caller-supplied serialized parsed values must match. Current wall time
 is never consulted. Numeric length/range is checked before integer conversion.
 The automatic delta/date-delay limit is 86400 seconds, never a clipping target.
 
+M-C2-1 separates that automatic limit from known lower bounds. A syntactically
+valid delta above 86400 retains its exact `delay_seconds` with `out_of_range`
+classification when it fits both int64 and the remaining UTC datetime range at
+the fixed observation time. Digit count and lexical magnitude are checked before
+integer conversion. Thus 86401, 99999 and 100000 retain their full wait floors;
+manual review cannot shorten them. A valid future HTTP-date above the automatic
+limit likewise remains `out_of_range` and retains the absolute date as a floor.
+
+An unrepresentable delta (for example 1024 significant digits) is
+`capture_rejected`, with no numeric `delay_seconds` or fabricated server deadline.
+Bounded raw/diagnostic evidence and indefinite manual hold remain. A hold may
+still contain an independently known local rule floor: that is not a substitute
+interpretation of the unparsed server value. If a representable delta cannot be
+added to a later settlement timestamp without UTC overflow, deadline derivation
+fails closed rather than wrapping, clipping or silently losing the bound.
+
 HTTP dates support IMF-fixdate, obsolete RFC850 and asctime English forms, with
 UTC and calendar/weekday validation. RFC850's two-digit-year interpretation uses
 the fixed observation timestamp and the 50-year boundary, not today's date.
@@ -150,6 +166,18 @@ inconsistency hold additionally requires a repair reference. These are evidence
 contracts, not proof that the referenced human review or repair truly occurred.
 Open attempts or insufficient derived holds prevent release. Other active manual
 holds suppress automatic rule-release candidates.
+
+M-C2-2 binds every release (manual or rule-based) to the current hold snapshot.
+`LiveHold.hold_version_sha256` hashes its complete canonical content: ID, reason,
+source refs, deadline, mode, indefinite flag, policy SHA and recording time.
+`hold_released.data.expected_hold_sha256` is mandatory. Replay first locates the
+active hold and checks this hash, then evaluates deadlines and other release
+conditions. Extension changes the version; a release with the previous version
+fails with `live_hold_version_mismatch` even after the new deadline. Reopening
+reconstructs the same version. Missing version fields are rejected, not migrated.
+The hash identifies the reviewed content only: it does not authenticate the
+reviewer, approval, or the claim that a review actually occurred. C1's authenticity
+boundary is unchanged.
 
 ## Generation and reclaim
 
@@ -229,6 +257,26 @@ Store-owned UTC, durable projection checks, v2-path rejection and suitable capac
 controls. I2 must capture actual headers, atomically append both journal events
 and necessary holds, enforce ownership/timeout/monotonic budgets, close sockets
 on callback failure and test real crash positions with localhost fixtures.
+
+**L-C2-1 — mandatory I1/I2 coordination:** before any new account reservation,
+send or hold release, the future live Store/runner must reconcile **all related
+plan journals** with the account journal and require `consistent`. Account-only
+state is insufficient; `pending` or `inconsistent` prohibits sending/control
+authorization. Record `ledger_inconsistency` / `stale_generation` manual holds
+when warranted. C2's account-journal reducer operations alone never authorize a
+live send; this cross-journal execution interlock is not implemented in C2.
+
+**L-C2-5 — mandatory I2 write-before-send ordering:** persistent reservation
+must be followed by an atomic durable commit of both plan/account sent
+transitions, successful commit confirmation, and only then the first HTTP request
+byte. If sent evidence persistence fails, send no request. This prevents an
+actually sent request from becoming `pre_send_reclaim` after restart. The inverse
+crash window (sent evidence committed but no byte sent) remains conservatively
+sent/unknown, not inferred unsent. C2 does not implement this I/O ordering.
+
+Other Low findings are deliberately unchanged: L-C2-2 Unicode/bidi reference
+hardening, L-C2-3 global transition-ID uniqueness, L-C2-4 pure cross-check against
+the C1 preflight object, and L-C2-6 reason-code granularity.
 
 C3 retains M4 duplicate-body semantics, M5 physical output-root binding and N2
 quarantine/storage accounting. N3/N4 and remaining findings outside C2 are not

@@ -204,14 +204,22 @@ def settled(header=None, *, outcome="response", s=None, others=()):
     return p, a, b
 
 
-def release(account, *, at=None, hold_id=None, manual=None, repair=None):
+def release(
+    account, *, at=None, hold_id=None, manual=None, repair=None, expected_hash=None
+):
     at = t(606) if at is None else at
-    h = account.projection.holds[0].hold
+    h = next(
+        (s.hold for s in account.projection.holds if s.hold.hold_id == hold_id),
+        account.projection.holds[0].hold,
+    )
     return account.append(
         "hold_released",
         recorded_at=at,
         transition_id="release-" + str(len(account.records)),
         hold_id=hold_id or h.hold_id,
+        expected_hold_sha256=(
+            h.hold_version_sha256 if expected_hash is None else expected_hash
+        ),
         clock_reference="urn:artificial:clock-review",
         account_state_reference="urn:artificial:account-review",
         manual_review_reference=manual,
@@ -309,7 +317,7 @@ def test_sent_unknown_without_headers_is_manual_and_uses_unknown_lower_bound():
     [
         ((b"nonsense",), "malformed"),
         ((b"86401",), "out_of_range"),
-        ((b"9" * 1024,), "out_of_range"),
+        ((b"9" * 1024,), "capture_rejected"),
         ((b"600", b"900"), "duplicate_field"),
         ((b"600", b"\x00"), "capture_rejected"),
         ((b"9" * 5000,), "capture_rejected"),
@@ -1107,3 +1115,230 @@ def test_hold_sources_reject_invalid_types_and_duplicates_without_type_error(sou
     raw["source_refs"] = sources
     with pytest.raises(HttpContractError):
         LiveHold.from_dict(raw)
+
+
+@pytest.mark.parametrize("delay", [86400, 86401, 99999, 100000])
+@pytest.mark.parametrize("outcome", ["response", "unknown"])
+def test_bounded_long_retry_after_preserves_exact_floor_and_manual_rules(
+    delay, outcome
+):
+    h = observation(retry_after_fields=(str(delay),))
+    assert h.parsed.kind == ("delta_seconds" if delay == 86400 else "out_of_range")
+    assert h.parsed.delay_seconds == delay
+    p, a, b = settled(h, outcome=outcome)
+    hold = a.projection.holds[0].hold
+    deadline = t(6 + delay)  # settlement, not the earlier header timestamp
+    assert hold.not_before == deadline
+    assert hold.indefinite == (delay > 86400)
+    assert hold.release_mode == (
+        "manual" if delay > 86400 or outcome == "unknown" else "rule_based"
+    )
+    before = a.to_bytes()
+    for early in (t(125), deadline - MICRO):
+        with pytest.raises(HttpContractError, match="live_hold_known_wait_not_elapsed"):
+            release(a, at=early, manual="urn:review:current")
+        assert a.to_bytes() == before
+    a = LiveJournal.from_bytes(before, expected_schema=LIVE_ACCOUNT_SCHEMA)
+    assert a.projection.holds[0].hold.not_before == deadline
+    assessment = assess_live_restrictions(a, (p,), plan_sha=b.plan_sha, at=deadline)
+    if hold.release_mode == "manual":
+        assert not assessment.rule_release_candidates
+        with pytest.raises(HttpContractError, match="reference_invalid"):
+            release(a, at=deadline)
+    released = release(a, at=deadline, manual="urn:review:current")
+    assert released.projection.holds[0].released_at == deadline
+    assert reconcile_live_journals(released, (p,)).classification == "consistent"
+
+
+@pytest.mark.parametrize("raw", ["9" * 1024, str(2**63 - 1), "9" * 5000])
+def test_unrepresentable_retry_after_never_converts_unbounded_integer(raw, monkeypatch):
+    from feasibility import live_http_evidence as evidence
+
+    h = observation(retry_after_fields=(raw,))
+    calls = []
+
+    def bounded_int(value):
+        calls.append(value)
+        assert len(value) <= 19
+        return int(value)
+
+    # Patch only the pure parser's global int; no builtins or policy types change.
+    with monkeypatch.context() as m:
+        m.setattr(evidence, "int", bounded_int, raising=False)
+        parsed = h.parsed
+    assert not calls
+    assert parsed.kind == "capture_rejected"
+    assert parsed.delay_seconds is None and parsed.http_date is None
+    assert HeaderObservation.from_dict(h.to_dict()) == h
+    _, a, _ = settled(h)
+    hold = a.projection.holds[0].hold
+    assert hold.release_mode == "manual" and hold.indefinite
+    # 126 is only the independently known local 429 floor, NOT the raw value.
+    assert hold.not_before == t(126)
+    assert not h.parsed.delay_seconds
+
+
+def test_out_of_range_http_date_retains_absolute_floor_for_manual_release():
+    h = observation(retry_after_fields=("Thu, 01 Oct 2026 00:00:05 GMT",))
+    deadline = t(2 * 86400 + 5)
+    assert h.parsed.kind == "out_of_range"
+    assert h.parsed.http_date == stamp(deadline)
+    p, a, b = settled(h)
+    hold = a.projection.holds[0].hold
+    assert hold.indefinite and hold.release_mode == "manual"
+    assert hold.not_before == deadline
+    for early in (t(125), deadline - MICRO):
+        with pytest.raises(HttpContractError, match="known_wait_not_elapsed"):
+            release(a, at=early, manual="urn:review:date")
+    assert not assess_live_restrictions(
+        a, (p,), plan_sha=b.plan_sha, at=deadline
+    ).rule_release_candidates
+    assert (
+        release(a, at=deadline, manual="urn:review:date")
+        .projection.holds[0]
+        .released_at
+        == deadline
+    )
+
+
+def test_duplicate_600_fields_keep_floor_and_indefinite_manual_hold():
+    _, a, _ = settled(observation(retry_after_fields=("600", "600")))
+    hold = a.projection.holds[0].hold
+    assert hold.not_before == t(606)
+    assert hold.indefinite and hold.release_mode == "manual"
+    with pytest.raises(HttpContractError, match="known_wait_not_elapsed"):
+        release(a, at=t(125), manual="urn:review")
+    assert release(a, manual="urn:review").projection.holds[0].released_at == t(606)
+
+
+def test_exact_review_counterexample_86401_header_1_settlement_5_release_130():
+    p, a, b = opened()
+    p, a = paired(
+        p,
+        a,
+        b,
+        "attempt_reserved",
+        "slot_reserved",
+        t(),
+        "reserve",
+        reserved_at=stamp(t()),
+    )
+    p, a = paired(
+        p,
+        a,
+        b,
+        "attempt_sent",
+        "slot_sent",
+        t(),
+        "send",
+        sent_at=stamp(t()),
+    )
+    h = observation(observed_at=t(1), retry_after_fields=("86401",))
+    p, a = paired(
+        p,
+        a,
+        b,
+        "response_headers_observed",
+        "slot_headers_observed",
+        t(1),
+        "header",
+        observation=h.to_dict(),
+    )
+    a = hold_sync(a, b, t(1), "header-hold")
+    p, a = paired(
+        p,
+        a,
+        b,
+        "outcome_unknown",
+        "slot_settled",
+        t(5),
+        "unknown",
+        outcome="unknown",
+        status=None,
+        settled_at=stamp(t(5)),
+    )
+    a = hold_sync(a, b, t(5), "unknown-hold")
+    assert a.projection.holds[0].hold.not_before == t(86406)
+    with pytest.raises(HttpContractError, match="known_wait_not_elapsed"):
+        release(a, at=t(130), manual="urn:review:current")
+    assert release(a, at=t(86406), manual="urn:review:current").projection.holds[
+        0
+    ].released_at == t(86406)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"not_before": t(3605)},
+        {"source_refs": ("additional-source",)},
+        {"release_mode": "manual"},
+        {"release_mode": "manual", "indefinite": True},
+    ],
+)
+def test_hold_extension_rejects_stale_review_even_after_new_deadline(changes):
+    _, a, _ = settled()
+    old = a.projection.holds[0].hold
+    changes = dict(changes)
+    if "source_refs" in changes:
+        changes["source_refs"] = old.source_refs + changes["source_refs"]
+    # Same recording time isolates the changed content in the version identity.
+    new = replace(old, **changes)
+    assert new.hold_version_sha256 != old.hold_version_sha256
+    a = a.append(
+        "hold_extended",
+        recorded_at=new.recorded_at,
+        transition_id="extend-reviewed-hold",
+        hold=new.to_dict(),
+    )
+    data = a.to_bytes()
+    a = LiveJournal.from_bytes(data, expected_schema=LIVE_ACCOUNT_SCHEMA)
+    assert a.projection.holds[0].hold.hold_version_sha256 == new.hold_version_sha256
+    with pytest.raises(HttpContractError, match="live_hold_version_mismatch"):
+        release(
+            a,
+            at=t(3606),
+            manual="urn:review:v1",
+            expected_hash=old.hold_version_sha256,
+        )
+    assert a.to_bytes() == data
+    released = release(
+        a,
+        at=t(3606),
+        manual="urn:review:v2",
+        expected_hash=new.hold_version_sha256,
+    )
+    assert released.projection.holds[0].released_at == t(3606)
+    assert (
+        json.loads(released.records[-1])["event"]["data"]["expected_hold_sha256"]
+        == new.hold_version_sha256
+    )
+
+
+def test_current_hold_version_release_double_release_and_unknown_hold():
+    _, a, _ = settled(outcome="unknown")
+    hold = a.projection.holds[0].hold
+    released = release(a, manual="urn:review", expected_hash=hold.hold_version_sha256)
+    assert released.projection.holds[0].released_at == t(606)
+    with pytest.raises(HttpContractError, match="live_hold_not_active"):
+        release(released, manual="urn:review")
+    with pytest.raises(HttpContractError, match="live_hold_not_active"):
+        release(a, hold_id="unknown-hold", manual="urn:review")
+
+
+def test_release_requires_valid_current_hash_before_other_release_conditions():
+    _, a, _ = settled()
+    with pytest.raises(HttpContractError, match="live_hold_version_mismatch"):
+        release(a, at=t(125), expected_hash="0" * 64)
+    with pytest.raises(HttpContractError, match="digest_invalid"):
+        release(a, expected_hash=True)
+    with pytest.raises(HttpContractError, match="fields_invalid"):
+        a.append(
+            "hold_released",
+            recorded_at=t(606),
+            transition_id="missing-version",
+            hold_id=a.projection.holds[0].hold.hold_id,
+            clock_reference="urn:clock",
+            account_state_reference="urn:account",
+            manual_review_reference=None,
+            repair_reference=None,
+        )

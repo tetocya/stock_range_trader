@@ -370,13 +370,19 @@ class HeaderObservation:
         raw = self.raw_retry_after[0].strip(" ")
         if re.fullmatch(r"[0-9]+", raw):
             significant = raw.lstrip("0") or "0"
-            if len(significant) > 5:
-                return RetryAfterParse("out_of_range")
+            # Bound BEFORE int conversion. Retain exact values above the automatic
+            # wait limit only when both the integer and its UTC deadline fit.
+            remaining = datetime.max.replace(tzinfo=UTC) - _utc(self.observed_at)
+            maximum = str(min(MAX_INT64, remaining.days * 86400 + remaining.seconds))
+            if len(significant) > len(maximum) or (
+                len(significant) == len(maximum) and significant > maximum
+            ):
+                return RetryAfterParse("capture_rejected")
             value = int(significant)
             return (
                 RetryAfterParse("delta_seconds", value)
                 if value <= MAX_WAIT_SECONDS
-                else RetryAfterParse("out_of_range")
+                else RetryAfterParse("out_of_range", value)
             )
         at = _http_date(raw, _utc(self.observed_at))
         if at is None:
@@ -403,11 +409,15 @@ class HeaderObservation:
         deadline = max(_utc(anchor), _utc(self.observed_at))
         for raw in self.raw_retry_after:
             parsed = replace(self, raw_retry_after=(raw,), capture_issues=()).parsed
-            if parsed.kind == "delta_seconds":
+            if parsed.kind in {"delta_seconds", "out_of_range"} and (
+                parsed.delay_seconds is not None
+            ):
                 deadline = max(
                     deadline, _add(max(anchor, self.observed_at), parsed.delay_seconds)
                 )
-            elif parsed.kind == "http_date":
+            elif parsed.kind in {"http_date", "out_of_range"} and (
+                parsed.http_date is not None
+            ):
                 deadline = max(deadline, _time(parsed.http_date))
         return deadline
 
@@ -697,6 +707,11 @@ class LiveHold:
             "policy_sha": self.policy_sha,
             "recorded_at": _stamp(self.recorded_at),
         }
+
+    @property
+    def hold_version_sha256(self) -> str:
+        """Bind a release to this snapshot, without authenticating its review."""
+        return _hash(self.to_dict())
 
     @classmethod
     def from_dict(cls, raw: dict) -> LiveHold:
@@ -1146,6 +1161,7 @@ class _Reducer:
             data,
             {
                 "hold_id",
+                "expected_hold_sha256",
                 "clock_reference",
                 "account_state_reference",
                 "manual_review_reference",
@@ -1157,6 +1173,8 @@ class _Reducer:
         if state is None or state.released_at is not None:
             _fail("live_hold_not_active")
         hold = state.hold
+        if _digest_ref(data["expected_hold_sha256"]) != hold.hold_version_sha256:
+            _fail("live_hold_version_mismatch")
         if hold.not_before is not None and at < hold.not_before:
             _fail("live_hold_known_wait_not_elapsed")
         _text(data["clock_reference"])
