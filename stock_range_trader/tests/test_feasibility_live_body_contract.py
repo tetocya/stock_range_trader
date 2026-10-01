@@ -1089,3 +1089,154 @@ def test_old_c2_prefix_cannot_hide_generation_already_advanced_before_commit():
     result = s.result()
     assert result.classification == "inconsistent"
     assert "c3_historical_generation_already_superseded" in result.reasons
+
+
+def sent_without_writer(outcome=None):
+    """Model a crash window: C2 advanced, but no C3 writer event was recorded."""
+    s = Scenario().begin()
+    at = s.tick()
+    s.pair("attempt_sent", "slot_sent", at, sent_at=stamp(at))
+    if outcome is not None:
+        s.received(outcome)
+    return s
+
+
+def test_writer_evidence_not_required_for_presend_reservation():
+    s = Scenario().begin()
+    before = s.j.to_bytes()
+    assert s.j.object(s.oid).writer.state == "not_started"
+    assert s.a.projection.attempt(s.b.plan_sha, s.b.attempt_id).sent_at is None
+    assert s.result().classification == "consistent"
+    assert "writer_evidence_missing" not in s.result().reasons
+    assert s.j.to_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "outcome", [None, "response", "unknown"], ids=["sent", "complete-200", "unknown"]
+)
+def test_sent_without_writer_is_pending_and_next_reservation_rejected(outcome):
+    s = sent_without_writer(outcome)
+    assert s.j.object(s.oid).writer.state == "not_started"
+    before = s.j.to_bytes()
+    result = s.result()
+    assert result.classification == "pending"
+    assert "writer_evidence_missing" in result.reasons
+    assert not result.live_send_permitted
+    assert not result.live_acquisition_permitted
+    if outcome is None:
+        # C2 still has an open attempt. Prove C3 rejects at its own gate first.
+        with pytest.raises(HttpContractError, match="c3_reservation_pending"):
+            s.j.reserve(
+                s.identity,
+                at=s.tick(),
+                operation_id="next-body",
+                account=s.a,
+                plans=(s.p,),
+            )
+    else:
+        if outcome == "unknown":
+            assert any(
+                h.hold.release_mode == "manual" and h.released_at is None
+                for h in s.a.projection.holds
+            )
+        # The fixture explicitly reviews/releases C2's hold and creates a new
+        # valid C2 reservation. Missing C3 evidence must still block its body.
+        with pytest.raises(HttpContractError, match="c3_reservation_pending"):
+            s.begin()
+        assert s.a.projection.attempt(s.b.plan_sha, s.b.attempt_id).state == "reserved"
+    assert s.j.to_bytes() == before  # gate and reconciliation are nonmutating
+    assert s.j.projection.unresolved_acquisition_charge == 100
+
+
+def test_writer_missing_is_detected_from_one_sided_plan_send():
+    s = Scenario().begin()
+    at = s.tick()
+    s.p = s.p.append(
+        "attempt_sent",
+        recorded_at=at,
+        transition_id="one-sided-send",
+        binding=s.b,
+        sent_at=stamp(at),
+    )
+    result = s.result()
+    assert result.classification == "pending"
+    assert "writer_evidence_missing" in result.reasons
+
+
+@pytest.mark.parametrize("state", ["open", "closed", "stable"])
+def test_missing_writer_evidence_recovery_requires_close_and_measurement(state):
+    s = sent_without_writer("response")
+    assert "writer_evidence_missing" in s.result().reasons
+    w = WriterEvidence(s.b, "recovered-writer", "open", s.tick(), 0)
+    s.j = s.j.writer(s.oid, w, operation_id="recovered-open")
+    assert "writer_evidence_missing" not in s.result().reasons
+    if state in {"closed", "stable"}:
+        s.closed()
+    if state == "stable":
+        s.stabilized(size=0, digest=hashlib.sha256(b"").hexdigest())
+        assert s.result().classification == "consistent"
+        assert not s.j.projection.unstable
+        s.begin()  # no other constraints: the next body reservation is possible
+        assert len(s.j.projection.objects) == 2
+    else:
+        assert s.j.projection.unstable
+        assert s.result().classification == "pending"
+        with pytest.raises(HttpContractError, match="c3_reservation_pending"):
+            s.begin()
+
+
+@pytest.mark.parametrize(
+    "output_dir",
+    [
+        str(HTTP_OUTPUT_ROOT),
+        "/tmp/x",
+        "/var/tmp/x",
+        "/etc/x",
+        str(HTTP_OUTPUT_ROOT.parents[2]),
+        "/Users/example/stock_range_trader",
+        "/opt/outside/x",
+        str(HTTP_OUTPUT_ROOT) + "-lookalike/c3-artificial",
+        str(HTTP_OUTPUT_ROOT / "c3-artificial" / "nested"),
+        str(HTTP_OUTPUT_ROOT / "different-artifact"),
+    ],
+)
+def test_snapshot_rejects_output_outside_dedicated_plan_directory(output_dir):
+    raw = contract().plan.content
+    raw["output_dir"] = output_dir
+    text = canonical(raw)
+    # Rehash intentionally: validation must reject the boundary, not a stale hash.
+    with pytest.raises(
+        HttpContractError, match="output_dir_outside_dedicated_http_root"
+    ):
+        FixedPlanSnapshot(text, hashlib.sha256(text.encode()).hexdigest())
+
+
+def test_snapshot_valid_dedicated_root_is_pure_even_when_constructed_directly(
+    monkeypatch,
+):
+    from pathlib import Path
+
+    c = contract()
+    raw = c.plan.content
+    raw["artifact_id"] = "another-dedicated-plan"
+    raw["output_dir"] = str(HTTP_OUTPUT_ROOT / raw["artifact_id"])
+    text = canonical(raw)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("C3 snapshot performed filesystem lookup")
+
+    with monkeypatch.context() as m:
+        for method in ("exists", "resolve", "stat", "is_symlink"):
+            m.setattr(Path, method, forbidden)
+        direct = FixedPlanSnapshot(text, hashlib.sha256(text.encode()).hexdigest())
+        assert direct.content["output_dir"] == raw["output_dir"]
+        assert FixedPlanSnapshot.from_bytes(direct.to_bytes()) == direct
+
+
+@pytest.mark.parametrize("artifact_id", ["../x", "/tmp/x", "nested/x", "", True])
+def test_snapshot_rejects_invalid_dedicated_artifact_name(artifact_id):
+    raw = contract().plan.content
+    raw["artifact_id"] = artifact_id
+    text = canonical(raw)
+    with pytest.raises(HttpContractError, match="artifact_id_invalid"):
+        FixedPlanSnapshot(text, hashlib.sha256(text.encode()).hexdigest())

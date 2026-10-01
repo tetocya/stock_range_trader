@@ -16,7 +16,12 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from typing import ClassVar, get_args, get_origin, get_type_hints
 
-from .http_contract import PLAN_SCHEMA, HttpAcquisitionPlan, HttpContractError
+from .http_contract import (
+    HTTP_OUTPUT_ROOT,
+    PLAN_SCHEMA,
+    HttpAcquisitionPlan,
+    HttpContractError,
+)
 from .live_http_evidence import (
     AttemptBinding,
     LiveJournal,
@@ -301,6 +306,19 @@ class FixedPlanSnapshot(Value):
             "plan_snapshot_mismatch",
         )
         _path(raw["output_dir"])
+        # Match the legacy dedicated-directory rule without invoking its
+        # filesystem checks. Neither containment nor a valid hash is enough
+        # when the directory does not belong to this exact artifact ID.
+        artifact_id = raw["artifact_id"]
+        _require(
+            type(artifact_id) is str
+            and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", artifact_id),
+            "artifact_id_invalid",
+        )
+        _require(
+            raw["output_dir"] == str(HTTP_OUTPUT_ROOT) + "/" + artifact_id,
+            "output_dir_outside_dedicated_http_root",
+        )
         _text(raw["account_ref"])
         _require(
             _parse_time(raw["not_before"]) < _parse_time(raw["expires_at"]),
@@ -1391,6 +1409,27 @@ def _reconcile_one(
                 (pending if current.classification == "pending" else reasons).extend(
                     current.reasons
                 )
+            # not_started is only safe before C2 send. Inspect the latest
+            # evidence (including a one-sided plan send), not just the older
+            # C2 prefix referenced by the original body reservation. Absence
+            # of a writer event must never be interpreted as proof of no FD.
+            latest_attempts = (
+                *account.projection.attempts,
+                *(attempt for p in plans for attempt in p.projection.attempts),
+            )
+            for obj in projection.objects:
+                if obj.writer.state == "not_started" and any(
+                    attempt.key
+                    == (obj.identity.binding.plan_sha, obj.identity.binding.attempt_id)
+                    and (
+                        attempt.sent_at is not None
+                        or attempt.send_transition is not None
+                        or attempt.state in {"response_received", "unknown"}
+                        or attempt.outcome in {"response", "unknown"}
+                    )
+                    for attempt in latest_attempts
+                ):
+                    pending.append("writer_evidence_missing")
             for event in operations.values():
                 if event.c2_heads is None:
                     continue

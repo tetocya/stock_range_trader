@@ -69,6 +69,15 @@ validated plan, not a second plan-authoring validator or approval authenticator.
 Journal loading requires an externally expected contract and physical-root
 claim; a self-consistent hash alone is not an external trust anchor.
 
+Direct construction and decoding also enforce the legacy **lexical** output
+boundary: `output_dir` must equal `HTTP_OUTPUT_ROOT/<artifact_id>`, and the
+artifact ID must satisfy the existing dedicated-name grammar. The root itself,
+another artifact's directory, nested subdirectories, temporary paths, checkout
+roots and absolute paths outside that dedicated directory are rejected even
+with a recomputed, matching plan hash. This comparison uses the existing constant
+as a string; it performs no exists/resolve/stat/realpath or worktree lookup.
+It does not prove physical root identity or owner-approval authenticity.
+
 There is no caller-supplied body-root argument. The fixed layout is:
 
 ```text
@@ -116,6 +125,39 @@ Writer evidence binds the C2 attempt, holder and generation, writer/session ID,
 state, observation time/size, close/termination reference, and optional lease or
 reclaim reference. Stale generation does not imply a closed OS file descriptor.
 The same applies to an old FD after rename or hard-link/unlink quarantine.
+
+`not_started` is a safe pre-send claim only while the corresponding C2 attempt
+is still reserved and unsent. Once either current C2 journal has sent evidence
+(`sent_at` or send transition), or has progressed to response/unknown settlement,
+`not_started` means **writer evidence missing**, not proof that no writer existed.
+Reconciliation returns `pending` with `writer_evidence_missing`; new body
+reservation is rejected, including when this object belongs to a related plan.
+A one-sided C2 send remains pending too. Existing C2 unknown/manual holds are not
+released or rewritten by this check.
+
+The standalone C3 projection has no C2 input, so its `unstable` field alone is
+not an admission decision. The existing reservation entry always reconciles
+current C2 evidence and all related body journals. No event/schema fields were
+added for this cross-journal reason code. A pre-send reserved/not_started object
+remains legal. Adding open evidence clears the missing-evidence reason but still
+blocks on instability; close alone is insufficient until post-close recount and
+rehash stabilize the object. Other holds and budgets still apply.
+
+### I2/I3 writer-open write-ahead requirement
+
+The future physical implementation must persist writer-open evidence **before**
+creating or enabling a writable staging writer:
+
+1. Persist body reservation.
+2. Allocate writer identity/session.
+3. Durably commit writer-open evidence to the authoritative plan/body Store.
+4. Confirm that commit succeeded.
+5. Open the staging file.
+6. Begin body byte writes.
+
+If writer-open evidence cannot be persisted, do not open a staging writer or
+write body bytes. This minimizes the crash window in which an actual open writer
+appears as not_started. C3 only specifies this ordering; it does not implement I/O.
 
 Finalization requires declared evidence in this order:
 
@@ -301,6 +343,12 @@ atomic persistent updates, complete inventory, filesystem fencing and HTTP
 streaming integration. C2 Low findings L-C2-2/3/4/6/7 remain; stricter new C3
 inputs do not retroactively fix C2. Other legacy/external-account/authenticity
 findings remain outside this change.
+
+L-C3-2 remains open: C3 v1 has no contradiction event for physical evidence that
+disproves an earlier closed/stable claim (for example a stale FD writes again).
+I3 must fail closed and stop new reservations on such a discovery. A future
+versioned schema may add contradiction events; this limited fix does not add one
+or treat the physical problem as resolved.
 
 All BodyAssessment permission flags are `init=False`, permanently false:
 live send, live acquisition, verified identity and implemented Store. There is
