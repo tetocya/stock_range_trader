@@ -8,9 +8,11 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import test_feasibility_live_body_contract as body_fixture
 from test_feasibility_live_body_contract import NOW, Scenario, canonical, stamp
 from test_feasibility_live_plan_enrollment import sources
 
+from feasibility import http_contract, live_body_contract, live_plan_enrollment
 from feasibility.http_contract import HttpContractError
 from feasibility.live_body_contract import (
     BodyEvent,
@@ -511,32 +513,69 @@ def test_unknown_account_schema_has_no_fallback():
         _heads(forged, (s.p,))
 
 
-def test_v1_golden_bytes_receipt_projection_and_hashes_unchanged():
-    # Captured on fixed base f614538 before any production modification.
-    s = Scenario().begin().complete()
-    expected = {
-        "contract": "661dba71bba715003a943460f9a6a3561e29dd6cef9a405efc363264e5c2ea98",
-        "root": "2ecfa4a88e3157fa368d0d7b3235b46651091b907690cca8a108ebf3f3cf852a",
-        "journal": "52052859fe5cc8c7c620085849f6bb95e34053aa118bddeeba784af0e3b0b50f",
-        "receipt": "3c36a34e8d466cc271153b3849afae2bc7c7ca3f21ab136518ce5795e6867fb2",
-        "projection": "847aed68925bfcf5b29a841fac598db98b41bfdc2f586cab1d9967c1f3f588c2",
-        "result": "1fec4a83ffac24782b71252f2c3c7850b1ea6042948eba56bdcbc2674019cf1e",
-    }
-    values = dict(
-        contract=s.c,
-        root=s.root,
-        journal=s.j,
-        receipt=s.j.object(s.oid).receipt,
-        projection=s.j.projection,
-        result=s.result(),
-    )
-    for name, value in values.items():
-        assert hashlib.sha256(value.to_bytes()).hexdigest() == expected[name]
-    assert (
-        s.j.head_sha
-        == "5c8fb13880cdb74686b5230d2f37bbbbcdc6e9cd633bd229072fe2cdca852400"
-    )
-    assert all(json.loads(line)["schema"].endswith("-v1") for line in s.j.records)
+def pin_golden_http_output_root(monkeypatch):
+    """Pin imported aliases before construction; never inspect/create this path."""
+    root = Path("/__stock_range_trader_golden__/http-output")
+    for module in (
+        http_contract,
+        live_plan_enrollment,
+        live_body_contract,
+        body_fixture,
+    ):
+        monkeypatch.setattr(module, "HTTP_OUTPUT_ROOT", root)
+
+    # The legacy plan constructor checks symlinks. Supply an artificial claim
+    # only for this fixture's path/ancestors, without weakening production code.
+    output = root / "c3-artificial"
+    allowed = (output, *output.parents)
+
+    def synthetic_non_symlink(path):
+        assert path in allowed, "unexpected path in golden fixture"
+        return False
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("golden fixture must not access the filesystem")
+
+    monkeypatch.setattr(Path, "is_symlink", synthetic_non_symlink)
+    for name in ("resolve", "stat", "lstat", "exists", "mkdir", "touch", "open"):
+        monkeypatch.setattr(Path, name, forbidden)
+    monkeypatch.setattr(builtins, "open", forbidden)
+    return root
+
+
+def test_v1_golden_bytes_receipt_projection_and_hashes_unchanged(monkeypatch):
+    # Fixed digests captured once from unchanged production C3 using
+    # /__stock_range_trader_golden__/http-output, not the checkout's real path.
+    # Expected values must never be recomputed from the runtime fixture.
+    with monkeypatch.context() as pinned:
+        root = pin_golden_http_output_root(pinned)
+        s = Scenario().begin().complete()
+        assert s.c.plan.content["output_dir"] == str(root / "c3-artificial")
+        assert s.c.root == str(root / "c3-artificial" / "live-body-v1")
+        assert s.root.canonical_realpath == s.c.root
+        expected = {
+            "contract": "4b21e43d9b28c70227a22278dc49328ec98096db6f794c486c533961a8557379",
+            "root": "81498f29023d1f5d5f11e76a3c23f13d7748e0f4517b943f2280039a4f1acc37",
+            "journal": "f56aff527b082a36848d801c220dce8bbd911a12877bcf652758ba8cb72a56f0",
+            "receipt": "469f4245d996334ccd89c1ff94033dda7155ada336246c93a9dfc638f13b799a",
+            "projection": "a7d2093331d35102342e67d83a06793297a4fa70d82783546acdda65352554e1",
+            "result": "1fec4a83ffac24782b71252f2c3c7850b1ea6042948eba56bdcbc2674019cf1e",
+        }
+        values = dict(
+            contract=s.c,
+            root=s.root,
+            journal=s.j,
+            receipt=s.j.object(s.oid).receipt,
+            projection=s.j.projection,
+            result=s.result(),
+        )
+        for name, value in values.items():
+            assert hashlib.sha256(value.to_bytes()).hexdigest() == expected[name]
+        assert (
+            s.j.head_sha
+            == "3625483fb31a53bd0bfe25fd8c156d6a1af0825022ba38f7da75e0618592a522"
+        )
+        assert all(json.loads(line)["schema"].endswith("-v1") for line in s.j.records)
 
 
 def test_v2_body_saved_schema_and_roundtrip_are_still_v1():
