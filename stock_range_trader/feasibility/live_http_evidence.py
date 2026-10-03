@@ -23,6 +23,8 @@ from .live_preflight import LiveClockPolicy, LiveReclaimEvidence, assess_live_re
 
 LIVE_PLAN_SCHEMA = "historical-feasibility-live-plan-journal-v1"
 LIVE_ACCOUNT_SCHEMA = "historical-feasibility-live-account-rate-ledger-v1"
+LIVE_ACCOUNT_SCHEMA_V1 = LIVE_ACCOUNT_SCHEMA
+LIVE_ACCOUNT_SCHEMA_V2 = "historical-feasibility-live-account-rate-ledger-v2"
 LIVE_HEADER_SCHEMA = "historical-feasibility-live-header-observation-v1"
 MAX_EVENT_BYTES = 32 * 1024
 MAX_INT64 = (1 << 63) - 1
@@ -1195,8 +1197,198 @@ class _Reducer:
         self.holds[hold_id] = replace(state, released_at=at)
 
 
+@dataclass(frozen=True)
+class LiveAccountAuthority:
+    """Account-wide claims fixed at v2 opening; not authenticated identity."""
+
+    account_ref: str
+    preflight_sha: str
+    account_policy: AccountRatePolicy
+    clock_policy: LiveClockPolicy
+
+    def __post_init__(self) -> None:
+        _label(self.account_ref)
+        _digest_ref(self.preflight_sha)
+        if (
+            type(self.account_policy) is not AccountRatePolicy
+            or type(self.clock_policy) is not LiveClockPolicy
+        ):
+            _fail("live_authority_policy_required")
+        self.clock_policy.validate_rate_policy(self.account_policy)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> LiveAccountAuthority:
+        _keys(raw, {f.name for f in fields(cls)})
+        return cls(
+            raw["account_ref"],
+            raw["preflight_sha"],
+            AccountRatePolicy(
+                **_keys(
+                    raw["account_policy"], {f.name for f in fields(AccountRatePolicy)}
+                )
+            ),
+            LiveClockPolicy(
+                **_keys(raw["clock_policy"], {f.name for f in fields(LiveClockPolicy)})
+            ),
+        )
+
+    def matches(self, scope: LivePlanScope) -> bool:
+        return (
+            self.account_ref,
+            self.preflight_sha,
+            self.account_policy,
+            self.clock_policy,
+        ) == (
+            scope.account_ref,
+            scope.preflight_sha,
+            scope.account_policy,
+            scope.clock_policy,
+        )
+
+
+@dataclass(frozen=True)
+class PlanEnrollment:
+    scope: LivePlanScope
+    initial_head: str
+    prior_plan_heads: tuple[tuple[str, str], ...]
+    transition_id: str
+    recorded_at: datetime
+    previous_account_head: str
+    account_enrollment_head: str
+
+
+@dataclass(frozen=True)
+class LiveAccountProjectionV2(LiveProjection):
+    opened: bool
+    authority: LiveAccountAuthority | None
+    enrollment_revision: int
+    enrollments: tuple[PlanEnrollment, ...]
+
+
+def require_enrollment_idle(projection: LiveProjection) -> None:
+    """Holds alone are legal; unresolved unknown recovery and open slots are not."""
+    if any(
+        a.state in {"reserved", "sent", "headers_observed"} for a in projection.attempts
+    ):
+        _fail("plan_enrollment_in_flight")
+    for attempt in projection.attempts:
+        if attempt.outcome == "unknown":
+            required = required_attempt_hold(
+                projection.scope(attempt.binding.plan_sha), attempt
+            )
+            state = next(
+                (
+                    s
+                    for s in projection.holds
+                    if required and s.hold.hold_id == required.hold_id
+                ),
+                None,
+            )
+            if state is None or state.released_at is None:
+                _fail("plan_enrollment_unknown_recovery_pending")
+
+
+class _AccountReducerV2(_Reducer):
+    """Explicitly separate opening/enrollment semantics; v1 reducer is unchanged."""
+
+    def __init__(self) -> None:
+        super().__init__(LIVE_ACCOUNT_SCHEMA_V1)
+        self.opened = False
+        self.authority: LiveAccountAuthority | None = None
+        self.enrollments: list[PlanEnrollment] = []
+        self.previous_hash = ZERO_HASH
+        self.event_hash = ZERO_HASH
+
+    def projection(self) -> LiveAccountProjectionV2:
+        return LiveAccountProjectionV2(
+            self.scopes,
+            tuple(self.attempts.values()),
+            tuple(self.holds.values()),
+            self.generation,
+            self.opened,
+            self.authority,
+            len(self.enrollments),
+            tuple(self.enrollments),
+        )
+
+    def apply(self, event: dict) -> None:
+        _keys(event, {"kind", "transition_id", "recorded_at", "binding", "data"})
+        kind = event["kind"]
+        if type(kind) is not str or kind not in _ACCOUNT_KINDS | {"plan_enrolled"}:
+            _fail("live_event_unknown")
+        transition = _label(event["transition_id"])
+        at = _time(event["recorded_at"])
+        if self.last_at is not None and at < self.last_at:
+            _fail("live_recorded_clock_regressed")
+        if kind not in {"ledger_opened", "plan_enrolled"}:
+            if not self.opened or not self.scopes:
+                _fail("live_plan_scope_unknown")
+            if any(
+                t == transition and k == "plan_enrolled" for k, t in self.transitions
+            ):
+                _fail("live_transition_reused")
+            super().apply(event)
+            return
+        if event["binding"] is not None:
+            _fail("plan_enrollment_binding_mismatch")
+        if any(t == transition for _, t in self.transitions):
+            _fail("live_transition_reused")
+        if kind == "ledger_opened":
+            if self.opened:
+                _fail("live_duplicate_open")
+            _keys(event["data"], {"authority"})
+            self.authority = LiveAccountAuthority.from_dict(event["data"]["authority"])
+            self.opened = True
+        else:
+            if not self.opened:
+                _fail("live_open_event_required")
+            data = _keys(
+                event["data"],
+                {"scope", "plan_journal_initial_head", "prior_plan_heads"},
+            )
+            scope = LivePlanScope.from_dict(data["scope"])
+            if not self.authority.matches(scope):
+                _fail("plan_enrollment_binding_mismatch")
+            if scope.plan_sha in {s.plan_sha for s in self.scopes}:
+                _fail("plan_already_enrolled")
+            if not scope.not_before <= at < scope.expires_at:
+                _fail("plan_enrollment_outside_validity_window")
+            require_enrollment_idle(self.projection())
+            if not _holds_cover(self.projection()):
+                _fail("plan_enrollment_reconciliation_required")
+            raw = data["prior_plan_heads"]
+            if type(raw) is not list:
+                _fail("plan_enrollment_prior_heads_mismatch")
+            pairs = []
+            for item in raw:
+                _keys(item, {"plan_sha", "head"})
+                pairs.append((_digest_ref(item["plan_sha"]), _digest_ref(item["head"])))
+            if [p[0] for p in pairs] != sorted(s.plan_sha for s in self.scopes):
+                _fail("plan_enrollment_prior_heads_mismatch")
+            initial = _digest_ref(data["plan_journal_initial_head"])
+            self.enrollments.append(
+                PlanEnrollment(
+                    scope,
+                    initial,
+                    tuple(pairs),
+                    transition,
+                    at,
+                    self.previous_hash,
+                    self.event_hash,
+                )
+            )
+            self.scopes = tuple(sorted((*self.scopes, scope), key=lambda s: s.plan_sha))
+        self.transitions.add((kind, transition))
+        self.last_at = at
+
+
 def _replay(schema: str, records: tuple[str, ...]) -> LiveProjection:
-    reducer = _Reducer(schema)
+    reducer = (
+        _AccountReducerV2() if schema == LIVE_ACCOUNT_SCHEMA_V2 else _Reducer(schema)
+    )
     if type(records) is not tuple or not records:
         _fail("live_journal_records_required")
     previous = ZERO_HASH
@@ -1224,6 +1416,9 @@ def _replay(schema: str, records: tuple[str, ...]) -> LiveProjection:
             _fail("live_journal_hash_mismatch")
         if _canonical(record) != line:
             _fail("live_journal_noncanonical_record")
+        if isinstance(reducer, _AccountReducerV2):
+            reducer.previous_hash = previous
+            reducer.event_hash = digest
         reducer.apply(record["event"])
         previous = digest
     return reducer.projection()
@@ -1238,6 +1433,35 @@ class LiveJournal:
 
     def __post_init__(self) -> None:
         _replay(self.schema, self.records)
+
+    @classmethod
+    def create_account_v2(
+        cls,
+        authority: LiveAccountAuthority,
+        *,
+        recorded_at: datetime,
+        transition_id: str = "opened",
+    ) -> LiveJournal:
+        if type(authority) is not LiveAccountAuthority:
+            _fail("live_account_authority_required")
+        event = {
+            "kind": "ledger_opened",
+            "recorded_at": _stamp(recorded_at),
+            "transition_id": transition_id,
+            "binding": None,
+            "data": {"authority": authority.to_dict()},
+        }
+        return cls(
+            LIVE_ACCOUNT_SCHEMA_V2,
+            (cls._record(LIVE_ACCOUNT_SCHEMA_V2, 0, ZERO_HASH, event),),
+        )
+
+    def prefix(self, head: str) -> LiveJournal:
+        _digest_ref(head)
+        for index, line in enumerate(self.records):
+            if json.loads(line)["event_hash"] == head:
+                return LiveJournal(self.schema, self.records[: index + 1])
+        _fail("live_journal_head_unknown")
 
     @classmethod
     def create(
@@ -1310,7 +1534,11 @@ class LiveJournal:
 
     @classmethod
     def from_bytes(cls, data: bytes, *, expected_schema: str) -> LiveJournal:
-        if expected_schema not in {LIVE_PLAN_SCHEMA, LIVE_ACCOUNT_SCHEMA}:
+        if expected_schema not in {
+            LIVE_PLAN_SCHEMA,
+            LIVE_ACCOUNT_SCHEMA_V1,
+            LIVE_ACCOUNT_SCHEMA_V2,
+        }:
             _fail("live_journal_schema_mismatch")
         if type(data) is not bytes or not data.endswith(b"\n"):
             _fail("live_journal_incomplete_tail")
@@ -1335,14 +1563,17 @@ class LiveReconciliation:
     store_implemented: bool = field(default=False, init=False)
 
 
-def reconcile_live_journals(
+def _reconcile_attempt_journals(
     account: LiveJournal,
     plan_journals: tuple[LiveJournal, ...],
     *,
     claimed_projection: LiveProjection | None = None,
 ) -> LiveReconciliation:
     """Compare matching attempts and transition IDs, never repair one-sided evidence."""
-    if type(account) is not LiveJournal or account.schema != LIVE_ACCOUNT_SCHEMA:
+    if type(account) is not LiveJournal or account.schema not in {
+        LIVE_ACCOUNT_SCHEMA_V1,
+        LIVE_ACCOUNT_SCHEMA_V2,
+    }:
         _fail("live_account_journal_required")
     if type(plan_journals) is not tuple or any(
         type(p) is not LiveJournal or p.schema != LIVE_PLAN_SCHEMA
@@ -1461,16 +1692,82 @@ def reconcile_live_journals(
     if not pending and not _holds_cover(ap):
         reasons.append("hold_projection_mismatch")
     if claimed_projection is not None:
-        if type(claimed_projection) is not LiveProjection:
+        if type(claimed_projection) is not type(ap):
             _fail("live_projection_required")
         if claimed_projection.generation != ap.generation:
             reasons.append("generation_projection_mismatch")
         if claimed_projection.holds != ap.holds:
             reasons.append("hold_projection_mismatch")
+        if account.schema == LIVE_ACCOUNT_SCHEMA_V2 and claimed_projection != ap:
+            reasons.append("enrollment_projection_mismatch")
     classification = (
         "inconsistent" if reasons else ("pending" if pending else "consistent")
     )
     return LiveReconciliation(classification, tuple(sorted(set(reasons + pending))))
+
+
+def _reconcile_enrollments(
+    account: LiveJournal, plans: tuple[LiveJournal, ...]
+) -> list[str]:
+    reasons: list[str] = []
+    by_sha = {p.projection.scopes[0].plan_sha: p for p in plans}
+    enrolled = {s.plan_sha for s in account.projection.scopes}
+    if enrolled - by_sha.keys():
+        reasons.append("plan_enrollment_missing_journal")
+    if by_sha.keys() - enrolled:
+        reasons.append("plan_journal_not_enrolled")
+    for item in account.projection.enrollments:
+        plan = by_sha.get(item.scope.plan_sha)
+        if plan is None:
+            continue
+        first = json.loads(plan.records[0])
+        event = first["event"]
+        if first["event_hash"] != item.initial_head:
+            reasons.append("plan_enrollment_initial_head_mismatch")
+        if plan.projection.scopes != (item.scope,):
+            reasons.append("plan_enrollment_binding_mismatch")
+        if event["transition_id"] != item.transition_id:
+            reasons.append("plan_enrollment_transition_mismatch")
+        if _time(event["recorded_at"]) != item.recorded_at:
+            reasons.append("plan_enrollment_time_mismatch")
+        try:
+            prior = tuple(
+                by_sha[sha].prefix(head) for sha, head in item.prior_plan_heads
+            )
+            if any(
+                _time(json.loads(p.records[-1])["event"]["recorded_at"])
+                > item.recorded_at
+                for p in prior
+            ):
+                reasons.append("plan_enrollment_prior_heads_mismatch")
+            prefix = account.prefix(item.previous_account_head)
+            if (
+                _reconcile_attempt_journals(prefix, prior).classification
+                != "consistent"
+            ):
+                reasons.append("plan_enrollment_prior_heads_mismatch")
+        except (KeyError, HttpContractError):
+            reasons.append("plan_enrollment_prior_heads_mismatch")
+    return reasons
+
+
+def reconcile_live_journals(
+    account: LiveJournal,
+    plan_journals: tuple[LiveJournal, ...],
+    *,
+    claimed_projection: LiveProjection | None = None,
+) -> LiveReconciliation:
+    """Version-aware completeness and paired evidence, without repair or fallback."""
+    result = _reconcile_attempt_journals(
+        account, plan_journals, claimed_projection=claimed_projection
+    )
+    if account.schema == LIVE_ACCOUNT_SCHEMA_V2:
+        reasons = _reconcile_enrollments(account, plan_journals)
+        if reasons:
+            return LiveReconciliation(
+                "inconsistent", tuple(sorted(set((*result.reasons, *reasons))))
+            )
+    return result
 
 
 @dataclass(frozen=True)
@@ -1551,7 +1848,7 @@ def check_body_generation(account: LiveJournal, binding: AttemptBinding) -> None
     """Only a pure prerequisite check. It cannot commit or authorize a body."""
     if (
         type(account) is not LiveJournal
-        or account.schema != LIVE_ACCOUNT_SCHEMA
+        or account.schema not in {LIVE_ACCOUNT_SCHEMA_V1, LIVE_ACCOUNT_SCHEMA_V2}
         or type(binding) is not AttemptBinding
     ):
         _fail("live_body_generation_inputs_invalid")
