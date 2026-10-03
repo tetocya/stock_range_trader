@@ -309,6 +309,88 @@ Self-consistent hash chains and caller-provided evidence do not authenticate an
 owner, account, filesystem or external receipt. Independent anchoring is still
 required in later work.
 
+## C2 enrollment compatibility
+
+| C2 account | Plan | C3 body/storage | Status |
+| --- | --- | --- | --- |
+| live account v1 | live plan v1 | body v1 | Supported; existing semantics retained |
+| live account v2 | live plan v1 | body v1 | Supported by the enrollment compatibility tests |
+| unknown account schema | live plan v1 | body v1 | Rejected by the C2 reader/reconciliation path |
+
+This compatibility work is test-first on fixed base
+`f6145384e5db56dbaa55af0e4790abf6de3e7962`. The new artificial suite has
+35 passing cases without any production C3 changes. Initial test failures were
+test setup/API expectation errors, not production compatibility defects.
+All persisted C3 schemas remain v1. No event, receipt or historical-head fields
+were added or reinterpreted. A representative existing account-v1 scenario pins
+the contract, root, journal, receipt, projection and assessment canonical byte
+digests plus the final event hash. Existing C3 tests remain applicable.
+
+### Historical causality versus current completeness
+
+At H0, an account-v2 opening has no plans and no plan-specific C3 journal.
+There is no fictitious global empty-body object. After enrolling A at H1,
+an empty A body journal with valid contract/root binding is sufficient. A can
+then reserve, acquire and commit under account v2 at H2.
+
+After B is enrolled at H3, `_historical_c2` reconstructs the account prefix and
+only the plan prefixes saved in each H2 event's `C2Heads`. Those historical
+prefixes require A, not B. B is not retroactively added to old events or receipts.
+This remains true when the A event and B enrollment share the same UTC
+microsecond: saved chain heads identify the relevant prefixes.
+
+Current reconciliation at H3 is separate. It requires both current C2 plan
+journals and both C3 body journals. B's empty journal counts as present only with
+valid contract/root binding. Omitting either body journal yields `pending` with
+`required_related_body_journal_missing`; it does not corrupt A's historical
+events. A prepared but unenrolled C is not required. Supplying it is inconsistent
+(`unrelated_body_journal`). Duplicate journals and shared A/B body roots remain
+rejected. This models an enrolled set, not an implemented I1 catalog or activation.
+
+New C3 events use `_heads` against all supplied current C2 journals: supplying
+the current A+B account with only A's plan journal fails closed. Missing or
+corrupt enrollment pairs, opening heads, transitions, times and prior-head
+claims propagate C2 pending/inconsistent classifications; C3 does not promote
+them to consistent. `_scope_check` still checks plan SHA, preflight SHA,
+account reference, both window boundaries and retry rules. The success fixtures
+use approval windows equal to the fixed plan windows; compatibility does not
+relax the existing exact-window check for narrower approval claims.
+
+### Generation and writer evidence
+
+Enrollment revision is not request generation. Enrolling B leaves generation 1
+unchanged, so A's still-current object can be committed with both current plan
+heads. Reserving a subsequent request advances generation and rejects a new
+commit from A's older generation. A previously committed receipt remains valid
+historical evidence. Known newer request evidence cannot be hidden by selecting
+old prefixes for a later body event: the existing
+`c3_historical_generation_already_superseded` check remains in effect.
+
+C2 sent/settled evidence with a C3 writer still `not_started` remains pending
+(`writer_evidence_missing`), including after later enrollment. One-sided C2 send
+evidence remains pending as well. All permission flags remain false.
+
+### Pure-layer limits and handoff
+
+A caller can supply an entirely old, internally consistent account-and-plan
+snapshot. The pure API cannot discover a newer authoritative Store head that was
+not supplied. A test demonstrates that such an input can form a proposal, not a
+current-state authorization. I1 must load and compare authoritative current
+heads under its atomic transaction before accepting any new operation; historical
+audit prefixes must not substitute for that current snapshot.
+
+`PhysicalRootIdentity` is still a claim. These tests perform no inode/device
+measurement, custody verification, activation, HTTP or credential access. A
+guarded reconciliation test traps selected Path/open, socket, getenv and
+time.time entry points. It does not prove physical Store safety.
+
+L-EN-1 (stale-prior-head diagnostics), L-EN-2 (formal plan-count limit) and
+L-EN-3 (Store operation receipts) remain open. No measured plan-count limit is
+hard-coded here. L-C2-2/3/4/6/7 and L-C3-2 also remain open. This compatibility
+commit alone does not authorize I1a: independent review, CI and normal merge of
+the compatibility PR are still required before the next implementation stage.
+Live acquisition and Formal Real OOS remain prohibited.
+
 ## Tests and later physical verification
 
 Dedicated tests cover the requested 32 cases and additional boundaries: duplicate
@@ -322,6 +404,9 @@ Local verification commands (no live opt-in):
 
 ```text
 python -m pytest -q tests/test_feasibility_live_body_contract.py
+python -m pytest -q tests/test_feasibility_live_body_enrollment_compatibility.py
+python -m pytest -q tests/test_feasibility_live_plan_enrollment.py
+python -m pytest -q tests/test_feasibility_live_http_evidence.py
 python -m pytest -q tests/test_feasibility_*.py
 python -m pytest -q
 ruff check .
