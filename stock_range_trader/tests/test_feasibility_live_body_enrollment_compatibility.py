@@ -1,0 +1,576 @@
+"""Test-first C3 v1 / C2 account v2 compatibility; artificial evidence only."""
+
+import builtins
+import hashlib
+import json
+from dataclasses import replace
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+from test_feasibility_live_body_contract import NOW, Scenario, canonical, stamp
+from test_feasibility_live_plan_enrollment import sources
+
+from feasibility.http_contract import HttpContractError
+from feasibility.live_body_contract import (
+    BodyEvent,
+    FixedPlanSnapshot,
+    LiveBodyJournal,
+    LiveBodyReceipt,
+    LiveBodyStorageContract,
+    PhysicalRootIdentity,
+    StoragePolicy,
+    _heads,
+    _historical_c2,
+    reconcile_live_bodies,
+)
+from feasibility.live_http_evidence import (
+    LIVE_PLAN_SCHEMA,
+    AttemptBinding,
+    LiveAccountAuthority,
+    LiveJournal,
+    check_body_generation,
+    reconcile_live_journals,
+)
+from feasibility.live_plan_enrollment import (
+    authority_from_preflight,
+    propose_plan_enrollment,
+)
+
+
+def source(name):
+    return sources(name, not_before=NOW, expires_at=NOW + timedelta(hours=1))
+
+
+def body(src, inode=2):
+    c = LiveBodyStorageContract(
+        FixedPlanSnapshot.from_plan(src["plan"]),
+        src["preflight"].sha256,
+        StoragePolicy(100, 1000, 1000, 1000, 10000),
+    )
+    root = PhysicalRootIdentity(
+        c.root_binding_sha,
+        "owner-store-claim",
+        c.root,
+        1,
+        inode,
+        "mount-claim",
+        1,
+        NOW,
+        "physical-observation-claim",
+    )
+    return LiveBodyJournal(c, root)
+
+
+class EnrolledScenario(Scenario):
+    """Reuse unchanged C3 writer/response fixtures, with genuine enrollment pairs."""
+
+    def __init__(self):
+        self.src = source("compat-a")
+        authority = authority_from_preflight(
+            self.src["preflight"], canonical_preflight=self.src["canonical_preflight"]
+        )
+        self.h0 = LiveJournal.create_account_v2(authority, recorded_at=NOW)
+        proposal = propose_plan_enrollment(
+            self.h0,
+            (),
+            expected_account_head=self.h0.head_sha,
+            operation_id="enroll-a",
+            at=NOW,
+            **self.src,
+        )
+        self.a, self.p = proposal.account, proposal.plan
+        self.h1 = self.a
+        self.scope = self.p.projection.scopes[0]
+        self.j = body(self.src)
+        self.c, self.root = self.j.contract, self.j.root
+        self.n = self.index = 0
+        self.pb = self.jb = None
+
+    @property
+    def plans(self):
+        return (self.p,) if self.pb is None else (self.p, self.pb)
+
+    @property
+    def related(self):
+        return () if self.jb is None else (self.jb,)
+
+    def enroll_b(self, same_time=False, src=None):
+        self.h2 = self.a
+        self.old_body_bytes = self.j.to_bytes()
+        self.src_b = src or source("compat-b")
+        when = NOW + timedelta(seconds=self.n) if same_time else self.tick()
+        proposal = propose_plan_enrollment(
+            self.a,
+            (self.p,),
+            expected_account_head=self.a.head_sha,
+            operation_id="enroll-b",
+            at=when,
+            **self.src_b,
+        )
+        self.a, self.pb = proposal.account, proposal.plan
+        self.jb = body(self.src_b, 3)
+        return self
+
+    def result(self, **kwargs):
+        values = dict(account=self.a, plans=self.plans, related_bodies=self.related)
+        values.update(kwargs)
+        return reconcile_live_bodies(self.j, **values)
+
+    def committed(self, next_cursor=None):
+        self.j = self.j.commit(
+            self.oid,
+            next_cursor=next_cursor,
+            at=self.tick(),
+            operation_id=f"commit-{self.index}",
+            account=self.a,
+            plans=self.plans,
+            related_bodies=self.related,
+        )
+        return self
+
+    def reserve_b_attempt(self):
+        for state in self.a.projection.holds:
+            if state.released_at is None:
+                self.n = max(self.n, int((state.hold.not_before - NOW).total_seconds()))
+                self.a = self.a.append(
+                    "hold_released",
+                    recorded_at=self.tick(),
+                    transition_id="release-b-" + state.hold.hold_id,
+                    hold_id=state.hold.hold_id,
+                    expected_hold_sha256=state.hold.hold_version_sha256,
+                    clock_reference="clock",
+                    account_state_reference="state",
+                    manual_review_reference="review",
+                    repair_reference=None,
+                )
+        scope = self.pb.projection.scopes[0]
+        b = AttemptBinding(
+            scope.plan_sha,
+            scope.preflight_sha,
+            scope.account_ref,
+            scope.approval_sha,
+            "attempt-b",
+            "slot-b",
+            "holder-b",
+            self.a.projection.generation + 1,
+        )
+        when = self.tick()
+        self.pb = self.pb.append(
+            "attempt_reserved",
+            recorded_at=when,
+            transition_id="reserve-b",
+            binding=b,
+            reserved_at=stamp(when),
+        )
+        self.a = self.a.append(
+            "slot_reserved",
+            recorded_at=when,
+            transition_id="reserve-b",
+            binding=b,
+            reserved_at=stamp(when),
+        )
+        return self
+
+
+def prepared_complete():
+    return (
+        EnrolledScenario()
+        .begin()
+        .opened()
+        .observed()
+        .received()
+        .closed()
+        .stabilized()
+        .acquired()
+    )
+
+
+def test_empty_account_needs_no_fictitious_global_body():
+    s = EnrolledScenario()
+    assert s.h0.projection.scopes == ()
+    assert reconcile_live_journals(s.h0, ()).classification == "consistent"
+    assert s.h1.projection.enrollment_revision == 1
+    assert s.j.records == ()
+    assert s.result().classification == "consistent"
+
+
+def test_v2_reservation_complete_and_commit():
+    s = EnrolledScenario().begin()
+    assert s.j.object(s.oid).state == "reserved"
+    assert s.result().classification == "consistent"
+    s.complete()
+    assert s.j.object(s.oid).state == "committed"
+    assert s.result().classification == "consistent"
+    check_body_generation(s.a, s.b)
+    assert (
+        not s.result().live_send_permitted and not s.result().live_acquisition_permitted
+    )
+
+
+@pytest.mark.parametrize("same_time", [False, True])
+def test_old_events_require_historical_a_but_current_requires_a_b(same_time):
+    s = EnrolledScenario().begin().complete()
+    old_events = tuple(BodyEvent.from_dict(json.loads(r)["event"]) for r in s.j.records)
+    receipt_bytes = s.j.object(s.oid).receipt.to_bytes()
+    s.enroll_b(same_time=same_time)
+    assert s.j.to_bytes() == s.old_body_bytes
+    assert s.jb.records == ()
+    assert s.j.object(s.oid).receipt.to_bytes() == receipt_bytes
+    for event in old_events:
+        if event.c2_heads is None:
+            continue
+        old_account, old_plans = _historical_c2(event.c2_heads, s.a, s.plans)
+        assert {p.projection.scopes[0].plan_sha for p in old_plans} == {
+            s.scope.plan_sha
+        }
+        assert {scope.plan_sha for scope in old_account.projection.scopes} == {
+            s.scope.plan_sha
+        }
+        assert _heads(old_account, old_plans) == event.c2_heads
+        assert (
+            reconcile_live_journals(old_account, old_plans).classification
+            == "consistent"
+        )
+    assert len(s.a.projection.scopes) == 2
+    assert s.result().classification == "consistent"
+    assert "c3_historical_generation_already_superseded" not in s.result().reasons
+    assert s.a.projection.generation == s.h2.projection.generation == 1
+    assert s.a.projection.enrollment_revision == s.h2.projection.enrollment_revision + 1
+    check_body_generation(s.a, s.b)
+
+
+@pytest.mark.parametrize("side", ["a", "b"])
+def test_current_missing_body_is_pending_not_historical_corruption(side):
+    s = EnrolledScenario().begin().complete().enroll_b()
+    journal = s.j if side == "a" else s.jb
+    result = reconcile_live_bodies(journal, account=s.a, plans=s.plans)
+    assert result.classification == "pending"
+    assert result.reasons == ("required_related_body_journal_missing",)
+
+
+def test_prepared_c_not_required_but_supplied_unrelated_c_rejected():
+    s = EnrolledScenario().begin().complete().enroll_b()
+    c = body(source("compat-c"), 4)
+    assert c.contract.plan.plan_sha not in {p.plan_sha for p in s.a.projection.scopes}
+    assert s.result().classification == "consistent"
+    result = s.result(related_bodies=(s.jb, c))
+    assert result.classification == "inconsistent"
+    assert "unrelated_body_journal" in result.reasons
+
+
+def test_duplicate_body_rejected():
+    s = EnrolledScenario().enroll_b()
+    with pytest.raises(HttpContractError, match="duplicate_body_journal"):
+        s.result(related_bodies=(s.jb, s.j))
+
+
+def test_different_plans_same_dedicated_root_still_rejected():
+    s = EnrolledScenario()
+    other = sources(
+        "compat-a",
+        not_before=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        limits=replace(s.src["plan"].limits, max_attempts=9),
+    )
+    s.enroll_b(src=other)
+    assert s.j.contract.root == s.jb.contract.root
+    assert s.scope.plan_sha != s.pb.projection.scopes[0].plan_sha
+    result = s.result()
+    assert result.classification == "inconsistent"
+    assert "different_plans_share_body_root" in result.reasons
+
+
+def test_empty_b_requires_valid_root_binding():
+    s = EnrolledScenario().enroll_b()
+    assert s.result().classification == "consistent"
+    with pytest.raises(HttpContractError, match="root"):
+        LiveBodyJournal(s.jb.contract, s.j.root)
+
+
+def test_current_c2_cannot_omit_b_even_while_evaluating_a():
+    s = prepared_complete().enroll_b()
+    result = s.result(plans=(s.p,))
+    assert result.classification == "inconsistent"
+    assert "plan_enrollment_missing_journal" in result.reasons
+    with pytest.raises(HttpContractError, match="c2_inconsistent"):
+        _heads(s.a, (s.p,))
+    with pytest.raises(HttpContractError, match="commit_inconsistent"):
+        s.j.commit(
+            s.oid,
+            next_cursor=None,
+            at=s.tick(),
+            operation_id="incomplete-plans",
+            account=s.a,
+            plans=(s.p,),
+            related_bodies=s.related,
+        )
+
+
+def test_wholly_old_snapshot_is_pure_limit_not_current_authority():
+    s = prepared_complete()
+    old_account, old_plan = s.a, s.p
+    s.enroll_b()
+    # A pure function cannot discover that BOTH supplied values are stale.
+    # I1 must compare locked current heads before accepting this proposal.
+    claimed = s.j.commit(
+        s.oid,
+        next_cursor=None,
+        at=s.tick(),
+        operation_id="old-snapshot-claim",
+        account=old_account,
+        plans=(old_plan,),
+    )
+    assert claimed.object(s.oid).receipt.c2_heads.account_head == old_account.head_sha
+    assert old_account.head_sha != s.a.head_sha
+    assert len(s.a.projection.scopes) == 2
+
+
+def test_new_commit_after_enrollment_records_all_current_heads():
+    s = prepared_complete().enroll_b()
+    old_records = s.j.records
+    s.committed()
+    receipt = s.j.object(s.oid).receipt
+    assert receipt.c2_heads == _heads(s.a, s.plans)
+    assert len(receipt.c2_heads.plan_heads) == 2
+    assert s.j.records[:-1] == old_records
+    assert s.a.projection.generation == 1
+    assert s.result().classification == "consistent"
+
+
+def test_later_real_generation_rejects_new_commit_but_keeps_old_receipt():
+    s = prepared_complete().enroll_b().reserve_b_attempt()
+    assert s.a.projection.generation == 2
+    with pytest.raises(HttpContractError, match="stale_generation"):
+        s.committed()
+    s = EnrolledScenario().begin().complete().enroll_b()
+    receipt = s.j.object(s.oid).receipt.to_bytes()
+    s.reserve_b_attempt()
+    assert s.j.object(s.oid).receipt.to_bytes() == receipt
+    assert s.result().classification == "consistent"
+
+
+def test_backdated_account_prefix_cannot_hide_known_newer_generation():
+    s = prepared_complete()
+    before = s.j
+    s.committed()
+    event = BodyEvent.from_dict(json.loads(s.j.records[-1])["event"])
+    s.j = before
+    s.enroll_b().reserve_b_attempt()
+    when = s.tick()
+    receipt = LiveBodyReceipt.from_dict(json.loads(event.payload_json))
+    event = replace(
+        event,
+        recorded_at=when,
+        payload_json=canonical(replace(receipt, committed_at=when).to_dict()),
+    )
+    s.j = s.j.append(event)
+    result = s.result()
+    assert result.classification == "inconsistent"
+    assert "c3_historical_generation_already_superseded" in result.reasons
+
+
+@pytest.mark.parametrize("outcome", ["response", "unknown"])
+def test_v2_sent_without_writer_is_pending(outcome):
+    s = EnrolledScenario().begin()
+    when = s.tick()
+    s.pair("attempt_sent", "slot_sent", when, sent_at=stamp(when))
+    s.received(outcome=outcome)
+    if outcome == "response":
+        s.enroll_b()
+    result = s.result()
+    assert result.classification == "pending"
+    assert "writer_evidence_missing" in result.reasons
+    assert not result.live_send_permitted
+
+
+def test_current_pending_send_pair_is_not_promoted():
+    s = EnrolledScenario().begin()
+    when = s.tick()
+    s.p = s.p.append(
+        "attempt_sent",
+        recorded_at=when,
+        transition_id="one-sided-send",
+        binding=s.b,
+        sent_at=stamp(when),
+    )
+    result = s.result()
+    assert result.classification == "pending"
+    assert "pending_send_pair" in result.reasons
+    assert "writer_evidence_missing" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "field", ["account", "preflight", "window", "expiry", "retry", "plan"]
+)
+def test_v2_scope_check_not_relaxed(field):
+    s = EnrolledScenario()
+    scope = s.scope
+    if field == "account":
+        scope = replace(scope, account_ref="wrong-account")
+    if field == "preflight":
+        scope = replace(scope, preflight_sha="f" * 64)
+    if field == "window":
+        scope = replace(scope, not_before=NOW + timedelta(seconds=1))
+    if field == "expiry":
+        scope = replace(scope, expires_at=scope.expires_at - timedelta(seconds=1))
+    if field == "retry":
+        scope = replace(scope, retry=replace(scope.retry, max_attempts_per_page=2))
+    if field == "plan":
+        scope = replace(scope, plan_sha="e" * 64)
+    auth = LiveAccountAuthority(
+        scope.account_ref, scope.preflight_sha, scope.account_policy, scope.clock_policy
+    )
+    account = LiveJournal.create_account_v2(auth, recorded_at=NOW)
+    when = NOW + timedelta(seconds=2)
+    plan = LiveJournal.create(
+        LIVE_PLAN_SCHEMA, (scope,), recorded_at=when, transition_id="different-opening"
+    )
+    account = account.append(
+        "plan_enrolled",
+        recorded_at=when,
+        transition_id="different-opening",
+        scope=scope.to_dict(),
+        plan_journal_initial_head=plan.head_sha,
+        prior_plan_heads=[],
+    )
+    assert reconcile_live_journals(account, (plan,)).classification == "consistent"
+    result = s.result(account=account, plans=(plan,))
+    assert result.classification == "inconsistent"
+    assert any("scope" in r for r in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "damage", ["initial", "transition", "time", "prior", "plan_only", "account_only"]
+)
+def test_enrollment_pair_corruption_propagates(damage):
+    s = EnrolledScenario().begin().complete()
+    old_account = s.a
+    s.enroll_b()
+    if damage == "account_only":
+        plans = (s.p,)
+    elif damage == "plan_only":
+        s.a = old_account
+        plans = s.plans
+    elif damage in {"transition", "time"}:
+        s.pb = LiveJournal.create(
+            LIVE_PLAN_SCHEMA,
+            s.pb.projection.scopes,
+            recorded_at=NOW + timedelta(seconds=s.n + (damage == "time")),
+            transition_id="wrong" if damage == "transition" else "enroll-b",
+        )
+        plans = s.plans
+    else:
+        raw = json.loads(s.a.records[-1])["event"]["data"]
+        if damage == "initial":
+            raw["plan_journal_initial_head"] = s.p.head_sha
+        if damage == "prior":
+            raw["prior_plan_heads"][0]["head"] = "f" * 64
+        s.a = old_account.append(
+            "plan_enrolled",
+            recorded_at=NOW + timedelta(seconds=s.n),
+            transition_id="enroll-b",
+            **raw,
+        )
+        plans = s.plans
+    c2 = reconcile_live_journals(s.a, plans)
+    assert c2.classification == "inconsistent"
+    result = s.result(plans=plans)
+    assert result.classification == "inconsistent"
+    assert set(c2.reasons).issubset(result.reasons)
+
+
+def test_stale_prior_head_safety_without_claiming_l_en_1_fixed():
+    s = EnrolledScenario().begin().complete()
+    opening = s.p.records[:1]
+    before = s.a
+    s.enroll_b()
+    data = json.loads(s.a.records[-1])["event"]["data"]
+    data["prior_plan_heads"][0]["head"] = LiveJournal(
+        LIVE_PLAN_SCHEMA, opening
+    ).head_sha
+    s.a = before.append(
+        "plan_enrolled",
+        recorded_at=NOW + timedelta(seconds=s.n),
+        transition_id="enroll-b",
+        **data,
+    )
+    assert reconcile_live_journals(s.a, s.plans).classification != "consistent"
+    assert s.result().classification != "consistent"
+
+
+def test_unknown_account_schema_has_no_fallback():
+    s = EnrolledScenario()
+    with pytest.raises(HttpContractError, match="schema_mismatch"):
+        LiveJournal.from_bytes(s.a.to_bytes(), expected_schema="unknown-account-v2")
+    # Deliberately corrupt an otherwise frozen in-memory claim; C2 reader still
+    # rejects it. This is not a supported constructor for unknown schemas.
+    forged = replace(s.a)
+    object.__setattr__(forged, "schema", "unknown-account-v2")
+    with pytest.raises(HttpContractError, match="live_account_journal_required"):
+        _heads(forged, (s.p,))
+
+
+def test_v1_golden_bytes_receipt_projection_and_hashes_unchanged():
+    # Captured on fixed base f614538 before any production modification.
+    s = Scenario().begin().complete()
+    expected = {
+        "contract": "661dba71bba715003a943460f9a6a3561e29dd6cef9a405efc363264e5c2ea98",
+        "root": "2ecfa4a88e3157fa368d0d7b3235b46651091b907690cca8a108ebf3f3cf852a",
+        "journal": "52052859fe5cc8c7c620085849f6bb95e34053aa118bddeeba784af0e3b0b50f",
+        "receipt": "3c36a34e8d466cc271153b3849afae2bc7c7ca3f21ab136518ce5795e6867fb2",
+        "projection": "847aed68925bfcf5b29a841fac598db98b41bfdc2f586cab1d9967c1f3f588c2",
+        "result": "1fec4a83ffac24782b71252f2c3c7850b1ea6042948eba56bdcbc2674019cf1e",
+    }
+    values = dict(
+        contract=s.c,
+        root=s.root,
+        journal=s.j,
+        receipt=s.j.object(s.oid).receipt,
+        projection=s.j.projection,
+        result=s.result(),
+    )
+    for name, value in values.items():
+        assert hashlib.sha256(value.to_bytes()).hexdigest() == expected[name]
+    assert (
+        s.j.head_sha
+        == "5c8fb13880cdb74686b5230d2f37bbbbcdc6e9cd633bd229072fe2cdca852400"
+    )
+    assert all(json.loads(line)["schema"].endswith("-v1") for line in s.j.records)
+
+
+def test_v2_body_saved_schema_and_roundtrip_are_still_v1():
+    s = EnrolledScenario().begin().complete().enroll_b()
+    for value in (s.c, s.root, s.j.object(s.oid).receipt, s.j.projection):
+        assert value.schema.endswith("-v1")
+        assert type(value).from_bytes(value.to_bytes()).to_bytes() == value.to_bytes()
+    decoded = LiveBodyJournal.from_bytes(
+        s.j.to_bytes(), expected_contract=s.c, expected_root=s.root
+    )
+    assert decoded.to_bytes() == s.j.to_bytes()
+    assert decoded.projection == s.j.projection
+    assert (
+        reconcile_live_bodies(
+            decoded, account=s.a, plans=s.plans, related_bodies=s.related
+        )
+        == s.result()
+    )
+
+
+def test_reconciliation_uses_no_io_or_real_clock(monkeypatch):
+    s = EnrolledScenario().begin().complete().enroll_b()
+    import os
+    import socket
+    import time
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("I/O forbidden")
+
+    for name in ("exists", "resolve", "stat", "open"):
+        monkeypatch.setattr(Path, name, forbidden)
+    monkeypatch.setattr(builtins, "open", forbidden)
+    monkeypatch.setattr(os, "getenv", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(time, "time", forbidden)
+    assert s.result().classification == "consistent"
+    assert not s.result().live_send_permitted
