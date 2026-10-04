@@ -24,9 +24,12 @@ from feasibility.live_body_contract import (
     StoragePolicy,
     _heads,
     _historical_c2,
+    _scope_check,
     reconcile_live_bodies,
 )
 from feasibility.live_http_evidence import (
+    LIVE_ACCOUNT_SCHEMA_V1,
+    LIVE_ACCOUNT_SCHEMA_V2,
     LIVE_PLAN_SCHEMA,
     AttemptBinding,
     LiveAccountAuthority,
@@ -67,8 +70,16 @@ def body(src, inode=2):
 class EnrolledScenario(Scenario):
     """Reuse unchanged C3 writer/response fixtures, with genuine enrollment pairs."""
 
-    def __init__(self):
+    def __init__(self, *, approval_start=None, approval_end=None):
         self.src = source("compat-a")
+        approval = replace(
+            self.src["approval"],
+            valid_from=approval_start or self.src["plan"].not_before,
+            valid_until=approval_end or self.src["plan"].expires_at,
+        )
+        self.src.update(
+            approval=approval, canonical_approval=canonical(approval.to_dict())
+        )
         authority = authority_from_preflight(
             self.src["preflight"], canonical_preflight=self.src["canonical_preflight"]
         )
@@ -78,7 +89,7 @@ class EnrolledScenario(Scenario):
             (),
             expected_account_head=self.h0.head_sha,
             operation_id="enroll-a",
-            at=NOW,
+            at=max(NOW, approval.valid_from),
             **self.src,
         )
         self.a, self.p = proposal.account, proposal.plan
@@ -86,7 +97,8 @@ class EnrolledScenario(Scenario):
         self.scope = self.p.projection.scopes[0]
         self.j = body(self.src)
         self.c, self.root = self.j.contract, self.j.root
-        self.n = self.index = 0
+        self.n = int((max(NOW, approval.valid_from) - NOW).total_seconds())
+        self.index = 0
         self.pb = self.jb = None
 
     @property
@@ -186,6 +198,222 @@ def prepared_complete():
         .stabilized()
         .acquired()
     )
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        (NOW, NOW + timedelta(hours=1)),
+        (NOW + timedelta(minutes=30), NOW + timedelta(hours=1)),
+        (NOW, NOW + timedelta(minutes=45)),
+        (NOW + timedelta(minutes=30), NOW + timedelta(minutes=45)),
+        (NOW + timedelta(microseconds=1), NOW + timedelta(hours=1)),
+        (NOW, NOW + timedelta(hours=1, microseconds=-1)),
+    ],
+    ids=["exact", "start-narrow", "end-narrow", "both-narrow", "start-us", "end-us"],
+)
+def test_scope_window_genuine_v2_enrollment_reservation_and_commit(start, end):
+    s = EnrolledScenario(approval_start=start, approval_end=end)
+    assert s.a.schema == LIVE_ACCOUNT_SCHEMA_V2
+    assert (s.scope.not_before, s.scope.expires_at) == (start, end)
+    assert s.scope.approval_sha == s.src["approval"].sha256
+    assert reconcile_live_journals(s.a, s.plans).classification == "consistent"
+    assert s.result().classification == "consistent"
+    s.begin().complete()
+    assert s.j.object(s.oid).state == "committed"
+    result = s.result()
+    assert result.classification == "consistent"
+    assert not any(
+        (
+            result.live_send_permitted,
+            result.live_acquisition_permitted,
+            result.identity_verified,
+            result.store_implemented,
+        )
+    )
+
+
+@pytest.mark.parametrize("schema", [LIVE_ACCOUNT_SCHEMA_V1, LIVE_ACCOUNT_SCHEMA_V2])
+@pytest.mark.parametrize("start_offset,end_offset", [(0, 0), (1, 0), (0, -1), (1, -1)])
+def test_scope_window_schema_policy(schema, start_offset, end_offset):
+    s = EnrolledScenario()
+    scope = replace(
+        s.scope,
+        not_before=s.scope.not_before + timedelta(seconds=start_offset),
+        expires_at=s.scope.expires_at + timedelta(seconds=end_offset),
+    )
+    at = NOW + timedelta(seconds=2)
+    plan = LiveJournal.create(
+        LIVE_PLAN_SCHEMA, (scope,), recorded_at=at, transition_id="opening"
+    )
+    if schema == LIVE_ACCOUNT_SCHEMA_V1:
+        account = LiveJournal.create(schema, (scope,), recorded_at=at)
+    else:
+        account = s.h0.append(
+            "plan_enrolled",
+            recorded_at=at,
+            transition_id="opening",
+            scope=scope.to_dict(),
+            plan_journal_initial_head=plan.head_sha,
+            prior_plan_heads=[],
+        )
+    assert reconcile_live_journals(account, (plan,)).classification == "consistent"
+    result = s.result(account=account, plans=(plan,))
+    if schema == LIVE_ACCOUNT_SCHEMA_V1 and (start_offset or end_offset):
+        assert result.classification == "inconsistent"
+        assert result.reasons == ("c3_c2_scope_mismatch",)
+    else:
+        assert result.classification == "consistent"
+
+
+@pytest.mark.parametrize("side", ["start", "end"])
+def test_scope_window_outside_approval_rejected_by_genuine_builder(side):
+    start = NOW - timedelta(microseconds=1) if side == "start" else NOW
+    end = NOW + timedelta(hours=1, microseconds=1 if side == "end" else 0)
+    with pytest.raises(HttpContractError, match="^approval_outside_validity_window$"):
+        EnrolledScenario(approval_start=start, approval_end=end)
+
+
+@pytest.mark.parametrize("delta", [0, -1])
+def test_scope_window_empty_or_inverted_rejected_by_c2_value(delta):
+    s = EnrolledScenario()
+    with pytest.raises(HttpContractError, match="^live_scope_window_invalid$"):
+        replace(s.scope, expires_at=s.scope.not_before + timedelta(microseconds=delta))
+
+
+@pytest.mark.parametrize(
+    "boundary,delta,valid",
+    [("start", -1, False), ("start", 0, True), ("end", -1, True), ("end", 0, False)],
+)
+def test_scope_window_genuine_enrollment_is_half_open(boundary, delta, valid):
+    s = EnrolledScenario(
+        approval_start=NOW + timedelta(minutes=30),
+        approval_end=NOW + timedelta(minutes=45),
+    )
+    at = (
+        s.scope.not_before if boundary == "start" else s.scope.expires_at
+    ) + timedelta(microseconds=delta)
+    args = dict(
+        expected_account_head=s.h0.head_sha, operation_id="boundary", at=at, **s.src
+    )
+    before = s.h0.to_bytes()
+    if valid:
+        result = propose_plan_enrollment(s.h0, (), **args)
+        assert (
+            reconcile_live_journals(result.account, (result.plan,)).classification
+            == "consistent"
+        )
+        assert (
+            s.result(account=result.account, plans=(result.plan,)).classification
+            == "consistent"
+        )
+    else:
+        with pytest.raises(
+            HttpContractError, match="^approval_outside_validity_window$"
+        ):
+            propose_plan_enrollment(s.h0, (), **args)
+    assert s.h0.to_bytes() == before
+
+
+def narrow_scenario():
+    return EnrolledScenario(
+        approval_start=NOW + timedelta(minutes=30),
+        approval_end=NOW + timedelta(minutes=45),
+    )
+
+
+def test_scope_window_narrow_history_current_and_generation():
+    s = narrow_scenario().begin().complete()
+    old_bytes = s.j.to_bytes()
+    receipt_bytes = s.j.object(s.oid).receipt.to_bytes()
+    s.enroll_b()
+    assert s.j.to_bytes() == old_bytes
+    assert s.result().classification == "consistent"
+    assert s.a.projection.generation == 1
+    assert s.a.projection.enrollment_revision == 2
+    for raw in s.j.records:
+        event = BodyEvent.from_dict(json.loads(raw)["event"])
+        if event.c2_heads is not None:
+            account, plans = _historical_c2(event.c2_heads, s.a, s.plans)
+            assert account.schema == LIVE_ACCOUNT_SCHEMA_V2
+            assert len(account.projection.scopes) == len(plans) == 1
+            assert _scope_check(s.c, account) == s.scope
+            assert _heads(account, plans) == event.c2_heads
+    missing_body = s.result(related_bodies=())
+    assert missing_body.classification == "pending"
+    assert missing_body.reasons == ("required_related_body_journal_missing",)
+    missing_plan = s.result(plans=(s.p,))
+    assert missing_plan.classification == "inconsistent"
+    assert "plan_enrollment_missing_journal" in missing_plan.reasons
+    s.reserve_b_attempt()
+    assert s.a.projection.generation == 2
+    assert s.j.object(s.oid).receipt.to_bytes() == receipt_bytes
+    assert s.result().classification == "consistent"
+    with pytest.raises(HttpContractError, match="stale_generation"):
+        check_body_generation(s.a, s.b)
+
+
+def test_scope_window_narrow_stale_new_commit_rejected():
+    s = (
+        narrow_scenario()
+        .begin()
+        .opened()
+        .observed()
+        .received()
+        .closed()
+        .stabilized()
+        .acquired()
+    )
+    s.enroll_b().reserve_b_attempt()
+    with pytest.raises(HttpContractError, match="stale_generation"):
+        s.committed()
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_scope_window_narrow_missing_writer_and_c2_pending(paired):
+    s = narrow_scenario().begin()
+    at = s.tick()
+    if paired:
+        s.pair("attempt_sent", "slot_sent", at, sent_at=stamp(at))
+        s.received().enroll_b()
+        assert reconcile_live_journals(s.a, s.plans).classification == "consistent"
+    else:
+        s.p = s.p.append(
+            "attempt_sent",
+            recorded_at=at,
+            transition_id="unpaired",
+            binding=s.b,
+            sent_at=stamp(at),
+        )
+        assert reconcile_live_journals(s.a, s.plans).classification == "pending"
+    result = s.result()
+    assert result.classification == "pending"
+    assert "writer_evidence_missing" in result.reasons
+    if not paired:
+        assert "pending_send_pair" in result.reasons
+
+
+def test_scope_window_narrow_approval_binding_remains_exact():
+    s = narrow_scenario().begin()
+    identity = replace(s.identity, binding=replace(s.b, approval_sha="f" * 64))
+    before = s.j.to_bytes()
+    with pytest.raises(HttpContractError, match="^header_binding_mismatch$"):
+        s.j.reserve(
+            identity,
+            at=s.tick(),
+            operation_id="wrong-approval",
+            account=s.a,
+            plans=s.plans,
+        )
+    assert s.j.to_bytes() == before
+
+
+def test_scope_window_unknown_schema_rejected_by_c2_reader():
+    s = EnrolledScenario()
+    forged = replace(s.a)
+    object.__setattr__(forged, "schema", "unknown-account")
+    with pytest.raises(HttpContractError, match="schema_mismatch"):
+        _scope_check(s.c, forged)
 
 
 def test_empty_account_needs_no_fictitious_global_body():
@@ -403,7 +631,17 @@ def test_current_pending_send_pair_is_not_promoted():
 
 
 @pytest.mark.parametrize(
-    "field", ["account", "preflight", "window", "expiry", "retry", "plan"]
+    "field",
+    [
+        "account",
+        "preflight",
+        "window",
+        "expiry",
+        "outside-start",
+        "outside-end",
+        "retry",
+        "plan",
+    ],
 )
 def test_v2_scope_check_not_relaxed(field):
     s = EnrolledScenario()
@@ -416,6 +654,10 @@ def test_v2_scope_check_not_relaxed(field):
         scope = replace(scope, not_before=NOW + timedelta(seconds=1))
     if field == "expiry":
         scope = replace(scope, expires_at=scope.expires_at - timedelta(seconds=1))
+    if field == "outside-start":
+        scope = replace(scope, not_before=scope.not_before - timedelta(microseconds=1))
+    if field == "outside-end":
+        scope = replace(scope, expires_at=scope.expires_at + timedelta(microseconds=1))
     if field == "retry":
         scope = replace(scope, retry=replace(scope.retry, max_attempts_per_page=2))
     if field == "plan":
@@ -438,8 +680,12 @@ def test_v2_scope_check_not_relaxed(field):
     )
     assert reconcile_live_journals(account, (plan,)).classification == "consistent"
     result = s.result(account=account, plans=(plan,))
-    assert result.classification == "inconsistent"
-    assert any("scope" in r for r in result.reasons)
+    if field in {"window", "expiry"}:
+        # OD-CMP-WINDOW-02 intentionally replaces the old v2 exact-window rule.
+        assert result.classification == "consistent"
+    else:
+        assert result.classification == "inconsistent"
+        assert any("scope" in r for r in result.reasons)
 
 
 @pytest.mark.parametrize(
