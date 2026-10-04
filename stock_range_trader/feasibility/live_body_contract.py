@@ -23,6 +23,8 @@ from .http_contract import (
     HttpContractError,
 )
 from .live_http_evidence import (
+    LIVE_ACCOUNT_SCHEMA_V1,
+    LIVE_ACCOUNT_SCHEMA_V2,
     AttemptBinding,
     LiveJournal,
     check_body_generation,
@@ -715,11 +717,20 @@ def _heads(account: LiveJournal, plans: tuple[LiveJournal, ...]) -> C2Heads:
 def _scope_check(contract, account):
     scope = account.projection.scope(contract.plan.plan_sha)
     raw = contract.plan.content
+    plan_start, plan_end = (
+        _parse_time(raw["not_before"]),
+        _parse_time(raw["expires_at"]),
+    )
+    if account.schema == LIVE_ACCOUNT_SCHEMA_V1:
+        window_matches = scope.not_before == plan_start and scope.expires_at == plan_end
+    elif account.schema == LIVE_ACCOUNT_SCHEMA_V2:
+        window_matches = plan_start <= scope.not_before < scope.expires_at <= plan_end
+    else:
+        raise HttpContractError("live_account_journal_required")
     _require(
         scope.preflight_sha == contract.preflight_sha
         and scope.account_ref == raw["account_ref"]
-        and _time(scope.not_before) == raw["not_before"]
-        and _time(scope.expires_at) == raw["expires_at"]
+        and window_matches
         and asdict(scope.retry) == raw["retry"],
         "c2_scope_mismatch",
     )

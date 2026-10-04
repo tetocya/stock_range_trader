@@ -317,8 +317,8 @@ required in later work.
 | live account v2 | live plan v1 | body v1 | Supported by the enrollment compatibility tests |
 | unknown account schema | live plan v1 | body v1 | Rejected by the C2 reader/reconciliation path |
 
-This compatibility work is test-first on fixed base
-`f6145384e5db56dbaa55af0e4790abf6de3e7962`. The new artificial suite has
+The original compatibility work (PR #17) was test-first on fixed base
+`f6145384e5db56dbaa55af0e4790abf6de3e7962`. Its artificial suite had
 35 passing cases without any production C3 changes. Initial test failures were
 test setup/API expectation errors, not production compatibility defects.
 All persisted C3 schemas remain v1. No event, receipt or historical-head fields
@@ -352,9 +352,52 @@ the current A+B account with only A's plan journal fails closed. Missing or
 corrupt enrollment pairs, opening heads, transitions, times and prior-head
 claims propagate C2 pending/inconsistent classifications; C3 does not promote
 them to consistent. `_scope_check` still checks plan SHA, preflight SHA,
-account reference, both window boundaries and retry rules. The success fixtures
-use approval windows equal to the fixed plan windows; compatibility does not
-relax the existing exact-window check for narrower approval claims.
+account reference, both window boundaries and retry rules. Window checks now
+follow the versioned rules below; other binding checks remain exact.
+
+### L-CMP-1: versioned execution-window validation
+
+This pure validator fix starts from PR #17's merge commit
+`6f5f23f009ba72236eb6cf94eec052550a9a18a7`. Owner decisions
+OD-CMP-WINDOW-01/02/03 define:
+
+| C2 account schema | Required relationship to the fixed plan outer window |
+| --- | --- |
+| live account v1 | Exact start and end equality, unchanged |
+| live account v2 | `plan.start <= scope.start < scope.end <= plan.end` |
+| unknown | Rejected; no v1/v2 fallback |
+
+The execution scope is half-open `[not_before, expires_at)`. Outer containment
+bounds are inclusive, but the scope must be nonempty. Canonical UTC comparisons
+are exact to the microsecond; there is no tolerance, rounding or clipping.
+Window mismatches retain `c3_c2_scope_mismatch`. Invalid empty/inverted C2 values
+can be rejected earlier with their existing reason, such as
+`live_scope_window_invalid`; errors are not rewritten to hide that validation.
+
+C2 remains responsible for canonical approval content, plan/approval validity
+and generating `scope.not_before = approval.valid_from` and
+`scope.expires_at = approval.valid_until`. C2 production code is unchanged.
+C3 only checks consistency with the fixed outer plan window; it does not load
+or authenticate an approval. I1 must separately check original canonical
+documents, authoritative current heads and operational approval/custody evidence.
+
+Both current reconciliation and historical event validation use the same rule
+for the supplied account/prefix schema. Later enrollments do not alter the
+historical prefix's scope. Plan SHA, preflight SHA, account reference, retry,
+approval/attempt binding, generation, writer and inventory rules are unchanged.
+The change is limited to validator semantics: no C3 schema version or saved field
+changes, and no byte changes for otherwise identical serialized evidence. The
+path-independent v1 golden literals remain unchanged (M-CMP-1 retained).
+
+Genuine `propose_plan_enrollment` fixtures cover exact/narrow-start/narrow-end/
+narrow-both approvals and 1-microsecond bounds through reservation and commit.
+Separate cases protect v1 exact semantics, reject plan-external/empty/inverted
+scopes, check half-open enrollment timing and exact approval binding, and cover
+narrow historical/current inventory, stale generations, missing writers and C2
+pending/inconsistent propagation. Consistency still grants no live permission.
+
+L-CMP-1 is addressed by this pure contract implementation; it does not implement
+or authorize I1a, a physical Store, acquisition or Formal Real OOS.
 
 ### Generation and writer evidence
 
@@ -386,9 +429,9 @@ time.time entry points. It does not prove physical Store safety.
 
 L-EN-1 (stale-prior-head diagnostics), L-EN-2 (formal plan-count limit) and
 L-EN-3 (Store operation receipts) remain open. No measured plan-count limit is
-hard-coded here. L-C2-2/3/4/6/7 and L-C3-2 also remain open. This compatibility
-commit alone does not authorize I1a: independent review, CI and normal merge of
-the compatibility PR are still required before the next implementation stage.
+hard-coded here. L-C2-2/3/4/6/7 and L-C3-2 also remain open. The scope-window
+fix alone does not authorize I1a: its independent review, CI and normal merge
+are still required before the next implementation stage.
 Live acquisition and Formal Real OOS remain prohibited.
 
 ## Tests and later physical verification
