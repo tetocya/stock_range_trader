@@ -645,6 +645,22 @@ def _roles(data):
 def validate_store_contents(connection):
     """Read-only relational/byte/chain/completeness validator; never repairs."""
     validate_store_schema(connection)
+    _validate_relational_contents(connection)
+    return STORE_SCHEMA
+
+
+def _validate_relational_contents(
+    connection,
+    *,
+    deployment_schema=DEPLOYMENT_SCHEMA,
+    store_schema=STORE_SCHEMA,
+    initial_lifecycle="prepared",
+):
+    """Shared content checks after the caller's exact versioned DDL validation.
+
+    v2 has a different deployment envelope and a separate runtime lifecycle.
+    Existing policy/document/business journal/receipt bytes are never rewritten.
+    """
     policies = {}
     for row in _rows(connection, "policies"):
         policy = StorePolicy.from_bytes(row["canonical"], row["policy_sha"])
@@ -669,7 +685,18 @@ def validate_store_contents(connection):
             for k in DeploymentRecord.__dataclass_fields__
         }
     )
-    _require(record.canonical == d["canonical"], "deployment_binding_mismatch")
+    expected_deployment = canonical_bytes(
+        {
+            **record.__dict__,
+            "schema": deployment_schema,
+            "store_schema": store_schema,
+            "lifecycle": initial_lifecycle,
+        }
+    )
+    _require(
+        expected_deployment == d["canonical"] and d["lifecycle"] == initial_lifecycle,
+        "deployment_binding_mismatch",
+    )
     for row in _rows(connection, "documents"):
         CanonicalDocument(
             row["kind"],
@@ -982,7 +1009,6 @@ def validate_store_contents(connection):
             and row["created_at"] <= row["committed_at"],
             "receipt_content_mismatch",
         )
-    return STORE_SCHEMA
 
 
 @dataclass(frozen=True)
