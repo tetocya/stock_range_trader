@@ -649,18 +649,15 @@ def validate_store_contents(connection):
     return STORE_SCHEMA
 
 
-def _validate_relational_contents(
+def _validate_core_contents(
     connection,
     *,
     deployment_schema=DEPLOYMENT_SCHEMA,
     store_schema=STORE_SCHEMA,
     initial_lifecycle="prepared",
+    document_shas=None,
 ):
-    """Shared content checks after the caller's exact versioned DDL validation.
-
-    v2 has a different deployment envelope and a separate runtime lifecycle.
-    Existing policy/document/business journal/receipt bytes are never rewritten.
-    """
+    """Core originals; a scoped reader may select only its document dependencies."""
     policies = {}
     for row in _rows(connection, "policies"):
         policy = StorePolicy.from_bytes(row["canonical"], row["policy_sha"])
@@ -698,6 +695,8 @@ def _validate_relational_contents(
         "deployment_binding_mismatch",
     )
     for row in _rows(connection, "documents"):
+        if document_shas is not None and row["document_sha"] not in document_shas:
+            continue
         CanonicalDocument(
             row["kind"],
             row["schema"],
@@ -707,6 +706,23 @@ def _validate_relational_contents(
             row["source_reference"],
             row["registered_at"],
         )
+    return policies, d
+
+
+def _validate_relational_contents(
+    connection,
+    *,
+    deployment_schema=DEPLOYMENT_SCHEMA,
+    store_schema=STORE_SCHEMA,
+    initial_lifecycle="prepared",
+):
+    """Global validation; scoped receipt reads never weaken this entry point."""
+    policies, d = _validate_core_contents(
+        connection,
+        deployment_schema=deployment_schema,
+        store_schema=store_schema,
+        initial_lifecycle=initial_lifecycle,
+    )
     accounts = _rows(connection, "accounts")
     plans = _rows(connection, "plans")
     journals = {

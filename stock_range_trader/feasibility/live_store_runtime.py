@@ -1012,6 +1012,11 @@ def validate_store_v2_contents(connection):
         store_schema=STORE_SCHEMA_V2,
         initial_lifecycle="bootstrap_pending",
     )
+    return _validate_runtime_contents(connection)
+
+
+def _validate_runtime_contents(connection):
+    """Runtime originals/projections only, after exact schema and core checks."""
     d = store._rows(connection, "deployments")[0]
     deployment = store.DeploymentRecord(
         **{
@@ -1050,6 +1055,8 @@ def validate_store_v2_contents(connection):
     docs = {
         row["document_sha"]: store._load(row["canonical"])
         for row in store._rows(connection, "documents")
+        if row["document_sha"]
+        in {deployment.owner_registry_sha, deployment.preflight_sha}
     }
     registry, preflight = (
         docs[deployment.owner_registry_sha],

@@ -838,8 +838,8 @@ class StoreSession:
                 self._resources.guard()
                 c.commit()
                 raise HttpContractError("store_clock_uncertain")
-            # Until I1a-3 supplies authoritative business reconciliation, accept
-            # only the empty business catalog. Never certify unknown quiescence.
+            # Preserve the empty v1 profile byte-for-byte. Nonempty evidence
+            # requires I1a-3's separate global quiescence proof/profile.
             tables = (
                 "accounts",
                 "plans",
@@ -853,7 +853,6 @@ class StoreSession:
             summary = {
                 t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables
             }
-            _require(not any(summary.values()), "quiescence_unproven")
             snapshot = {
                 "schema": "historical-feasibility-runtime-clean-validation-v1",
                 "store_schema": rt.STORE_SCHEMA_V2,
@@ -864,6 +863,10 @@ class StoreSession:
                 "journal_heads": [],
                 "business_row_counts": summary,
             }
+            if any(summary.values()):
+                from .live_store_transactions import _clean_snapshot
+
+                snapshot = _clean_snapshot(c, self.identity, p)
             result = _append(
                 context,
                 checked,
