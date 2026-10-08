@@ -55,4 +55,4 @@ jobs:
       - name: Install project and development dependencies
         run: python -m pip install -e ".[dev]"
       - name: Check physical Store runtime on macOS
-        run: python -m pytest -q -W error tests/test_feasibility_live_store_i1a2b.py
+        run: python -m pytest -q -W error tests/test_feasibility_live_store_i1a2b.py tests/test_feasibility_live_store_i1a3.py
