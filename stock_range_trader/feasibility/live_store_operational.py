@@ -433,6 +433,12 @@ def _authority(value, *, pin_required):
 
 def _read_context(c, a):
     p = rt.validate_store_v2_contents(c)
+    if c.execute(
+        "SELECT 1 FROM operations WHERE kind IN ('i1b-account-open-v1','i1b-plan-enroll-v1') LIMIT 1"
+    ).fetchone():
+        from .live_store_transactions import _reconcile
+
+        _reconcile(c)
     d = store._rows(c, "deployments")[0]
     deployment = store.DeploymentRecord(
         **{

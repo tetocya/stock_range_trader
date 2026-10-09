@@ -1,8 +1,7 @@
-"""I1a-3 local authority. No exported business handler, activation or sender.
+"""Local transaction authority, with explicitly versioned I1b typed dispatch.
 
-Read APIs return immutable values, never a connection/cursor. Private typed
-handlers are deliberately absent until their own implementation/review stage.
-Tests install a bounded artificial handler, not an arbitrary SQL callback.
+Read APIs return immutable values, never a connection/cursor. I1b handlers are
+internal fixed commands. No arbitrary SQL callback or sender is exposed.
 """
 
 from __future__ import annotations
@@ -17,6 +16,8 @@ from . import live_store as st
 from . import live_store_operational as op
 from . import live_store_runtime as rt
 from .http_contract import HttpContractError
+from .live_body_contract import EVENT_SCHEMA as BODY_SCHEMA
+from .live_body_contract import LiveBodyJournal
 from .live_http_evidence import LiveJournal, reconcile_live_journals
 
 
@@ -81,13 +82,14 @@ class _Journal:
     journal_id: str
     kind: str
     plan_sha: str | None
-    value: LiveJournal
+    value: LiveJournal | LiveBodyJournal
 
 
 @dataclass(frozen=True)
 class _Proposal:
     documents: tuple[_Document, ...]
     journals: tuple[_Journal, ...]
+    initialization_manifest: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,10 @@ class _Rules:
 
 
 def _rules_for(kind):
+    from . import live_store_enrollment as enrollment
+
+    if kind in enrollment.KINDS:
+        return enrollment._rules(kind)
     raise HttpContractError("store_transaction_business_handler_not_installed")
 
 
@@ -275,6 +281,20 @@ def _prefix(c, journal_id, sequence):
     return journal, rows, value
 
 
+def _evidence_prefix(c, journal_id, sequence):
+    rows = _rows(c, "journals", " WHERE journal_id=?", (journal_id,))
+    _check(len(rows) == 1, "journal_missing")
+    if rows[0]["kind"] == "body":
+        from .live_store_enrollment import _body_prefix
+
+        return _body_prefix(c, journal_id, sequence)
+    return _prefix(c, journal_id, sequence)
+
+
+def _journal_schema(journal):
+    return BODY_SCHEMA if journal.kind == "body" else journal.value.schema
+
+
 def _receipt(c, row, projection):
     """Verify original dependencies, not unrelated latest catalog/head state."""
     intent = st.OperationIntent.from_bytes(row["canonical_intent"], row["intent_sha"])
@@ -290,20 +310,31 @@ def _receipt(c, row, projection):
         "required_roles_mismatch",
     )
     pre = st._load(row["execution_preconditions"])
+    from . import live_store_enrollment as enrollment
+
+    is_enrollment = intent.kind in enrollment.KINDS
     _check(
         set(pre)
-        == {
-            "schema",
-            "source_heads",
-            "dependency_heads",
-            "catalog_sha",
-            "session_id",
-            "fence_epoch",
-            "runtime_head",
-            "started_at",
-            "documents",
-        }
-        and pre["schema"] == "store-transaction-preconditions-v1",
+        == (
+            {
+                "schema",
+                "source_heads",
+                "dependency_heads",
+                "catalog_sha",
+                "session_id",
+                "fence_epoch",
+                "runtime_head",
+                "started_at",
+                "documents",
+            }
+            | ({"initialization_manifest"} if is_enrollment else set())
+        )
+        and pre["schema"]
+        == (
+            enrollment.PRECONDITIONS
+            if is_enrollment
+            else "store-transaction-preconditions-v1"
+        ),
         "preconditions_invalid",
     )
     st._sha(pre["catalog_sha"])
@@ -389,14 +420,14 @@ def _receipt(c, row, projection):
             and reference["sequence"] >= 0,
             "dependency_reference_invalid",
         )
-        meta, _, value = _prefix(c, journal_id, reference["sequence"])
+        meta, _, value = _evidence_prefix(c, journal_id, reference["sequence"])
         _check(
             value.head_sha == reference["head_sha"]
             and meta["account_ref"] == intent.account_ref,
             "dependency_head_mismatch",
         )
         historical_journals.append((meta["kind"], value))
-        for scope in value.projection.scopes:
+        for scope in getattr(value.projection, "scopes", ()):
             for sha in (scope.plan_sha, scope.preflight_sha, scope.approval_sha):
                 _document(c, sha)
     accounts = [j for kind, j in historical_journals if kind == "account"]
@@ -419,7 +450,7 @@ def _receipt(c, row, projection):
             == list(range(0 if first is None else first + 1, result["sequence"] + 1)),
             "operation_sequence_gap",
         )
-        journal, events, value = _prefix(c, journal_id, result["sequence"])
+        journal, events, value = _evidence_prefix(c, journal_id, result["sequence"])
         _check(value.head_sha == result["head_sha"], "result_head_mismatch")
         _check(
             source[journal_id]["head_sha"]
@@ -442,7 +473,7 @@ def _receipt(c, row, projection):
                 and row["created_at"] <= e["recorded_at"] <= row["committed_at"],
                 "event_part_mismatch",
             )
-        for scope in value.projection.scopes:
+        for scope in getattr(value.projection, "scopes", ()):
             for sha in (scope.plan_sha, scope.preflight_sha, scope.approval_sha):
                 _document(c, sha)
     receipts = _rows(c, "receipts", " WHERE deployment_id=? AND operation_id=?", key)
@@ -494,6 +525,9 @@ def _receipt(c, row, projection):
         ),
         "end_clock_evidence_missing",
     )
+    if is_enrollment:
+        enrollment._validate_manifest(c, row, pre)
+        enrollment._end_check(intent, row["committed_at"])
     return receipt["canonical"]
 
 
@@ -586,7 +620,7 @@ def _journal_values(c):
             r["journal_id"],
             r["kind"],
             r["plan_sha"],
-            _prefix(c, r["journal_id"], h["last_sequence"])[2],
+            _evidence_prefix(c, r["journal_id"], h["last_sequence"])[2],
         )
         for r in _rows(c, "journals")
         for h in _rows(c, "journal_heads", " WHERE journal_id=?", (r["journal_id"],))
@@ -630,8 +664,14 @@ def _write_proposal(
     for j in proposal.journals:
         _check(
             type(j) is _Journal
-            and type(j.value) is LiveJournal
-            and j.kind in {"account", "plan"},
+            and (
+                (type(j.value) is LiveJournal and j.kind in {"account", "plan"})
+                or (
+                    type(j.value) is LiveBodyJournal
+                    and j.kind == "body"
+                    and proposal.initialization_manifest is not None
+                )
+            ),
             "typed_journal_required",
         )
         st._label(j.journal_id)
@@ -642,7 +682,7 @@ def _write_proposal(
             r = rows[0]
             _check(
                 (r["kind"], r["plan_sha"], r["schema"], r["account_ref"])
-                == (j.kind, j.plan_sha, j.value.schema, intent.account_ref),
+                == (j.kind, j.plan_sha, _journal_schema(j), intent.account_ref),
                 "journal_binding",
             )
             h = _rows(c, "journal_heads", " WHERE journal_id=?", (j.journal_id,))[0]
@@ -667,7 +707,8 @@ def _write_proposal(
         for data in new:
             raw = st._load(data.encode())
             _check(
-                raw["event"]["transition_id"] == operation_id
+                raw["event"].get("transition_id", raw["event"].get("operation_id"))
+                == operation_id
                 and raw["event"]["recorded_at"] == observed,
                 "event_command_binding",
             )
@@ -695,6 +736,21 @@ def _write_proposal(
             {x.sha256 for x in docs} | ({intent.plan_sha} if intent.plan_sha else set())
         ),
     }
+    if proposal.initialization_manifest is not None:
+        from .live_store_enrollment import KINDS, PRECONDITIONS
+
+        _check(intent.kind in KINDS, "manifest_kind_invalid")
+        manifest = st._load(proposal.initialization_manifest)
+        pre["schema"] = PRECONDITIONS
+        pre["initialization_manifest"] = manifest
+        pre["documents"] = [x["document_sha"] for x in manifest["documents"]]
+        if (
+            len(st.canonical_bytes(pre))
+            > session._resources.authority.policy.max_record_bytes
+        ):
+            from .live_store_enrollment import _reject
+
+            _reject("record_oversize")
     # Capacity precedes catalog updates, but follows document registration in the same savepoint.
     account = next((j for j in proposal.journals if j.kind == "account"), None)
     if account is not None:
@@ -742,7 +798,7 @@ def _write_proposal(
                 preflight_document_schema=st._DOCUMENT_SCHEMAS["preflight"],
                 approval_kind="approval",
                 approval_document_schema=st._DOCUMENT_SCHEMAS["approval"],
-                schema=j.value.schema,
+                schema=_journal_schema(j),
                 journal_id=None,
                 status="prepared",
                 enrolled_revision=None,
@@ -756,7 +812,7 @@ def _write_proposal(
                 account_ref=intent.account_ref,
                 plan_sha=j.plan_sha,
                 kind=j.kind,
-                schema=j.value.schema,
+                schema=_journal_schema(j),
                 status="prepared",
             )
             _insert(
@@ -801,7 +857,7 @@ def _write_proposal(
             deployment_id=d,
             journal_id=j.journal_id,
             sequence=raw["sequence"],
-            schema=j.value.schema,
+            schema=_journal_schema(j),
             canonical=data,
             event_hash=raw["event_hash"],
             previous_hash=raw["previous_hash"],
@@ -870,7 +926,7 @@ def _write_proposal(
                 (
                     j
                     for j in proposal.journals
-                    if j.plan_sha == enrollment.scope.plan_sha
+                    if j.kind == "plan" and j.plan_sha == enrollment.scope.plan_sha
                 ),
                 None,
             )
@@ -879,6 +935,7 @@ def _write_proposal(
                     "UPDATE plans SET journal_id=?,status=CASE WHEN status='stopped' THEN status ELSE 'enrolled' END,enrolled_revision=? WHERE deployment_id=? AND plan_sha=?",
                     (match.journal_id, revision, d, match.plan_sha),
                 )
+    _stage("catalog_updated")
     rt.validate_store_v2_contents(c)
     _reconcile(c)
     return parts
@@ -916,14 +973,21 @@ def _execute(session, operation_id, intent):
         op._persist(c, context, records, checked)
         c.execute("SAVEPOINT business")
         started = True
-        proposal = _prepare(
-            intent,
-            operation_id,
-            _catalog(c),
-            _journal_values(c),
-            tuple(_document(c, r["document_sha"]) for r in _rows(c, "documents")),
-            datetime.fromisoformat(start.utc),
-        )
+        from . import live_store_enrollment as enrollment
+
+        if intent.kind in enrollment.KINDS:
+            proposal = enrollment._prepare(
+                c, session, intent, operation_id, start.utc, p.head_sha
+            )
+        else:
+            proposal = _prepare(
+                intent,
+                operation_id,
+                _catalog(c),
+                _journal_values(c),
+                tuple(_document(c, r["document_sha"]) for r in _rows(c, "documents")),
+                datetime.fromisoformat(start.utc),
+            )
         parts = _write_proposal(
             c, session, intent, operation_id, proposal, rules, start.utc, p.head_sha
         )
@@ -937,6 +1001,8 @@ def _execute(session, operation_id, intent):
             c.commit()
             raise HttpContractError("store_clock_uncertain")
         op._persist(c, context, checked, ended)
+        if intent.kind in enrollment.KINDS:
+            enrollment._end_check(intent, end.utc)
         raw = st.canonical_bytes(
             dict(
                 schema=st.RECEIPT_SCHEMA,
@@ -987,6 +1053,8 @@ def _execute(session, operation_id, intent):
         _stage("committed_before_return")
         return result
     except HttpContractError as exc:
+        from .live_store_enrollment import KINDS, _BusinessRejection
+
         # Only deterministic semantic rejections preserve a valid session.
         recoverable = (
             "plan_count_exceeded",
@@ -994,7 +1062,22 @@ def _execute(session, operation_id, intent):
             "document_source_conflict",
             "business_handler_not_installed",
         )
-        if started and any(str(exc).endswith(x) for x in recoverable):
+        semantic = (
+            (
+                type(exc) is _BusinessRejection
+                or str(exc)
+                in {
+                    "live_store_plan_count_exceeded",
+                    "live_store_enrollment_record_oversize",
+                    "store_transaction_enrollment_record_oversize",
+                    "store_transaction_event_record_oversize",
+                    "store_transaction_document_source_conflict",
+                }
+            )
+            if intent.kind in KINDS
+            else any(str(exc).endswith(x) for x in recoverable)
+        )
+        if started and semantic:
             try:
                 c.rollback()
                 _guard_commit(session, c, session._head)
@@ -1015,11 +1098,14 @@ def _reconcile(c):
         plans = tuple(j.value for j in journals if j.kind == "plan")
         result = reconcile_live_journals(a.value, plans)
         _check(result.classification == "consistent", "journals_not_consistent")
+    from .live_store_enrollment import _validate_current
+
+    _validate_current(c, journals)
     return journals
 
 
 def _clean_snapshot(c, identity, p):
-    """Global quiescence. Body physical evidence remains unsupported in I1a-3."""
+    """Global quiescence; I1b permits only exactly initialized, object-free C3."""
     rt.validate_store_v2_contents(c)
     _check(
         all(r["journal_id"] is not None for r in _rows(c, "accounts")),
@@ -1032,16 +1118,22 @@ def _clean_snapshot(c, identity, p):
     for row in operations:
         _check(row["status"] == "committed", "quiescence_unproven")
         _receipt(c, row, p)
-    _check(
-        not any(r["kind"] == "body" for r in _rows(c, "journals")),
-        "quiescence_unproven",
-    )
-    for j in _reconcile(c):
+    journals = _reconcile(c)
+    bodies = [j for j in journals if j.kind == "body"]
+    if any(r["kind"] == "body" for r in _rows(c, "journals")):
+        from .live_store_enrollment import _initial_only
+
+        _initial_only(c, journals)
+    for j in journals:
+        if j.kind == "body":
+            continue
         q = j.value.projection
         _check(not q.attempts and not q.holds, "quiescence_unproven")
     _check(not _rows(c, "control_state"), "quiescence_unproven")
     return {
-        "schema": "historical-feasibility-runtime-clean-validation-v2",
+        "schema": "historical-feasibility-runtime-clean-validation-v3"
+        if bodies
+        else "historical-feasibility-runtime-clean-validation-v2",
         "store_schema": rt.STORE_SCHEMA_V2,
         **identity.__dict__,
         "runtime_head": p.head_sha,
@@ -1063,5 +1155,7 @@ def _clean_snapshot(c, identity, p):
                 }
             )
         ),
-        "quiescence_profile": "local-c2-no-attempts-no-holds-no-body-v1",
+        "quiescence_profile": "local-c2-idle-c3-initial-only-v1"
+        if bodies
+        else "local-c2-no-attempts-no-holds-no-body-v1",
     }
