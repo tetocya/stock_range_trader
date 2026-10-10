@@ -870,9 +870,10 @@ class StoreSession:
                 "business_row_counts": summary,
             }
             if any(summary.values()):
-                from .live_store_transactions import _clean_snapshot
+                from .live_store_terminal import _select_clean_snapshot
 
-                snapshot = _clean_snapshot(c, self.identity, p)
+                snapshot = _select_clean_snapshot(c, self.identity, p)
+            _stage("before_session_closed")
             result = _append(
                 context,
                 checked,
@@ -888,6 +889,7 @@ class StoreSession:
             )
             _persist(c, context, checked, result)
             self._resources.guard()
+            _stage("before_close_commit")
             c.commit()
             _stage("session_closed_committed")
             self._status = "closed"
