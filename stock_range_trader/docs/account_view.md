@@ -110,7 +110,16 @@ ACCOUNT_VIEW_TEST_BROWSER='/Applications/Google Chrome.app/Contents/MacOS/Google
 表の描画、日付／銘柄／status、詳細、正確な数値順、欠測、基礎データ不変、
 ページの外部resource読込0件を確認する。
 
+PR #7統合後のブラウザ試験では、テスト専用CDP pipeからネイティブのマウス／キー入力を送信し、
+`Browser.close`・終了コード0・プロセス群消滅まで確認する。DOM成功マーカーだけでは合格しない。
+起動、空ページ、口座読込、操作、終了の各段階を記録し、全体40秒・各段階最大10秒でfail-closedにする。
+macOSでは使い捨てprofile限定のmock keychainを使い、実Keychainと通常profileは使わない。
+追加パッケージ／ブラウザ自動ダウンロードは不要。未指定時は従来どおり6件skipだが、
+明示した実行ファイルが存在しない場合は失敗とする。POSIX Chromium用であり、他環境の成功は主張しない。
+原因の切り分けと再現手順は [ブラウザ試験記録](browser_validation.md) を参照。
+
 承認済みworktreeは `034f5ece86345f111d04f36d938bfee18faf24de` のまま維持。
 設定・既存hash計算範囲・実装・台帳・許可は変更しない。
 閲覧ツールのhashは追加2モジュールも含めて①と別に更新するが、6月実行承認には転用しない。
-ローカルcommitのみ。push・PR・mergeなし。②の完了報告で停止する。
+②の初回実装はローカルcommitで停止した。PR #7統合後のブラウザ補正は、別worktreeから
+commit・push・レビュー用PRまで行う承認範囲であり、6月試験の実行承認には転用しない。
