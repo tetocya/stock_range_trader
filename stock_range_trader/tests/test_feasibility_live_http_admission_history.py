@@ -4,8 +4,10 @@ Positive C2/C3 histories use their existing append APIs. Negative operation
 envelopes intentionally fabricate impossible commits or admission decisions.
 """
 
+import ast
 import builtins
 import hashlib
+import inspect
 import json
 import socket
 import sqlite3
@@ -216,15 +218,19 @@ class History(EnrolledScenario):
             for raw in j.records[old.get(j.journal_id, 0) :]:
                 r = json.loads(raw)
                 new_rows[(j.journal_id, r["sequence"])] = r
-        if kind == h.RESERVATION_KIND:
+        if kind in {h.RESERVATION_KIND, h.ENROLLMENT_KIND}:
             ids = (
                 "account",
                 "plan-" + self.c.plan.plan_sha,
                 "body-" + self.c.plan.plan_sha,
             )
-            roles = ("account-reservation", "plan-reservation", "body-reservation")
+            suffix = "reservation" if kind == h.RESERVATION_KIND else "enrollment"
+            roles = tuple(
+                f"{prefix}-{suffix}" for prefix in ("account", "plan", "body")
+            )
             ordered = [
-                (jid, old[jid], role) for jid, role in zip(ids, roles, strict=True)
+                (jid, old.get(jid, 0), role)
+                for jid, role in zip(ids, roles, strict=True)
             ]
         else:
             ordered = [
@@ -533,6 +539,7 @@ def test_O_incremental_reuses_projections_and_result_is_identical():
     assert b.full_replays == len(f.pool().journals) + 1
     assert b.indexed_events == sum(len(j.records) for j in f.pool().journals)
     assert b.prefix_hits > 0
+    assert b.retained_prefixes == b.indexed_events + len(f.pool().journals)
 
 
 def test_P_pure_verification_and_build_with_io_trapped(monkeypatch):
@@ -989,7 +996,14 @@ def test_later_enrollment_preserves_earlier_core_and_all_historical_checks():
     f.clock()
     before = f.cut()
     f.enroll_b()
-    f.finish(before, h.EVIDENCE_KIND, "enrollment-original")
+    f.switch_plan()
+    f.j = f.j.audit(
+        evidence_ref=h.ENROLLMENT_AUDIT_PREFIX + f.c.plan.plan_sha,
+        at=f.tick(),
+        operation_id="body-enrollment-audit",
+    )
+    f.finish(before, h.ENROLLMENT_KIND, "enrollment-original")
+    f.switch_plan()
     assert f.reservations[0].core_json == earlier
     r = verified(f)
     assert r.historical_admissions_valid, r.reason
@@ -1025,3 +1039,379 @@ def test_malformed_dependency_original_rejected_before_raw_key_access(row):
     for verifier in (h.verify_history_reference, h.verify_history_incremental):
         with pytest.raises(hc.HttpContractError, match="dependency_event_shape"):
             verifier(pool, limits=LIMITS)
+
+
+def reseal_operation(op, **changes):
+    """Adversarial edits rehash the outer envelope, intent and receipt."""
+    new = replace(op, **changes)
+    intent = json.loads(new.intent_json)
+    intent.update(kind=new.kind, plan_sha=new.plan_sha)
+    receipt = json.loads(new.receipt_json)
+    receipt.update(
+        intent_sha=h.digest(c3._canonical(intent).encode()),
+        parts=[
+            {k: v for k, v in p.to_dict().items() if k != "schema"} for p in new.parts
+        ],
+    )
+    return replace(
+        new, intent_json=c3._canonical(intent), receipt_json=c3._canonical(receipt)
+    )
+
+
+def later_enrollment_fixture():
+    f = History()
+    f.clock()
+    before = f.cut()
+    f.enroll_b()
+    f.switch_plan()
+    f.j = f.j.audit(
+        evidence_ref=h.ENROLLMENT_AUDIT_PREFIX + f.c.plan.plan_sha,
+        at=f.tick(),
+        operation_id="initial-body-audit",
+    )
+    f.finish(before, h.ENROLLMENT_KIND, "enroll-operation-b")
+    return f
+
+
+def test_R1_A_D_cross_plan_body_write_with_valid_receipt_is_rejected():
+    f = History(second_plan=True)
+    f.clock()
+    before = f.cut()
+    f.jb = f.jb.audit(evidence_ref="peer-audit", at=f.tick(), operation_id="peer-audit")
+    f.finish(before, h.EVIDENCE_KIND, "outer-plan-a")
+    assert rejected(f.pool(), "part_scope_mismatch").first_violation == 0
+
+
+def test_R1_B_D_cross_plan_c2_write_resealed_is_rejected():
+    f = History(second_plan=True)
+    a_sha = f.c.plan.plan_sha
+    f.switch_plan()
+    f.begin()
+    old = f.ops[0]
+    new = reseal_operation(old, plan_sha=a_sha)
+    rejected(rebind_operation(f.pool(), old, new), "part_scope_mismatch")
+
+
+def test_R1_C_E_enrollment_owns_B_and_only_reads_A():
+    f = later_enrollment_fixture()
+    op = f.ops[-1]
+    assert op.plan_sha == f.c.plan.plan_sha
+    assert f.pb.head_sha in {x.head_sha for x in op.source.heads}
+    assert "plan-" + f.pb.projection.scopes[0].plan_sha not in {
+        p.journal_id for p in op.parts
+    }
+    assert verified(f).historical_admissions_valid
+    f.begin().settle(status=200, size=5)
+    assert verified(f).historical_admissions_valid
+    assert len(f.j.object(f.oid).receipt.c2_heads.plan_heads) == 2
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    [
+        ("role", "enrollment_part_profile"),
+        ("ordinal", "part_order"),
+        ("schema", "intent_schema"),
+        ("session", "stale_fence_or_session"),
+        ("fence", "stale_fence_or_session"),
+    ],
+)
+def test_R1_F_enrollment_metadata_rejected(mutation, reason):
+    f = later_enrollment_fixture()
+    old = f.ops[-1]
+    if mutation in {"role", "ordinal"}:
+        fields = {"role": "fake"} if mutation == "role" else {"ordinal": 4}
+        new = reseal_operation(
+            old, parts=(replace(old.parts[0], **fields), *old.parts[1:])
+        )
+    elif mutation == "schema":
+        raw = json.loads(old.intent_json)
+        raw["schema"] = "unknown"
+        new = reseal_operation(old, intent_json=c3._canonical(raw))
+    else:
+        new = replace(
+            old,
+            **(
+                {"session_id": "stale"} if mutation == "session" else {"fence_epoch": 9}
+            ),
+        )
+    rejected(rebind_operation(f.pool(), old, new), reason)
+
+
+@pytest.mark.parametrize(
+    "kind", [h.EVIDENCE_KIND, h.SETTLEMENT_KIND, h.RESERVATION_KIND]
+)
+def test_R1_G_enrollment_cannot_hide_in_other_kind(kind):
+    f = later_enrollment_fixture()
+    old = f.ops[-1]
+    new = reseal_operation(old, kind=kind)
+    pool = rebind_operation(f.pool(), old, new)
+    result = verified(f)
+    assert result.historical_admissions_valid
+    reference = h.verify_history_reference(pool, limits=LIMITS)
+    actual = h.verify_history_incremental(pool, limits=LIMITS)
+    assert reference.to_bytes() == actual.to_bytes()
+    assert not actual.historical_admissions_valid
+    if kind == h.EVIDENCE_KIND:
+        assert "enrollment_operation_required" in actual.reason
+
+
+def test_R1_H_enrollment_cannot_write_existing_A():
+    f = later_enrollment_fixture()
+    old = f.ops[-1]
+    new = reseal_operation(old, plan_sha=f.pb.projection.scopes[0].plan_sha)
+    rejected(rebind_operation(f.pool(), old, new), "part_scope_mismatch")
+
+
+def test_R1_enrollment_rejects_extra_same_plan_audit():
+    f = later_enrollment_fixture()
+    old = f.ops.pop()
+    # Reconstruct one operation containing a fourth, otherwise legal body event.
+    f.runtime = f.runtime[:-1]
+    f.j = f.j.audit(evidence_ref="extra", at=f.tick(), operation_id="extra")
+    provisional = f.finish(old.source, h.EVIDENCE_KIND, old.operation_id)
+    new = reseal_operation(provisional, kind=h.ENROLLMENT_KIND)
+    rejected(rebind_operation(f.pool(), provisional, new), "enrollment_event_profile")
+
+
+def test_R1_H_B_enrollment_with_extra_A_write_rejects_resealed_receipt():
+    f = later_enrollment_fixture()
+    old = f.ops.pop()
+    f.runtime = f.runtime[:-1]
+    f.jb = f.jb.audit(evidence_ref="extra-A", at=f.tick(), operation_id="extra-A")
+    provisional = f.finish(old.source, h.EVIDENCE_KIND, old.operation_id)
+    new = reseal_operation(provisional, kind=h.ENROLLMENT_KIND)
+    rejected(rebind_operation(f.pool(), provisional, new), "part_scope_mismatch")
+
+
+def target_page(f):
+    return c3.LivePageIdentity(
+        f.c.plan.plan_sha,
+        c3._canonical(f.c.plan.content["scope"]["queries"][0]),
+        0,
+        None,
+    )
+
+
+def exhausted_history(*, second_transfer=500):
+    return (
+        History(second_plan=True)
+        .begin()
+        .settle(status=503, transfer=500)
+        .begin()
+        .settle(status=429, transfer=second_transfer)
+    )
+
+
+def test_R2_A_peer_exhaustion_does_not_retroactively_reject_or_block_B():
+    f = exhausted_history()
+    f.switch_plan()
+    f.release()
+    f.clock()
+    result = verified(f)
+    assert result.historical_admissions_valid
+    assert any("byte_budget_exhausted" in b.reasons for b in result.final_budgets)
+    core = h.build_admission_v2(
+        f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f)
+    )
+    assert core.allowance.transfer == 500
+    f.begin().settle(status=200, size=1)
+    assert verified(f).historical_admissions_valid
+
+
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_R2_B_I_peer_overrun_blocks_B_including_simultaneous_exhaustion(exhausted):
+    f = (
+        exhausted_history(second_transfer=501)
+        if exhausted
+        else History(second_plan=True).begin().settle(transfer=501)
+    )
+    f.switch_plan()
+    f.release()
+    f.clock()
+    result = verified(f)
+    assert result.historical_admissions_valid
+    reasons = set().union(*(set(b.reasons) for b in result.final_budgets))
+    assert "sticky_overrun" in reasons
+    assert ("byte_budget_exhausted" in reasons) is exhausted
+    with pytest.raises(hc.HttpContractError, match="sticky_overrun"):
+        h.build_admission_v2(f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f))
+
+
+def test_R2_C_peer_measurement_missing_cannot_be_hidden():
+    f = exhausted_history()
+    f.switch_plan()
+    f.release()
+    f.clock()
+    pool = replace(f.pool(), measurements=f.pool().measurements[1:])
+    rejected(pool, "availability_coverage")
+    with pytest.raises(hc.HttpContractError, match="availability_coverage"):
+        h.build_admission_v2(pool, limits=LIMITS, cut=f.cut(), page=target_page(f))
+
+
+@pytest.mark.parametrize("capacity,allowed", [(160, True), (159, False)])
+def test_R2_D_F_exhausted_stopped_peer_still_occupies_capacity(capacity, allowed):
+    f = History(account_capacity=capacity, second_plan=True)
+    f.begin().settle(transfer=500)
+    f.begin().settle(
+        status=429, size=60, transfer=500, digest=hashlib.sha256(b"x" * 60).hexdigest()
+    )
+    f.switch_plan()
+    f.release()
+    f.clock()
+    result = verified(f)
+    assert result.historical_admissions_valid
+    assert sum(x.retained for x in result.final_capacity) == 60
+    assert any(p.catalog_state == "stopped" for p in f.pool().plans)
+    if allowed:
+        assert h.build_admission_v2(
+            f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f)
+        )
+    else:
+        with pytest.raises(hc.HttpContractError, match="account_retained_capacity"):
+            h.build_admission_v2(
+                f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f)
+            )
+
+
+def test_R2_E_peer_illegal_404_retry_remains_invalid():
+    f = (
+        History(second_plan=True)
+        .begin()
+        .settle(status=404)
+        .begin(illegal=True)
+        .settle(status=200)
+    )
+    f.switch_plan()
+    assert rejected(f.pool(), "previous_attempt_not_retryable").first_violation == 1
+
+
+def test_R2_G_peer_hold_blocks_B_even_when_http_budget_is_exhausted():
+    f = exhausted_history()
+    f.switch_plan()
+    f.clock()
+    assert verified(f).historical_admissions_valid
+    with pytest.raises(hc.HttpContractError, match="known_wait_not_elapsed"):
+        h.build_admission_v2(f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f))
+
+
+def test_R2_H_target_exhaustion_is_still_a_blocker():
+    f = exhausted_history()
+    f.release()
+    f.clock()
+    assert verified(f).historical_admissions_valid
+    with pytest.raises(hc.HttpContractError, match="byte_budget_exhausted"):
+        h.build_admission_v2(f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f))
+
+
+@pytest.mark.parametrize("peer", [False, True])
+def test_R2_J_unknown_reason_is_fail_closed(monkeypatch, peer):
+    f = History(second_plan=True)
+    target = f.c.plan.plan_sha
+    original = v2.budget_result
+
+    def unknown(plan, *args, **kwargs):
+        result = original(plan, *args, **kwargs)
+        if (plan.sha256 != target) is peer:
+            return replace(result, reasons=(*result.reasons, "new_unregistered_reason"))
+        return result
+
+    monkeypatch.setattr(v2, "budget_result", unknown)
+    rejected(f.pool(), "unknown_budget_reason")
+    with pytest.raises(hc.HttpContractError, match="unknown_budget_reason"):
+        h.build_admission_v2(f.pool(), limits=LIMITS, cut=f.cut(), page=target_page(f))
+
+
+def test_R2_registry_exactly_covers_all_saved_and_budget_emitters():
+    # Audit the complete module: a newly added literal emitter changes this set;
+    # computed emitters/updates require explicit review, never silent acceptance.
+    emitted = set()
+    tree = ast.parse(inspect.getsource(v2))
+    for function in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
+        if function.name not in {"_saved", "budget_result"}:
+            continue
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
+                continue
+            if (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "reasons"
+            ):
+                assert node.func.attr == "add" and len(node.args) == 1
+                assert (
+                    isinstance(node.args[0], ast.Constant)
+                    and type(node.args[0].value) is str
+                )
+                emitted.add(node.args[0].value)
+    assert emitted == h.BUDGET_REASON_REGISTRY
+    assert h.LOCAL_ELIGIBILITY_PEER_ONLY == {"byte_budget_exhausted"}
+    assert not h.LOCAL_ELIGIBILITY_PEER_ONLY & h.PEER_BLOCKER
+
+
+@pytest.mark.parametrize(
+    "axis",
+    [
+        "original_records",
+        "plans",
+        "reservations",
+        "single_record_bytes",
+        "total_canonical_bytes",
+    ],
+)
+def test_R3_early_limits_precede_expansion_parse_and_replay(monkeypatch, axis):
+    f = History(second_plan=True).begin().settle().begin()
+    pool = f.pool()
+    limit = replace(LIMITS, **{axis: 1})
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("expansion/parse/replay before cheap limits")
+
+    monkeypatch.setattr(h.SourcePoolV1, "_iter_records", forbidden)
+    monkeypatch.setattr(h, "_json", forbidden)
+    monkeypatch.setattr(c2, "_replay", forbidden)
+    monkeypatch.setattr(c3, "_replay", forbidden)
+    with pytest.raises(hc.HttpContractError, match="limit_" + axis):
+        h.verify_history_incremental(pool, limits=limit)
+
+
+def test_R3_reference_limit_stops_before_deep_replay(monkeypatch):
+    pool = History().begin().pool()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("deep replay after reference exhaustion")
+
+    monkeypatch.setattr(c2, "_replay", forbidden)
+    monkeypatch.setattr(c3, "_replay", forbidden)
+    with pytest.raises(hc.HttpContractError, match="limit_references"):
+        h.verify_history_incremental(pool, limits=replace(LIMITS, references=1))
+
+
+@pytest.mark.parametrize("second_plan", [False, True])
+@pytest.mark.parametrize("audit_count", [1, 4])
+def test_R3_scaled_audit_extension_preserves_historical_admission(
+    second_plan, audit_count
+):
+    f = History(second_plan=second_plan).begin().settle()
+    before = verified(f)
+    original_reservations = tuple(f.reservations)
+    for n in range(audit_count):
+        f.clock()
+        cut = f.cut()
+        f.j = f.j.audit(
+            evidence_ref="scaled-artificial-audit",
+            at=f.tick(),
+            operation_id=f"scaled-body-{n}",
+        )
+        f.finish(cut, h.EVIDENCE_KIND, f"scaled-operation-{n}")
+    pool = f.pool()
+    reference = h.verify_history_reference(pool, limits=LIMITS)
+    incremental = h.verify_history_incremental(pool, limits=LIMITS)
+    assert reference.to_bytes() == incremental.to_bytes()
+    assert incremental.historical_admissions_valid
+    assert tuple(f.reservations) == original_reservations
+    assert incremental.checks == before.checks
+    assert incremental.final_budgets == before.final_budgets
+    assert incremental.final_capacity == before.final_capacity
+    assert incremental.input_commitment != before.input_commitment
