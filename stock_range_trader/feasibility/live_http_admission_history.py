@@ -22,6 +22,32 @@ from .live_http_reservation_boundary import RESERVATION_KIND, semantic_request_i
 PREFIX = "historical-feasibility-artificial-admission-"
 EVIDENCE_KIND = "artificial-evidence-operation-v1"
 SETTLEMENT_KIND = "artificial-settlement-operation-v1"
+ENROLLMENT_KIND = "artificial-enrollment-operation-v1"
+ENROLLMENT_AUDIT_PREFIX = "artificial-enrollment:"
+LOCAL_ELIGIBILITY_PEER_ONLY = frozenset({"byte_budget_exhausted"})
+PEER_BLOCKER = frozenset(
+    {
+        "sticky_overrun",
+        "open_unsettled",
+        "measurement_not_committed",
+        "conflicting_measurement",
+        "unsupported_recovery_operation",
+        "response_200_body_uncommitted",
+        "body_not_stable",
+        "body_not_committed_or_quarantined",
+        "untouched_send_evidence",
+        "body_measurement_missing",
+        "object_attempt_missing",
+        "attempt_multiple_objects",
+        "final_digest_size_conflict",
+        "successful_digest_duplicate",
+        "successful_measurement_mismatch",
+        "quarantine_outcome_invalid",
+        "quarantine_is_not_http_saved",
+        "quarantine_measurement_mismatch",
+    }
+)
+BUDGET_REASON_REGISTRY = LOCAL_ELIGIBILITY_PEER_ONLY | PEER_BLOCKER
 require = v2.require
 
 
@@ -222,8 +248,12 @@ class SourcePoolV1:
 
     def records(self):
         """Canonical originals, with container identity/ordering committed too."""
+        return tuple(self._iter_records())
+
+    def _iter_records(self):
+        """Stream canonical records after the inexpensive input guard."""
         ctx = self.runtime_context
-        rows = [
+        yield from (
             self.identity.to_bytes(),
             self.store_policy_json.encode(),
             ctx.deployment.canonical,
@@ -231,31 +261,31 @@ class SourcePoolV1:
             ctx.owner_intent.canonical,
             *(p.canonical for p in ctx.owner_pins),
             self.initial.to_bytes(),
-            *self.runtime_records,
-        ]
-        rows += [p.to_bytes() for p in self.plans]
+        )
+        yield from self.runtime_records
+        for p in self.plans:
+            yield p.to_bytes()
         for j in self.journals:
-            rows.append(
-                c3._canonical(
-                    {
-                        "schema": j.schema,
-                        "journal_id": j.journal_id,
-                        "kind": j.kind,
-                        "plan_sha": j.plan_sha,
-                        "journal_schema": j.journal_schema,
-                        "count": len(j.records),
-                    }
-                ).encode()
-            )
-            rows.extend(r.encode() for r in j.records)
+            yield c3._canonical(
+                {
+                    "schema": j.schema,
+                    "journal_id": j.journal_id,
+                    "kind": j.kind,
+                    "plan_sha": j.plan_sha,
+                    "journal_schema": j.journal_schema,
+                    "count": len(j.records),
+                }
+            ).encode()
+            for r in j.records:
+                yield r.encode()
         for values in (
             self.operations,
             self.reservations,
             self.measurements,
             self.availability,
         ):
-            rows.extend(v.to_bytes() for v in values)
-        return tuple(rows)
+            for v in values:
+                yield v.to_bytes()
 
     @property
     def commitment(self):
@@ -373,9 +403,10 @@ class ReplayStatistics:
     full_replays: int = 0
     indexed_events: int = 0
     prefix_hits: int = 0
+    retained_prefixes: int = 0
 
 
-def _dependency_count(pool):
+def _dependency_count(pool, maximum=None):
     """Bound explicit operation edges plus nested journal/measurement links."""
     count = sum(
         len(o.source.heads) + len(o.result.heads) + len(o.parts) + 2
@@ -389,8 +420,16 @@ def _dependency_count(pool):
     count += (
         len(pool.measurements) * 3 + len(pool.runtime_records) + len(pool.plans) * 4
     )
+
+    def bounded(value):
+        value = c3._integer(value)
+        require(maximum is None or value <= maximum, "limit_references")
+        return value
+
+    bounded(count)
     for journal in pool.journals:
         count += len(journal.records)  # previous-hash edges
+        bounded(count)
         for line in journal.records:
             row = _json(line)
             event = row.get("event")
@@ -412,23 +451,77 @@ def _dependency_count(pool):
                 prior = data.get("prior_plan_heads", ())
                 require(type(prior) in {list, tuple}, "dependency_enrollment_shape")
                 count += len(prior) + 1
-    return c3._integer(count)
+            bounded(count)
+    return bounded(count)
 
 
-def _limits(pool, limits):
+def _cheap_limits(pool, limits):
+    """No parsing, canonical expansion or replay before count/raw byte bounds.
+
+    The caller's already-created Python objects are outside this resource guard.
+    UTF-8 encoding is bounded by first checking the string's character count.
+    """
     require(
         type(pool) is SourcePoolV1 and type(limits) is ValidationLimitsV1,
         "limits_required",
     )
-    rows = pool.records()
-    refs = _dependency_count(pool)
+    for name in ("plans", "reservations"):
+        require(len(getattr(pool, name)) <= getattr(limits, name), "limit_" + name)
+    count = 6 + len(pool.runtime_context.owner_pins) + len(pool.runtime_records)
+    count += len(pool.plans) + len(pool.journals)
+    count += sum(len(j.records) for j in pool.journals)
+    count += sum(
+        len(values)
+        for values in (
+            pool.operations,
+            pool.reservations,
+            pool.measurements,
+            pool.availability,
+        )
+    )
+    require(count <= limits.original_records, "limit_original_records")
+    raw_total = 0
+
+    def charge(raw):
+        nonlocal raw_total
+        require(len(raw) <= limits.single_record_bytes, "limit_single_record_bytes")
+        size = len(raw.encode()) if type(raw) is str else len(raw)
+        require(size <= limits.single_record_bytes, "limit_single_record_bytes")
+        raw_total += size
+        require(
+            raw_total <= limits.total_canonical_bytes, "limit_total_canonical_bytes"
+        )
+
+    charge(pool.store_policy_json)
+    for raw in pool.runtime_records:
+        charge(raw)
+    for journal in pool.journals:
+        for raw in journal.records:
+            charge(raw)
+    return count
+
+
+def _limits(pool, limits):
+    count = _cheap_limits(pool, limits)
+    total_bytes = largest = emitted = 0
+    for raw in pool._iter_records():
+        size = len(raw)
+        require(size <= limits.single_record_bytes, "limit_single_record_bytes")
+        total_bytes = v2.total((total_bytes, size))
+        require(
+            total_bytes <= limits.total_canonical_bytes, "limit_total_canonical_bytes"
+        )
+        largest = max(largest, size)
+        emitted += 1
+    require(emitted == count, "record_count_mismatch")
+    refs = _dependency_count(pool, limits.references)
     actual = (
-        len(rows),
-        v2.total(len(r) for r in rows),
+        count,
+        total_bytes,
         len(pool.reservations),
         len(pool.plans),
         refs,
-        max(map(len, rows), default=0),
+        largest,
     )
     for key, count in zip(vars(limits), actual, strict=True):
         require(count <= getattr(limits, key), "limit_" + key)
@@ -523,6 +616,7 @@ class _Index:
                 views.append(reducer.projection())
                 self.stats.indexed_events += 1
         self.views[j.journal_id] = views
+        self.stats.retained_prefixes += len(views)
 
     def get(self, ref):
         require(ref.journal_id in self.sources, "unknown_journal")
@@ -617,6 +711,12 @@ def _chain_next(head, operation):
     )
 
 
+def _registered_budget_reasons(budget, *, peer):
+    reasons = set(budget.reasons) | set(budget.saved.reasons)
+    require(reasons <= BUDGET_REASON_REGISTRY, "unknown_budget_reason")
+    return reasons - LOCAL_ELIGIBILITY_PEER_ONLY if peer else reasons
+
+
 def _assessment(pool, index, cut, page, available, allowances):
     views = index.cut(cut)
     ap = _reconcile(index, views)
@@ -639,7 +739,7 @@ def _assessment(pool, index, cut, page, available, allowances):
         target_plan_sha=page.plan_sha,
         store_policy=store.StorePolicy.from_bytes(pool.store_policy_json.encode()),
     )
-    reasons = set(budget.reasons) | set(capacity.reasons)
+    reasons = _registered_budget_reasons(budget, peer=False) | set(capacity.reasons)
     restrictions = set()
     if (
         not scope.not_before <= at < scope.expires_at
@@ -714,7 +814,9 @@ def _assessment(pool, index, cut, page, available, allowances):
                 other_originals,
                 allowances,
             )
-            restrictions.update(other_budget.reasons)
+            restrictions.update(
+                _registered_budget_reasons(other_budget, peer=sha != page.plan_sha)
+            )
     reasons |= restrictions | retry
     assessment = AdmissionAssessmentV2(
         budget.saved.compatible,
@@ -854,7 +956,8 @@ def _validate_sources(pool, index, events):
     )
     require(
         all(
-            o.kind in {RESERVATION_KIND, EVIDENCE_KIND, SETTLEMENT_KIND}
+            o.kind
+            in {RESERVATION_KIND, EVIDENCE_KIND, SETTLEMENT_KIND, ENROLLMENT_KIND}
             for o in pool.operations
         ),
         "unsupported_recovery_operation",
@@ -890,10 +993,67 @@ def _validate_sources(pool, index, events):
     )
 
 
+def _enrollment_profile(index, op, before, after, additions):
+    """One new B: account enrollment, B plan opening, B initial body audit."""
+    sha = op.plan_sha
+    plan_id, body_id = index.plan_ids[sha], index.body_ids[sha]
+    prior = before[index.account_id]
+    current = after[index.account_id]
+    require(
+        sha not in {s.plan_sha for s in prior.scopes}
+        and {s.plan_sha for s in current.scopes}
+        == {s.plan_sha for s in prior.scopes} | {sha}
+        and before[plan_id] is None
+        and not before[body_id].objects,
+        "enrollment_prior_scope",
+    )
+    ids = (index.account_id, plan_id, body_id)
+    require(
+        len(additions) == 3 and {jid for jid, _ in additions} == set(ids),
+        "enrollment_event_profile",
+    )
+    rows = dict(additions)
+    require(
+        tuple(rows[jid]["event"]["kind"] for jid in ids)
+        == ("plan_enrolled", "journal_opened", "audit")
+        and rows[plan_id]["sequence"] == rows[body_id]["sequence"] == 0,
+        "enrollment_event_profile",
+    )
+    require(
+        tuple((p.journal_id, p.role) for p in op.parts)
+        == tuple(
+            zip(
+                ids,
+                ("account-enrollment", "plan-enrollment", "body-enrollment"),
+                strict=True,
+            )
+        ),
+        "enrollment_part_profile",
+    )
+    account_event, plan_event, body_event = (rows[jid]["event"] for jid in ids)
+    require(
+        account_event["recorded_at"]
+        == plan_event["recorded_at"]
+        <= body_event["recorded_at"],
+        "enrollment_event_order",
+    )
+    body_event = c3.BodyEvent.from_dict(body_event)
+    require(
+        body_event.object_id is None
+        and body_event.c2_heads is None
+        and _json(body_event.payload_json)
+        == {"evidence_ref": ENROLLMENT_AUDIT_PREFIX + sha},
+        "enrollment_body_audit",
+    )
+    # Existing C2 enrollment replay verifies document/owner/previous-head and
+    # paired opening bindings. C3 replay verifies the supplied contract/root.
+    _reconcile(index, after)
+
+
 def _operation(pool, index, op, previous, events):
     """Validate an entire atomic artificial operation, including every part."""
     require(
-        op.kind in {RESERVATION_KIND, EVIDENCE_KIND, SETTLEMENT_KIND},
+        op.kind in {RESERVATION_KIND, EVIDENCE_KIND, SETTLEMENT_KIND, ENROLLMENT_KIND},
         "unsupported_recovery_operation",
     )
     require(op.plan_sha in index.plans, "operation_plan")
@@ -972,6 +1132,37 @@ def _operation(pool, index, op, previous, events):
     require(
         bool(additions) and len(op.parts) == len(additions), "operation_parts_missing"
     )
+    allowed = {
+        index.account_id,
+        index.plan_ids[op.plan_sha],
+        index.body_ids[op.plan_sha],
+    }
+    require(
+        all(p.journal_id in allowed for p in op.parts)
+        and all(jid in allowed for jid, _ in additions),
+        "part_scope_mismatch",
+    )
+    if op.kind == ENROLLMENT_KIND:
+        _enrollment_profile(index, op, before, after, additions)
+    else:
+        require(
+            not any(
+                row["event"]["kind"] in {"plan_enrolled", "journal_opened"}
+                for _, row in additions
+            )
+            and {s.plan_sha for s in before[index.account_id].scopes}
+            == {s.plan_sha for s in after[index.account_id].scopes},
+            "enrollment_operation_required",
+        )
+        for jid, row in additions:
+            if index.sources[jid].kind == "body" and row["event"]["kind"] == "audit":
+                event = c3.BodyEvent.from_dict(row["event"])
+                require(
+                    not _json(event.payload_json)["evidence_ref"].startswith(
+                        ENROLLMENT_AUDIT_PREFIX
+                    ),
+                    "enrollment_operation_required",
+                )
     reservation_events = {"slot_reserved", "attempt_reserved", "reserved"}
     require(
         (op.kind == RESERVATION_KIND)
@@ -1002,6 +1193,17 @@ def _operation(pool, index, op, previous, events):
     require(
         tuple(p.ordinal for p in op.parts) == tuple(range(len(op.parts))), "part_order"
     )
+    if op.kind in {EVIDENCE_KIND, SETTLEMENT_KIND}:
+        require(
+            tuple((p.journal_id, p.sequence, p.role) for p in op.parts)
+            == tuple(
+                (jid, sequence, f"evidence-{i}")
+                for i, (jid, sequence) in enumerate(
+                    sorted((jid, row["sequence"]) for jid, row in additions)
+                )
+            ),
+            "evidence_part_profile",
+        )
     require(all(p.result_head == p.event_hash for p in op.parts), "part_result_head")
     receipt = _json(op.receipt_json)
     require(
@@ -1302,6 +1504,7 @@ def _evaluate(pool, limits, incremental, stats):
                         allowances,
                     )
                 )
+                _registered_budget_reasons(budgets[-1], peer=False)
             # Unknown size has no invented zero-valued final capacity result.
             require(bp.retained_body_bytes is not None, "unknown_retained_size")
             capacity.append(

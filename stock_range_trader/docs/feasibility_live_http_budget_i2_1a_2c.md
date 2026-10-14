@@ -202,3 +202,124 @@ Linux Python 3.11/3.12/3.13 CI、独立レビューは未実施。push/PR/Merge�
 ReferenceとIncrementalが共有する契約条件の誤りを重点確認する。
 本実装者によるテスト成功を独立したCritical/High/Medium/Lowの0件認定とはしない。
 数値profile未承認のためMerge candidateはNo。2B/I2-1B/production dispatchもNo。
+
+## 2026-10-14 Post-Merge remediation（OD-2C-R1〜R5）
+
+上の2026-10-13の測定・検証値は是正前の履歴であり、今回の結果へ読み替えない。
+PR #27のMergeとCI成功は確認済みだが、公開数値profileの承認を含む従前の
+Merge Gateが成立したことを意味せず、遡及的なPASSとは扱わない。
+
+今回の固定baseは`efbc67cbf28b8bf736d8822880916a84652dc199`、
+treeは`aee5ef3262f43632b4924cd3cb85422534f4a71d`。
+Owner承認済み原文14,978 bytesのSHA-256は
+`54b5432f0165cfc4cb5727cdad4ea9b92fe04a2c1230dfec901c9246c30facb3`。
+承認packetの全文を照合し、専用branch
+`real-oos/i2-1a-2c-postmerge-remediation`でpure実装だけを是正する。
+既存Store、Runtime、C1/C2/C3、Budget v1/v2、保存schemaは変更しない。
+
+### R1：書込みscopeと後続enrollment
+
+operationの書込みpartと実際に進むjournalは、account、当該`operation.plan_sha`
+のplan/bodyに限定する。他planへの書込みは`part_scope_mismatch`で拒否する。
+他planをdependency/sourceとして読み、そのheadを進めない操作は従来どおり許可する。
+
+後続Bのenrollmentは、B自身に帰属する専用人工kind
+`artificial-enrollment-operation-v1`で表す。これは本番Storeのkindやhandlerではない。
+sourceにBのenrollmentは存在せず、resultへ次の3 eventsだけを追加する。
+
+| 順序 | journal | role | event |
+|---|---|---|---|
+| 0 | account | account-enrollment | plan_enrolled |
+| 1 | 新B plan | plan-enrollment | journal_opened、sequence 0 |
+| 2 | 新B body | body-enrollment | audit、sequence 0 |
+
+account/planの時刻は同一、body auditはそれ以降とし、auditはobject/c2_headsを持たず、
+payloadを`{"evidence_ref":"artificial-enrollment:<B plan SHA>"}`に固定する。
+既存C2の正規replay/reconciliationとC3の正規root/contract検証により、
+documents、prior heads、openingの対、body初期状態の整合を検査する。
+専用kindでも追加のauditや他plan書込みは許可しない。
+汎用evidence/settlement/reservationへenrollment eventsや専用auditを紛れ込ませることは拒否する。
+`pool.initial`のbootstrapとは区別し、将来Bの原本がpool内にあるだけでは過去のenrollmentにならない。
+C2/C3のtransition IDを外側operation IDへ改変するような架空のmetadataは追加しない。
+
+### R2：peerの正常な枯渇だけを除外
+
+固定registryをhistory側へ置く。完全一致で分類し、prefixによる推測はしない。
+
+- `LOCAL_ELIGIBILITY_PEER_ONLY`：`byte_budget_exhausted`のみ。
+- `PEER_BLOCKER`：`sticky_overrun`、`open_unsettled`、`measurement_not_committed`、
+  `conflicting_measurement`、`unsupported_recovery_operation`、`response_200_body_uncommitted`、
+  `body_not_stable`、`body_not_committed_or_quarantined`、`untouched_send_evidence`、
+  `body_measurement_missing`、`object_attempt_missing`、`attempt_multiple_objects`、
+  `final_digest_size_conflict`、`successful_digest_duplicate`、`successful_measurement_mismatch`、
+  `quarantine_outcome_invalid`、`quarantine_is_not_http_saved`、`quarantine_measurement_mismatch`。
+
+target自身の理由は除外せず、peerでは最初の集合だけを除外する。
+未知reasonは`unknown_budget_reason`でfail-closed。最終budget集計にもregistry検査を適用する。
+静的テストでBudget v2の全reason emitterとregistryの一致を検査し、未知reasonの動的注入も拒否する。
+account/plan capacity、未解除hold、wait、過去の不正予約は別経路で引き続き強制する。
+停止済みpeerのretained bytesもaccount容量に算入し続ける。
+合法だった過去予約を、後のpeer枯渇だけで遡及的に不正扱いしない。
+
+### R3：早期limitsと是正HEADの人工実測
+
+順序は、型・plan/予約/原本件数、raw文字数/bytes、逐次canonical bytes、
+bounded dependency parse/reference件数、深いreplay/逐次監査とする。
+原本全体のcanonical tupleを先に展開せず、個別/総bytes超過時はその時点で停止する。
+raw文字列はUTF-8 encodingより先に文字数を検査する。
+既に呼出側が構築したPythonオブジェクトや、未承認の巨大なcaller limitsの
+メモリ消費を保証するものではない。`measure_input_size`も診断用で、実行権限ではない。
+`ReplayStatistics.retained_prefixes`は計測専用で、canonical結果やpersisted schemaには含めない。
+
+人工fixtureの暫定六上限は引き続き1,500 records / 4,000,000 canonical bytes /
+24 reservations / 4 plans / 5,000 references / 32,768 single-record bytesである。
+公開値としては未承認。探索用に別のcaller limitsを使用した場合は、その値と理由を
+benchmarkの各行へ記録し、公開profileへ昇格させない。
+
+正式実測は是正をまとめたローカル1 commitのclean HEADで実施する。
+人工pool、計測スクリプト、ログはrepo外に保持し、測定結果を入れるための追加commitは作らない。
+fixture生成・loadと検証を分離し、5回以上のwall/CPU中央値・最大、process RSSと
+tracemalloc peakを別々に報告する。guard/parse/replay計数・時間、prefix保持数も記録する。
+ステージ時間は包含関係があるため単純加算しない。
+高負荷のReferenceは60秒/512 MiB等の探索停止を認めるが、停止は一致確認ではない。
+小規模同形fixture、prefix不変性、追加audit/planによるmetamorphic検証で補助する。
+Linux実行系がない場合は未検証と記録し、macOS結果をLinux結果として扱わない。
+単一軸の測定や資源保護用停止値からproduction SLAや複合上限の保証を導かない。
+
+### R4/R5：権限と正式再受入
+
+pure結果の`producer_authenticated`、`reservation_permitted`、`live_send_permitted`は固定false。
+将来2BではOwner承認済みprofile ID/version/六上限/digest/approval referenceを
+Store管理documents/preconditionsへ束縛し、authoritative headsと全plan inventoryを使用する。
+未知profile、旧Core、source欠落を拒否する必要があるが、本変更では実装しない。
+
+R1-A〜H、R2-A〜J、既存専用試験の意図、v1完全非回帰を検査する。
+是正後実測を受けた六上限と許容wall/memory thresholdのOwner承認、
+Claude Code / Opus 5.5 / Highの独立レビュー、別承認によるpush/PR/CI/通常Merge、
+統合HEAD/tree/両親/profile確認を経て、2C正式再受入を別途判定する。
+本実装・ローカルgreenだけではM-R1-1/L-2C-9/L-2C-10の独立受入を宣言しない。
+L-BUD-5の数値・性能基準承認をはじめ既存のStore authority/真正性/物理実装の課題は残る。
+
+local pure remediationとsynthetic benchmarkだけが許可済み。
+Numeric public profile、push/PR/Merge、2B、I2-1B、production dispatchはNo。
+Live Gate closed。実HTTP/J-Quants、Formal Real OOSは引き続き不可。
+
+### 是正後のcommit前ローカル検証
+
+macOS 15.7.7 arm64 / Python 3.13.3。依存の追加・更新はしていない。
+既存の独立venvを読み取り使用し、importと作業先は新しい専用worktreeとした。
+
+| 検査 | 結果 |
+|---|---|
+| 2C専用（`-W error`） | 121 passed / 24.10秒 |
+| macOS対象Store 4ファイル | 289 passed / 58.01秒 |
+| feasibility全体 | 1,514 passed / 137.04秒 |
+| 全pytest | 2,997 passed / 13 skipped / 28既存warnings / 783.48秒 |
+| Ruff check / format / diff check | pass |
+
+baseの2,961 passedから36件増加。既存試験を削除したりskipへ変更したりしていない。
+skipはLive 7件とheadless browser 6件で、未検証。
+28 warningsは既存`jquants_v2.py:411`のurllib3 `allowed_methods`のみ。
+Linux Python 3.11/3.12/3.13の実行系はローカルにないため未検証。
+新HEADのGitHub CI、独立レビューは未実施であり、pushはしない。
+正式benchmarkの結果はこのcommit後、同じHEADに対してrepo外の別レポートへ記録する。
