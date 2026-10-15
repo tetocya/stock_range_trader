@@ -33,11 +33,18 @@ EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
 
 
 class History(EnrolledScenario):
-    def __init__(self, *, account_capacity=100000, second_plan=False):
+    def __init__(
+        self, *, account_capacity=100000, second_plan=False, account_cumulative=None
+    ):
         super().__init__()
         if second_plan:
             self.enroll_b(same_time=True)
-        self.policy = store.StorePolicy(4, 32768, account_capacity, account_capacity)
+        self.policy = store.StorePolicy(
+            4,
+            32768,
+            account_capacity,
+            account_capacity if account_cumulative is None else account_cumulative,
+        )
         pre = self.src["preflight"]
         runtime_policy = rt.RuntimePolicy()
         deployment = store.DeploymentRecord(
@@ -97,6 +104,8 @@ class History(EnrolledScenario):
         self.runtime_append("session_started", payload={"owner_pin_sha": pin.sha256})
         self.clock()
         self.ops, self.reservations, self.measurements, self.avail = [], [], [], []
+        # Selection never implicitly stops the other plan.
+        self.catalog_states = {}
         self.initial = self.cut()
 
     def switch_plan(self):
@@ -177,7 +186,7 @@ class History(EnrolledScenario):
                 self.root,
                 self.src["canonical_approval"],
                 self.src["canonical_preflight"],
-                "enrolled",
+                self.catalog_states.get(self.c.plan.plan_sha, "enrolled"),
             )
         ]
         if self.pb:
@@ -187,7 +196,7 @@ class History(EnrolledScenario):
                     self.jb.root,
                     self.src_b["canonical_approval"],
                     self.src_b["canonical_preflight"],
-                    "stopped",
+                    self.catalog_states.get(self.jb.contract.plan.plan_sha, "enrolled"),
                 )
             )
         return h.SourcePoolV1(
@@ -353,16 +362,31 @@ class History(EnrolledScenario):
             # claimed core, while the public historical verifier must reject it.
             index = h._Index(pool, True, h.ReplayStatistics())
             prior = h._chain_start()
+            events = h._runtime(pool, h.ReplayStatistics())
+            previous = pool.initial
+            available, allowances = [], {}
+            reservations = {r.operation_sha: r for r in pool.reservations}
             for op in pool.operations:
+                _, additions = h._operation(pool, index, op, previous, events)
+                if op.kind == h.RESERVATION_KIND:
+                    record = reservations[op.sha256]
+                    old_core = h.AdmissionCoreV2.from_bytes(record.core_json.encode())
+                    part = next(p for p in op.parts if p.role == "body-reservation")
+                    row = index.rows[part.journal_id][part.sequence]
+                    obj = c3.ObjectIdentity.from_dict(
+                        json.loads(row["event"]["payload_json"])
+                    )
+                    assert obj.binding.plan_sha == old_core.plan_sha == op.plan_sha
+                    assert obj.binding.slot_id == record.slot_id
+                    allowances[obj.binding] = old_core.allowance
+                # Availability follows the verified operation/receipt/parts/audit,
+                # never the final measurement list or UTC ordering alone.
+                available.extend(h._available(pool, index, op, additions))
                 prior = h._chain_next(prior, op)
-            available = pool.measurements
-            allowances = {}
-            for record in pool.reservations:
-                old_core = h.AdmissionCoreV2.from_bytes(record.core_json.encode())
-                for obj in self.j.projection.objects:
-                    if obj.identity.binding.slot_id == record.slot_id:
-                        allowances[obj.identity.binding] = old_core.allowance
-            core = h._core(pool, index, before, page, available, allowances, prior)[0]
+                previous = op.result
+            core = h._core(
+                pool, index, before, page, tuple(available), allowances, prior
+            )[0]
         else:
             core = h.build_admission_v2(pool, limits=LIMITS, cut=before, page=page)
         self.index += 1
@@ -862,6 +886,7 @@ def test_G_H_full_history_other_stopped_plan_is_in_account_capacity(capacity, al
     f = History(account_capacity=capacity, second_plan=True)
     f.switch_plan()
     f.begin().settle(size=60)
+    f.catalog_states[f.c.plan.plan_sha] = "stopped"
     f.switch_plan()
     f.release()
     f.clock()
@@ -1256,6 +1281,7 @@ def test_R2_D_F_exhausted_stopped_peer_still_occupies_capacity(capacity, allowed
     f.begin().settle(
         status=429, size=60, transfer=500, digest=hashlib.sha256(b"x" * 60).hexdigest()
     )
+    f.catalog_states[f.c.plan.plan_sha] = "stopped"
     f.switch_plan()
     f.release()
     f.clock()

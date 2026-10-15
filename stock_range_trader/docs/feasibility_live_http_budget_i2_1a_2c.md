@@ -323,3 +323,203 @@ skipはLive 7件とheadless browser 6件で、未検証。
 Linux Python 3.11/3.12/3.13の実行系はローカルにないため未検証。
 新HEADのGitHub CI、独立レビューは未実施であり、pushはしない。
 正式benchmarkの結果はこのcommit後、同じHEADに対してrepo外の別レポートへ記録する。
+
+## VL-01〜06：tests/docs限定の補強（2026-10-15）
+
+この節は上記R1〜R5当時の結果とは別の、Owner承認済みローカル検証を記録する。
+固定baseは`d307fad9cd1791a3ac206cf3f8420ec279c3500e`、treeは
+`06add56d67af3ef8398375f03ffbc4c0f302fce7`。
+承認原文24,340 bytesのSHA-256は
+`1072ae4c2de72c20f4104e4209d0c514da22ac478aa4bb2c14838e011b3f5e65`。
+Owner承認ヘッダーの対象はtests/docs・人工benchmark・ローカル1コミットまでであり、
+原文に列挙された数値候補を公開上限やSLAとして承認したものではない。
+
+### L-RV-1：reason生成経路の監査
+
+既存のliteral `.add()`検査を削除せず、2C専用の
+`test_feasibility_live_http_validation_coverage.py`へ補助検査を分離した。
+Historyの状態構築と、静的検査器自身のmutantを独立に読めるようにするための追加である。
+
+Budget/Savedの二つのsinkを対象に、literal add/update、集合union、`|=`、
+初期set/tuple/list、constructorのreason引数を収集し、固定registryと完全比較する。
+Capacity専用reasonと例外文言をBudget registryへ混入させない。
+`saved.reasons`の伝播は既知のedgeとして扱い、target/peer × Budget/Savedの
+4通りの動的注入で両verifierと`build_admission_v2`の拒否も確認する。
+
+新helper、alias、動的文字列、comprehension、未知のreturn経路は推測で通さない。
+既知moduleのtop-level AST unitごとの固定fingerprintを併用し、constructor、
+import、module assignmentを含む未監査の構造変更を要レビューとして検出する。
+fingerprintは実行時生成で追随せず、更新にはreason経路の差分監査を要する。
+Python 3.12で追加された空の`type_params`だけを正規化する。
+これは任意Pythonの完全な静的解析や、悪意ある同一processからの防御ではない。
+reasonに無関係な構造変更も保守的にレビューを要求する制約がある。
+
+### L-RV-2：mixed-plan fixture
+
+plan選択とcatalogのenrolled/stoppedを分離し、既定の人工peerもenrolledとする。
+既存のstopped-peer試験は停止を明示することで以前の意味を維持した。
+不正予約を作る試験補助経路では、過去operationをcommit順にたどり、receipt/parts/auditを
+確認した後だけmeasurementを追加する。allowanceは全planのbody-reservationから
+完全AttemptBindingで復元し、現在選択中のbodyや最終measurement一覧へ依存しない。
+
+正常control、A/B交替後の404不正retry、Bの違反後にAが成功する場合、正常peer枯渇、
+peer sticky overrun、stopped retained容量の160/159境界、長い履歴の末尾違反を追加した。
+役割を交換したケースも検証し、canonical一致だけでなく正しいreasonと最初の違反位置を
+固定期待値でassertする。retained境界ではcumulative容量を別設定にして、意図しない
+別の容量理由が先に出るfixtureを避けた。これらは人工設定であり公開既定値ではない。
+
+### 測定の位置付けと原本
+
+人工原本はrepo外のcanonical JSONとして保持し、各original hash、pool commitment、
+manifest/harness SHAを固定する。pickleや既存の市場データは使用しない。
+この承認では最終コミット前に測定結果を文書へまとめるため、base production SHAと
+変更後のfixture test SHAを各測定行に記録し、最後にtests/docsだけを1コミットとする。
+上記R3当時のcommit後測定と混同しない。
+
+Profile Bの候補六上限は300 /500,000 /7 /2 /850 /32,768、
+Aは1,500 /4,000,000 /24 /4 /5,000 /32,768。
+順にrecords、canonical bytes、reservations、plans、references、最大単一原本bytesである。
+どちらもOwner未承認の人工測定用caller limitsで、production constantを追加していない。
+
+T（spy/tracemallocなし）、M（process RSS）、P（Python allocation）、D（diagnostic）、
+R（直接canonical比較）、N（拒否費用）を別fresh processで測定する。
+import、fixture load/hash確認、verifier本体を分離する。低頻度の探索停止用SIGALRMは
+各modeにあり、60秒/512MiBはSLAではない。Dの包含時間は単純加算しない。
+Mの開始後HWM差は厳密な増分RSSではなく、Pのpeakとも別の量である。
+
+Linux x86_64のPython 3.13環境は今回準備できていない。同じcanonical fixture bytesを
+渡すrunbookを残すが、Linux性能・Linuxでの新テスト・新HEADのCIは未検証とする。
+macOSのみの結果や既存Linux CIをLinux性能の証拠へ読み替えない。
+
+公開profile ID/version/digest・六上限・数値SLAの確定、独立レビュー、2C正式再受入は
+引き続き別判断である。L-RV-1/2は本補強の独立レビュー後に解消判定する。
+Store/Runtime、C1/C2/C3、Budget v1/v2、production verifierは変更しない。
+permission/authenticationは固定false、Live Gateはclosed。
+Push/PR/Merge、2B/I2-1B、実HTTP/J-Quants、Formal Real OOSへ進まない。
+
+### VLローカル品質検査
+
+macOS 15.7.7 arm64 / Apple M4 / 16 GiB / Python 3.13.3。
+既存venvを読み取り使用し、import先は今回の独立worktreeへ固定した。
+新しい依存の導入や既存環境の変更はない。
+
+| 検査 | 結果 |
+|---|---|
+| 2C専用（3ファイル、`-W error`） | 156 passed / 82.03秒 |
+| macOS Store対象4ファイル | 289 passed / 58.28秒 |
+| feasibility全体 | 1,549 passed / 192.42秒 |
+| 全pytest | 3,032 passed / 13 skipped / 28既存warnings / 827.41秒 |
+
+baselineの2,997件を維持して35件追加した。既存試験の削除・skip追加はない。
+Live 7件・browser 6件は未検証で、既存urllib3 warning 28件も変更していない。
+Python 3.11/3.12のローカル実行は未実施。
+
+初回の制限付き全pytestは133 failed / 260 errors / 2,639 passedだった。
+既存人工Store試験のHOME配下temp作成がsandboxに拒否され、F0試験では
+明示した`/private/tmp`が標準tempの許可root外だった。加えてlocalhost socketを使う
+既存試験には実行権限が必要だった。productionやテストの検査条件は緩めず、
+標準`tempfile` rootと必要な権限で上記全体を再実行した結果を最終結果とする。
+既存試験が生成する専用人工Storeとloopback応答以外の市場API・保存口座は使用しない。
+
+### VL人工fixtureの到達範囲
+
+| fixture | records | canonical bytes | 予約数 | plan数 | references | 最大原本bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| B：7予約 | 236 | 430,177 | 7 | 2 | 673 | 14,981 |
+| B：複合 | 262 | 500,000 | 7 | 2 | 733 | 32,768 |
+| A：24予約 | 774 | 1,657,075 | 24 | 4 | 2,993 | 17,923 |
+| A：複合 | 1,477 | 3,861,772 | 24 | 4 | 4,991 | 19,109 |
+
+Bは六上限を同時に満たす7予約・2 planの合法な複合fixtureを構成できた。
+ただしrecords=300/references=850を同時に飽和させるfixtureは未作成で、
+上表は測定した構成であって全入力構造の数学的最大や性能保証ではない。
+Aも六軸すべてのexact境界を網羅したとは扱わない。
+
+六軸の機構確認は、合法なB複合の実測値をexact limitsとし、各軸だけを1下げた
+別ケースとして実行する。これと公開候補値の実境界試験を混同しない。
+候補境界にはrecords 300/301、bytes 500,000/500,001、予約7/8、plan 2/3、
+単一原本32,768、raw runtime原本32,769を用いる。最後は入口でのsize拒否の証拠であり、
+合法C3原本ではない（C3の型付き生成API自体が32,769 bytesを既に拒否する）。
+referencesはこのappend-only familyの奇数カウントにより849/851で候補850を挟む。
+exact-850の合法fixtureは未検証。0予約のケースでは診断helperが1へ丸めるため、
+manifestに別記した`actual_reservations`を真の件数として使う。
+
+正常terminal・解除済みhold・peer枯渇・stopped retainedと、末尾404不正retry、
+peer sticky overrun、cross-plan part scope、未来settlement commit、未知reasonも
+人工原本に含める。negativeでは想定reasonと最初の違反位置を固定し、
+別の欠損・receipt不整合による拒否を意図した検証結果へ読み替えない。
+
+### VL macOS性能実測
+
+各case/modeは5回、fresh processで測定した。TはIncremental public verifier、
+RSSはM、Python peakはPから取り、計装時間をTへ混ぜていない。
+Python peakはloadとverifierを含む最大値、RSSはprocess全体のHWMである。
+
+| fixture | T中央値 / 最大（秒） | RSS最大（MiB） | Python peak最大（MiB） |
+|---|---:|---:|---:|
+| baseline（1予約・1 plan） | 0.02244 / 0.02260 | 54.97 | 0.61 |
+| B：7予約 | 0.19037 / 0.19160 | 55.30 | 2.90 |
+| B：複合 | 0.22200 / 0.22313 | 58.98 | 3.21 |
+| A：24予約 | 1.13740 / 1.16039 | 58.48 | 8.49 |
+| A：複合 | 2.27078 / 2.27284 | 75.70 | 16.56 |
+
+A複合のPython peakは17,366,222 bytes（16.56 MiB）で、未承認候補16 MiBを上回った。
+verifier単体のlive allocation peakも16,797,859 bytes（16.02 MiB）である。
+verifier開始時baselineからの増分peakは6,173,941 bytes（5.89 MiB）だが、
+これを総peakと置き換えて候補以内とは報告しない。公開SLAの合否は未判定。
+baselineと大規模fixtureの比率は規模差であり、変更前後の回帰倍率ではない。
+1.25/1.5倍等の未承認回帰閾値を満たす証拠にもしていない。
+
+| 境界超過・不正入力 | N中央値 / 最大（ms） |
+|---|---:|
+| records 301 | 0.0189 / 0.0267 |
+| bytes 500,001 | 1.5663 / 1.8225 |
+| reservations 8 | 0.0167 / 0.0172 |
+| plans 3 | 0.0178 / 0.0217 |
+| references 851 | 2.3378 / 2.4020 |
+| raw single record 32,769 | 0.0198 / 0.0217 |
+| 末尾の不正retry（位置8） | 229.3635 / 233.8315 |
+| peer sticky overrun（位置3） | 79.9144 / 80.8983 |
+| cross-plan part scope（位置0） | 5.9084 / 6.0300 |
+| future measurement commit（位置1） | 23.2371 / 23.5668 |
+| 未知reason（位置0） | 5.2006 / 5.3301 |
+
+安価な入口上限と、履歴を読んで初めて検出する意味違反は別の費用である。
+全negativeを一律50ms以内とは主張しない。50ms自体も公開承認されていない。
+
+Dの内部logical full_replaysはB複合6、A複合10だったが、実関数call数とは異なる。
+spyで観測したC3 replay / C2 replay / JSON parseはそれぞれ
+B複合2 /24 /427、A複合4 /50 /3,100。
+bytes超過はJSON/replayとも0、references超過はJSON 75 / replay 0で停止した。
+これは現fixture上の観測であり、任意入力での計算量や物理Storeの性能保証ではない。
+
+A複合のRは5回とも60秒の探索上限で停止し、Referenceとの一致は未確認。
+Incremental側は全5回で有効な結果を返したが、Reference未完了を成功とは数えない。
+Linux同一bytes比較、OS負荷・thermalの統制、公開上限のOwner判断は残る。
+
+補助比較では、同じ4 plan・24予約でauditレコードを減らしたA原本を使った。
+このRは5回ともcanonical一致、合計検証時間の中央値28.70873秒 / 最大28.74817秒、
+Reference単独の中央値27.55805秒 / 最大27.60022秒だった。
+B複合もRは5回とも一致。全体では30 case・680測定行、直接比較50回一致、
+上記A複合5回は未比較である。上限超過の260行は期待どおりの拒否で、正常入力の
+成功件数へ足さない。mode/反復間で返却済みのcanonical結果hashも一致した。
+
+### VL測定成果物と引継ぎ
+
+repo外の`stock-range-i2c-vl.7wkA2J/verified-v2`へcanonical原本、各original SHA、
+pool commitment、environment、raw、summary JSON/CSVを保存した。
+測定script、再現runbook、品質検査log、最終local commitとの対応receiptを
+まとめたarchiveを別途引き渡す。一時領域のため、独立レビューまで保全を要する。
+
+| 成果物 | SHA-256 |
+|---|---|
+| fixture-manifest.json | `64b723faff1a1b72a5f05fd0465d16dde17d690da57e006a695f51ed49181bf5` |
+| benchmark.py | `64ab8c9147c7b9230546fb4d76faec5d78dccbde32669d9773a6cbcded4f5b6b` |
+| raw-timings.jsonl（675行） | `44e41b0dbe908dac9748820f9bd9cfbb4c69214bf1788eba5c56566af8984490` |
+| supplement-R.jsonl（5行） | `6c2bd29cd91ee307c0c38e11def03211600ad00375ba2e310c731f6eeb28ec59` |
+| summary.json | `dffe7e9c58915a5388b915330269723285a553b8530c519d87f12e412771072b` |
+
+今回の観測では修正を要するproduction不具合を確認していない。ただし、L-RV-1/2の
+独立再レビュー、Linux同一bytes実測、exact-850 fixture、A複合Referenceの未完了、
+Python peakの候補超過は引継ぎ事項である。未承認値の緩和やfixtureの結果隠蔽で
+解消したとは扱わない。公開ValidationLimits/SLAと2C正式再受入は未確定のまま。
