@@ -25,6 +25,113 @@ class ReasonAuditError(AssertionError):
     pass
 
 
+# Audited grammar, not a schema discovered from the running interpreter.
+# '*' is a required list, '?' an optional value. Only the absent 3.11
+# FunctionDef/ClassDef.type_params is equivalent to the 3.12+ empty list.
+AST_FIELDS = {
+    "Add": "",
+    "And": "",
+    "BitOr": "",
+    "Eq": "",
+    "Gt": "",
+    "In": "",
+    "Is": "",
+    "IsNot": "",
+    "Load": "",
+    "Mult": "",
+    "Not": "",
+    "NotEq": "",
+    "Or": "",
+    "Store": "",
+    "Continue": "",
+    "Pass": "",
+    "AnnAssign": "target annotation value? simple",
+    "Assign": "targets* value type_comment?",
+    "Attribute": "value attr ctx",
+    "AugAssign": "target op value",
+    "BinOp": "left op right",
+    "BoolOp": "op values*",
+    "Call": "func args* keywords*",
+    "ClassDef": "name bases* keywords* body* decorator_list* type_params*",
+    "Compare": "left ops* comparators*",
+    "Constant": "value kind?",
+    "Dict": "keys* values*",
+    "DictComp": "key value generators*",
+    "Expr": "value",
+    "For": "target iter body* orelse* type_comment?",
+    "FunctionDef": "name args body* decorator_list* returns? type_comment? type_params*",
+    "GeneratorExp": "elt generators*",
+    "If": "test body* orelse*",
+    "IfExp": "test body orelse",
+    "ImportFrom": "module? names* level",
+    "List": "elts* ctx",
+    "ListComp": "elt generators*",
+    "Module": "body* type_ignores*",
+    "Name": "id ctx",
+    "Raise": "exc? cause?",
+    "Return": "value?",
+    "Set": "elts*",
+    "Starred": "value ctx",
+    "Subscript": "value slice ctx",
+    "Tuple": "elts* ctx",
+    "UnaryOp": "op operand",
+    "alias": "name asname?",
+    "arg": "arg annotation? type_comment?",
+    "arguments": "posonlyargs* args* vararg? kwonlyargs* kw_defaults* kwarg? defaults*",
+    "comprehension": "target iter ifs* is_async",
+    "keyword": "arg? value",
+}
+AST_LOCATIONS = {"lineno", "col_offset", "end_lineno", "end_col_offset"}
+
+
+def canonical_ast(node):
+    """Pinned canonical spelling; no ast.dump/show_empty/runtime schema defaults.
+
+    Known empty lists/optional None have one representation. Constant(None),
+    list elements of None, and all nonempty fields remain significant. Unknown
+    nodes/fields require review, including future interpreter schema additions.
+    The spelling preserves the 21 previously reviewed 3.13 fingerprint literals.
+    """
+    if isinstance(node, ast.AST):
+        name = type(node).__name__
+        if name not in AST_FIELDS or type(node) is not getattr(ast, name, None):
+            raise ReasonAuditError("unsupported AST node: " + name)
+        specs = AST_FIELDS[name].split()
+        fields = tuple(s.rstrip("*?") for s in specs)
+        legacy = fields[:-1] if name in {"FunctionDef", "ClassDef"} else fields
+        if node._fields not in (fields, legacy):
+            raise ReasonAuditError("unsupported AST fields: " + name)
+        if set(vars(node)) - set(fields) - AST_LOCATIONS:
+            raise ReasonAuditError("unsupported AST attributes: " + name)
+        if set(node._attributes) - AST_LOCATIONS:
+            raise ReasonAuditError("unsupported AST metadata: " + name)
+        parts = []
+        for spec, field in zip(specs, fields, strict=True):
+            missing = not hasattr(node, field)
+            if field == "type_params":
+                value = getattr(node, field, [])
+                if type(value) is not list or value:
+                    raise ReasonAuditError("unsupported AST type_params: re-audit")
+                continue
+            if missing and not spec.endswith("?"):
+                raise ReasonAuditError("missing AST field: " + name + "." + field)
+            value = getattr(node, field, None)
+            if spec.endswith("*"):
+                if type(value) is not list:
+                    raise ReasonAuditError("invalid AST list: " + name + "." + field)
+                if not value:
+                    continue
+            if spec.endswith("?") and value is None:
+                continue
+            parts.append(field + "=" + canonical_ast(value))
+        return name + "(" + ", ".join(parts) + ")"
+    if type(node) is list:
+        return "[" + ", ".join(canonical_ast(x) for x in node) + "]"
+    if node is None or node is Ellipsis or type(node) in {str, int, bool}:
+        return repr(node)
+    raise ReasonAuditError("unsupported AST value: " + type(node).__name__)
+
+
 def literal_reasons(node, *, saved_propagation=False):
     """Only explicit literals/containers/unions and the audited saved edge."""
     if isinstance(node, ast.Constant) and type(node.value) is str:
@@ -41,7 +148,7 @@ def literal_reasons(node, *, saved_propagation=False):
                 return literal_reasons(
                     node.args[0], saved_propagation=saved_propagation
                 )
-    if saved_propagation and ast.dump(node) == ast.dump(
+    if saved_propagation and canonical_ast(node) == canonical_ast(
         ast.parse("saved.reasons", mode="eval").body
     ):
         return set()  # Its origin is _saved; checked separately and dynamically.
@@ -107,7 +214,7 @@ def collect_budget_reasons(source):
                     value = node.args[reason_position]
                 if value is None:
                     raise ReasonAuditError("unsupported emission shape: sink")
-                if ast.dump(value) != ast.dump(
+                if canonical_ast(value) != canonical_ast(
                     ast.parse("tuple(sorted(reasons))", mode="eval").body
                 ):
                     emitted |= literal_reasons(value)
@@ -154,8 +261,7 @@ def audit_budget_module(source):
         key = getattr(node, "name", f"{type(node).__name__}:{i}")
         if key in actual:
             raise ReasonAuditError("unsupported emission shape: duplicate definition")
-        # Empty type_params was introduced in Python 3.12; semantics unchanged.
-        shape = ast.dump(node, include_attributes=False).replace(", type_params=[]", "")
+        shape = canonical_ast(node)
         actual[key] = hashlib.sha256(shape.encode()).hexdigest()
     if actual != AUDITED_AST:
         changed = sorted(
@@ -171,6 +277,111 @@ def audit_budget_module(source):
 
 def test_VL_reason_sink_paths_and_change_guard():
     assert audit_budget_module(inspect.getsource(v2)) == h.BUDGET_REASON_REGISTRY
+
+
+@pytest.mark.parametrize("unit", tuple(AUDITED_AST))
+def test_VL_canonical_fingerprint_all_21_units(unit, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("canonical audit must not call ast.dump")
+
+    monkeypatch.setattr(ast, "dump", forbidden)
+    nodes = ast.parse(inspect.getsource(v2)).body
+    assert len(nodes) == len(AUDITED_AST) == 21
+    by_name = {
+        getattr(n, "name", f"{type(n).__name__}:{i}"): n for i, n in enumerate(nodes)
+    }
+    assert (
+        hashlib.sha256(canonical_ast(by_name[unit]).encode()).hexdigest()
+        == AUDITED_AST[unit]
+    )
+    assert audit_budget_module(inspect.getsource(v2)) == h.BUDGET_REASON_REGISTRY
+
+
+def test_VL_canonical_empty_optional_and_type_params(monkeypatch):
+    fn = ast.parse("def f():\n    return None\n").body[0]
+    expected = "FunctionDef(name='f', args=arguments(), body=[Return(value=Constant(value=None))])"
+    assert canonical_ast(fn) == expected
+    # Model the known schema delta explicitly; not a substitute for 3.11 execution.
+    fields = tuple(f for f in fn._fields if f != "type_params")
+    monkeypatch.setattr(ast.FunctionDef, "_fields", fields)
+    if hasattr(fn, "type_params"):
+        del fn.type_params
+    assert canonical_ast(fn) == expected
+    monkeypatch.setattr(ast.FunctionDef, "_fields", (*fields, "type_params"))
+    fn.type_params = []
+    if hasattr(fn, "returns"):
+        del fn.returns
+    assert canonical_ast(fn) == expected
+    fn.returns = ast.Name(id="int", ctx=ast.Load())
+    assert canonical_ast(fn) != expected
+    fn.type_params = [ast.Name(id="T", ctx=ast.Load())]
+    with pytest.raises(ReasonAuditError, match="unsupported AST type_params"):
+        canonical_ast(fn)
+    # None in a list is a value, not an omitted optional field.
+    assert canonical_ast([None]) == "[None]"
+    assert canonical_ast(ast.Constant(value=None)) == "Constant(value=None)"
+    assert canonical_ast(ast.parse("if x:\n pass\n").body[0]) != canonical_ast(
+        ast.parse("if x:\n pass\nelse:\n pass\n").body[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,reason",
+    [
+        ("node", "unsupported AST node"),
+        ("field", "unsupported AST fields"),
+        ("attribute", "unsupported AST attributes"),
+        ("metadata", "unsupported AST metadata"),
+        ("missing", "missing AST field"),
+        ("list", "invalid AST list"),
+        ("value", "unsupported AST value"),
+    ],
+)
+def test_VL_unknown_ast_structure_is_rejected(monkeypatch, mutation, reason):
+    node = ast.parse("f()").body[0].value
+    if mutation == "node":
+
+        class FutureNode(ast.AST):
+            _fields = ()
+
+        node = FutureNode()
+    elif mutation == "field":
+        node._fields = (*node._fields, "future")
+    elif mutation == "attribute":
+        node.future = None
+    elif mutation == "metadata":
+        monkeypatch.setattr(ast.Call, "_attributes", (*node._attributes, "future"))
+    elif mutation == "missing":
+        del node.args
+    elif mutation == "list":
+        node.args = None
+    else:
+        node.func = object()
+    with pytest.raises(ReasonAuditError, match=reason):
+        canonical_ast(node)
+
+
+def test_VL_comments_do_not_change_fingerprints():
+    source = inspect.getsource(v2)
+    source = "# review-only comment\n" + source.replace(
+        'reasons.add("open_unsettled")', 'reasons.add("open_unsettled")  # unchanged'
+    )
+    assert audit_budget_module(source) == h.BUDGET_REASON_REGISTRY
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        'getattr(reasons, "add")("new")',
+        'setattr(holder, "r", reasons)',
+    ],
+)
+def test_VL_reflective_reason_paths_require_review(expression):
+    source = inspect.getsource(v2).replace('reasons.add("open_unsettled")', expression)
+    # Preserve the original emitter so registry equality alone cannot catch it.
+    source = source.replace(expression, 'reasons.add("open_unsettled"); ' + expression)
+    with pytest.raises(ReasonAuditError, match="unsupported emission shape: re-audit"):
+        audit_budget_module(source)
 
 
 @pytest.mark.parametrize(

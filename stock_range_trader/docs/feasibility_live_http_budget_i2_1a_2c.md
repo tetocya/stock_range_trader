@@ -523,3 +523,103 @@ pool commitment、environment、raw、summary JSON/CSVを保存した。
 独立再レビュー、Linux同一bytes実測、exact-850 fixture、A複合Referenceの未完了、
 Python peakの候補超過は引継ぎ事項である。未承認値の緩和やfixtureの結果隠蔽で
 解消したとは扱わない。公開ValidationLimits/SLAと2C正式再受入は未確定のまま。
+
+## VL Review Follow-up：Owner承認済み限定是正（2026-10-16）
+
+対象は`9ccba1440947190bca7fa23c729f52e90a73a93c`、treeは
+`19f9f3574389790eae2a597d2e7c81b69ede84a3`。
+親は固定integration `d307fad9cd1791a3ac206cf3f8420ec279c3500e`で、開始時clean。
+原文SHA-256 `1072ae4c2de72c20f4104e4209d0c514da22ac478aa4bb2c14838e011b3f5e65`
+を再照合し、追加Owner承認のM-VL-1 / L-VL-1 / L-VL-2だけを扱う。
+旧commitのamendや原本の上書きは行わず、追加ローカル1コミットとする。
+
+### M-VL-1：固定canonical AST表現
+
+原因は`ast.dump()`の空list表示差である。実Python 3.11.5で旧式を再計算すると、
+21単位中12単位のfingerprintが不一致だった。空`type_params`の文字列置換だけでは
+`arguments`やdecorator等の空list差を吸収できなかった。
+
+監査器が存在する既存`test_feasibility_live_http_validation_coverage.py`も
+tests内部の修正対象に含めた。`ast.dump()`に依存しない固定node/field表と
+canonical formatterを導入し、**既存21個の期待hash literalは一つも変更していない**。
+実行時生成で期待値を更新する経路もない。
+
+既知listの空値、既知optional fieldのNoneは固定規則で省略する。
+3.11で未定義のFunctionDef/ClassDef.type_paramsは空listと同じ意味に扱うが、
+非空type_paramsは再監査を要求する。Constant(None)やlist要素のNoneは残す。
+未知node/field/attribute/metadata、欠落必須field、不正list値は理由付きで拒否する。
+新しいPython schemaを無条件に許可するfallbackはない。
+コメント・位置情報はfingerprintに影響しないが、docstringは従来どおり監査対象。
+
+全21単位の固定hash検査、ast.dump呼出禁止、empty/None/type_params境界、未知構造、
+getattr/setattr経路を追加した。既存add/update/union/constructor、alias、動的reason、
+新helperのnegative testsと、target/peer × Budget/Savedの実行時拒否試験は維持する。
+これは限定grammarの変更guardであり、任意Pythonの完全な静的解析ではない。
+
+### L-VL-1／2：Profile B内のrepository回帰試験
+
+固定人工root `/__stock_range_trader_vl_artificial__/http`を使い、checkoutの長さで
+bytesが変わらないようにした。通常の人工append/receipt APIで毎回構築し、
+scratchpadのJSONを盲目的に取り込まない。rootはlexical claimのみで作成しない。
+レビューの参考bytesとの差は固定root・fixture構成の違いによる。
+
+| fixture | records | canonical bytes | reservations | plans | references | single bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| 合法850 exact | 246 | 465,412 | 3 | 2 | 850 | 14,949 |
+| retry正常control | 205 | 371,992 | 6 | 2 | 579 | 14,981 |
+| 末尾404不正retry | 205 | 371,971 | 6 | 2 | 579 | 14,981 |
+
+六軸を固定期待値と比較し、人工Profile B候補の全上限内であることをassertする。
+合法850は両verifierで受理、同じ入力をreferences=849で両方とも
+`budget_v2_limit_references`として拒否する。受理時canonical bytesも一致する。
+これは以前未確認だったexact-850の回帰を補うもので、旧benchmarkの測定結果を
+書き換えたり公開ValidationLimitsを承認したりするものではない。
+
+末尾retryはA/B/A/B/B/Aの順に6予約を作り、各planの試行は3回に限定する。
+正常controlではAの途中応答を429、不正履歴では404とする。
+最初の5予約までのprefixは両方とも正常。最後の不正A予約のみ、
+`first_violation=5`、`budget_v2_previous_attempt_not_retryable`で拒否される。
+assessmentの理由集合がこの1件だけであることと、全operationの構造検証が通ることも
+確認し、retry回数上限等の別理由を誤って成功扱いしない。両verifierの結果は一致し、
+pure authorityの3 flagsはすべてfalse。
+
+### 実行環境と証拠の区別
+
+Python 3.11.5（macOS x86_64）をPATH外の既存Homebrew Cellarで確認した。
+pytestは未導入のため、対象worktreeのproduction moduleをimportし、同worktreeの
+テストから監査定義だけを読み込むstdlib-only runnerで21 fingerprintと7 mutationを
+実行した。3.13.3（macOS arm64）でも同じrunnerの結果が一致した。
+これは3.11のpytest実行や全依存環境の互換性確認を意味しない。
+3.12実行系は確認したローカル環境に見つからず、3.12は未実行。
+新規依存の導入や既存venvの変更はしていない。
+
+既存benchmark archiveは変更しない。SHA-256は引き続き
+`f45e9225d2c50e7f9bca439d11d1c2c8beaf253f92fad3990cdc2dc2707af6e2`。
+既存History class・mixed_history/mixed_resultのASTも旧commitと同一で、既存人工fixtureの
+生成意味は不変。旧benchmarkは旧commitの証拠として保持し、新しい測定へ読み替えない。
+Linux Python 3.13の性能benchmark、A複合Reference完了、候補Python peak超過、
+公開上限/SLAのOwner判断は未完了のまま。
+
+M-VL-1/L-VL-1/L-VL-2の最終解消判定は独立差分レビューへ引き継ぐ。
+push/PR/CIはまだ実施せず、独立レビューと別の実行承認を待つ。
+Merge・正式再受入はNo。Live Gateはclosed、実J-QuantsとFormal Real OOSは不可。
+
+### 限定是正後のローカル検証
+
+Python 3.13.3 / macOS arm64で次を実行した。新規回帰は35件で、production sourceの
+差分はゼロ。Budget v1/v2の90件はfeasibility全体・全pytestに含まれている。
+
+| 検査 | 結果 |
+|---|---|
+| 2C専用（warningをerror扱い） | 191 passed |
+| feasibility全体 | 1584 passed |
+| 全pytest | 3067 passed / 13 skipped / 0 failed / 0 errors |
+| Ruff check | pass |
+| Ruff format --check | pass（312 files） |
+| git diff --check | pass |
+
+skipはLive 7件・browser 6件で、未検証として維持する。全pytestの28 warningsは
+既存`jquants_v2.py`のurllib3 `allowed_methods`に関するFutureWarningである。
+通常pytestの成功をLinux性能測定や実HTTP取得の検証には読み替えない。
+実行コマンド、ログ、3.11/3.13静的監査結果、commitとの対応は別のfollow-up証拠へ保存し、
+既存benchmark原本・archiveの内容とSHAは変更していない。

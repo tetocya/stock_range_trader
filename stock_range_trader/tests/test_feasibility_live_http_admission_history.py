@@ -13,6 +13,7 @@ import socket
 import sqlite3
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from test_feasibility_live_body_contract import NOW, stamp
@@ -30,6 +31,9 @@ from feasibility import live_store_runtime as rt
 
 LIMITS = h.ValidationLimitsV1(1500, 4_000_000, 24, 4, 5000, 32768)
 EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
+
+# Owner-unapproved public numbers; explicit synthetic Profile B test limits.
+VL_PROFILE_B = h.ValidationLimitsV1(300, 500000, 7, 2, 850, 32768)
 
 
 class History(EnrolledScenario):
@@ -1441,3 +1445,124 @@ def test_R3_scaled_audit_extension_preserves_historical_admission(
     assert incremental.final_budgets == before.final_budgets
     assert incremental.final_capacity == before.final_capacity
     assert incremental.input_commitment != before.input_commitment
+
+
+@pytest.fixture
+def vl_profile_b_root(monkeypatch):
+    """Fixed lexical test claim, never a physical Store or real output root."""
+    import test_feasibility_live_body_contract as body_fixture
+    import test_feasibility_live_plan_enrollment as enrollment_fixture
+
+    from feasibility import live_plan_enrollment
+
+    root = Path("/__stock_range_trader_vl_artificial__/http")
+    for module in (hc, c3, live_plan_enrollment, body_fixture, enrollment_fixture):
+        monkeypatch.setattr(module, "HTTP_OUTPUT_ROOT", root)
+    original = Path.is_symlink
+
+    def artificial_symlink_claim(path):
+        if path == root or root in path.parents or path in root.parents:
+            return False
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_symlink", artificial_symlink_claim)
+
+
+def assert_vl_profile_b_dimensions(pool, expected):
+    dimensions = h.measure_input_size(pool)
+    assert vars(dimensions) == dict(zip(vars(VL_PROFILE_B), expected, strict=True))
+    assert all(
+        value <= getattr(VL_PROFILE_B, name) for name, value in vars(dimensions).items()
+    )
+    assert dimensions.reservations == len(pool.reservations)
+    assert dimensions.plans == len(pool.plans)
+
+
+def assert_vl_pure_result(result):
+    assert result.producer_authenticated is False
+    assert result.reservation_permitted is False
+    assert result.live_send_permitted is False
+
+
+def test_VL_profile_B_exact_850_references(vl_profile_b_root):
+    f = History(second_plan=True)
+    for _ in range(2):
+        f.begin().settle(status=503)
+        f.switch_plan()
+    f.begin()
+    # 38 evidence operations / 40 audit rows: 2+2+36*1. Construct through
+    # normal artificial append/receipt APIs, not copied scratchpad JSON.
+    for i in range(38):
+        f.clock()
+        before = f.cut()
+        for k in range(2 if i < 2 else 1):
+            f.j = f.j.audit(evidence_ref="r", at=f.tick(), operation_id=f"pad-{i}-{k}")
+        f.finish(before, h.EVIDENCE_KIND, f"pad-{i}")
+    pool = f.pool()
+    assert_vl_profile_b_dimensions(pool, (246, 465412, 3, 2, 850, 14949))
+    results = []
+    for verifier in (h.verify_history_reference, h.verify_history_incremental):
+        result = verifier(pool, limits=VL_PROFILE_B)
+        assert result.historical_admissions_valid
+        assert result.reason is None and result.first_violation is None
+        assert_vl_pure_result(result)
+        results.append(result)
+        with pytest.raises(hc.HttpContractError) as exc:
+            verifier(pool, limits=replace(VL_PROFILE_B, references=849))
+        assert str(exc.value) == "budget_v2_limit_references"
+    assert results[0].to_bytes() == results[1].to_bytes()
+
+
+@pytest.mark.parametrize("bad_retry", [False, True])
+def test_VL_profile_B_last_404_retry(vl_profile_b_root, bad_retry):
+    f = History(second_plan=True)
+    # A/B/A/B/B/A. Each plan has exactly three attempts, so the illegal last
+    # A retry is NOT also a retry-count/byte/page-budget violation.
+    f.begin().settle(status=503)
+    f.switch_plan()
+    f.begin().settle(status=503)
+    f.switch_plan()
+    f.begin().settle(status=404 if bad_retry else 429)
+    f.switch_plan()
+    f.begin().settle(status=429)
+    f.begin().settle(status=200, size=1, digest=hashlib.sha256(b"B").hexdigest())
+    f.switch_plan()
+    prefix = f.pool()
+    before = [
+        fn(prefix, limits=VL_PROFILE_B)
+        for fn in (h.verify_history_reference, h.verify_history_incremental)
+    ]
+    assert before[0].to_bytes() == before[1].to_bytes()
+    assert before[0].historical_admissions_valid
+    f.begin(illegal=bad_retry).settle(
+        status=200, size=1, digest=hashlib.sha256(b"A").hexdigest()
+    )
+    pool = f.pool()
+    assert_vl_profile_b_dimensions(
+        pool, (205, 371971 if bad_retry else 371992, 6, 2, 579, 14981)
+    )
+    results = [
+        fn(pool, limits=VL_PROFILE_B)
+        for fn in (h.verify_history_reference, h.verify_history_incremental)
+    ]
+    assert results[0].to_bytes() == results[1].to_bytes()
+    result = results[0]
+    assert_vl_pure_result(result)
+    assert result.historical_admissions_valid is (not bad_retry)
+    assert result.first_violation == (5 if bad_retry else None)
+    assert result.reason == (
+        "budget_v2_previous_attempt_not_retryable" if bad_retry else None
+    )
+    if bad_retry:
+        # _operation checks complete structural receipts/parts/runtime commits
+        # separately from admission semantics, including the last settlement.
+        stats = h.ReplayStatistics()
+        index = h._Index(pool, True, stats)
+        events = h._runtime(pool, stats)
+        previous = pool.initial
+        for op in pool.operations:
+            h._operation(pool, index, op, previous, events)
+            previous = op.result
+        assert result.checks[-1].assessment.reasons == (
+            "previous_attempt_not_retryable",
+        )
